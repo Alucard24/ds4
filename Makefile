@@ -46,6 +46,18 @@ else
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 endif
+# nvcc -arch=native resolves RTX Blackwell to sm_120, while the MXFP4/NVFP4
+# instructions require the architecture-specific sm_120a code image. Resolve
+# the local compute capability for cuda-generic so it uses the mapping above.
+CUDA_NATIVE_ARCH := $(shell \
+	if command -v nvidia-smi >/dev/null 2>&1; then \
+		nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | \
+		while IFS= read -r cap; do \
+			printf 'sm_%s' "$$(printf '%s' "$$cap" | tr -d '. ')"; \
+			break; \
+		done; \
+	fi)
+CUDA_GENERIC_ARCH := $(if $(strip $(CUDA_NATIVE_ARCH)),$(CUDA_NATIVE_ARCH),native)
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 # Vendored llama.cpp mmq prefill tier (cuda/mmq/, see cuda/mmq/VENDOR.md).
 MMQ_INCLUDES := -Icuda/mmq
@@ -166,7 +178,7 @@ cuda-spark:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=sm_121
 
 cuda-generic:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH="$(CUDA_GENERIC_ARCH)"
 
 cuda:
 	@if [ -z "$(strip $(CUDA_ARCH))" ]; then \

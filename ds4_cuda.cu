@@ -27,6 +27,15 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+/* CUDA 12.8 omits the device rsqrtf declaration with newer glibc headers. */
+static __host__ __device__ __forceinline__ float ds4_cuda_rsqrtf(float x) {
+#if defined(__CUDA_ARCH__)
+    return __frsqrt_rn(x);
+#else
+    return 1.0f / sqrtf(x);
+#endif
+}
+
 #define CUDA_QK_K 256
 #define DS4_CUDA_UNUSED __attribute__((unused))
 
@@ -6334,7 +6343,7 @@ __global__ static void rms_norm_plain_kernel(float *out, const float *x, uint32_
         if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
         __syncthreads();
     }
-    float scale = rsqrtf(partial[0] / (float)n + eps);
+    float scale = ds4_cuda_rsqrtf(partial[0] / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
         orow[i] = xr[i] * scale;
     }
@@ -6362,7 +6371,7 @@ __global__ static void rms_norm_plain_fast4096_kernel(float *out, const float *x
         if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
         __syncthreads();
     }
-    float scale = rsqrtf(partial[0] / (float)n + eps);
+    float scale = ds4_cuda_rsqrtf(partial[0] / (float)n + eps);
 #pragma unroll
     for (uint32_t j = 0; j < 16u; j++) orow[threadIdx.x + j * 256u] = v[j] * scale;
 }
@@ -6404,7 +6413,7 @@ __global__ static void rms_norm_plain_batch8_kernel(float *out, const float *x, 
         if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
         __syncthreads();
     }
-    float scale = rsqrtf(partial[0] / (float)n + eps);
+    float scale = ds4_cuda_rsqrtf(partial[0] / (float)n + eps);
 #pragma unroll 1
     for (uint32_t i = threadIdx.x; i < n; i += 2048u) {
         const float v0 = xr[i];
@@ -6467,7 +6476,7 @@ __global__ static void rms_norm_plain_f16_batch8_kernel(
         }
         __syncthreads();
     }
-    const float scale = rsqrtf(partial[0] / (float)n + eps);
+    const float scale = ds4_cuda_rsqrtf(partial[0] / (float)n + eps);
 #pragma unroll 1
     for (uint32_t i = threadIdx.x; i < n; i += 2048u) {
         orow[i] = __float2half(xr[i] * scale);
@@ -6498,7 +6507,7 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
         if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
         __syncthreads();
     }
-    float scale = rsqrtf(partial[0] / (float)n + eps);
+    float scale = ds4_cuda_rsqrtf(partial[0] / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
         orow[i] = xr[i] * scale * w[i];
     }
@@ -6534,7 +6543,7 @@ __global__ static void dsv4_qkv_rms_norm_rows_kernel(
         if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
         __syncthreads();
     }
-    const float scale = rsqrtf(partial[0] / (float)n + eps);
+    const float scale = ds4_cuda_rsqrtf(partial[0] / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
         orow[i] = xr[i] * scale * w[i];
     }
@@ -6556,7 +6565,7 @@ __global__ static void head_rms_norm_kernel(float *x, uint32_t n_tok, uint32_t n
         if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
         __syncthreads();
     }
-    float scale = rsqrtf(partial[0] / (float)head_dim + eps);
+    float scale = ds4_cuda_rsqrtf(partial[0] / (float)head_dim + eps);
     for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) xr[i] *= scale;
 }
 
@@ -6604,7 +6613,7 @@ __global__ static void dsv4_qkv_rms_norm_rows_kv_rope_kernel(
         if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
         __syncthreads();
     }
-    const float scale = rsqrtf(partial[0] / (float)n + eps);
+    const float scale = ds4_cuda_rsqrtf(partial[0] / (float)n + eps);
     if (which == 0u) {
         for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
             orow[i] = xr[i] * scale * w[i];
@@ -6688,7 +6697,7 @@ __global__ static void head_rms_norm_rope_tail_kernel(
         if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
         __syncthreads();
     }
-    const float scale = rsqrtf(partial[0] / (float)head_dim + eps);
+    const float scale = ds4_cuda_rsqrtf(partial[0] / (float)head_dim + eps);
     const uint32_t n_nope = head_dim - n_rot;
     for (uint32_t i = threadIdx.x; i < n_nope; i += blockDim.x) {
         xr[i] *= scale;
@@ -7063,7 +7072,7 @@ __global__ static void attention_prefill_raw_kernel(
     __shared__ float partial[128];
     __shared__ float max_s;
     __shared__ float denom;
-    float scale = rsqrtf((float)head_dim);
+    float scale = ds4_cuda_rsqrtf((float)head_dim);
     float local_max = sinks[h];
     __syncthreads();
     for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
@@ -7126,7 +7135,7 @@ __global__ static void attention_prefill_mixed_kernel(
     __shared__ float partial[256];
     __shared__ float max_s;
     __shared__ float denom;
-    float scale = rsqrtf((float)head_dim);
+    float scale = ds4_cuda_rsqrtf((float)head_dim);
     float local_max = sinks[h];
     uint32_t n_score = raw_count + visible_comp;
 
@@ -7384,7 +7393,7 @@ __global__ static void attention_decode_mixed_kernel(
     __shared__ uint32_t raw_first_idx;
     const uint32_t score_threads = blockDim.x > 256u ? 256u : blockDim.x;
     const bool score_thread = threadIdx.x < score_threads;
-    float scale = rsqrtf((float)head_dim);
+    float scale = ds4_cuda_rsqrtf((float)head_dim);
     if (threadIdx.x == 0) {
         raw_count = 0;
         raw_first_idx = 0;
@@ -7625,7 +7634,7 @@ __global__ static void attention_decode_score_split_scores_kernel(
     const uint32_t g1 = g0 + cnt;
     const float *qh = q + (uint64_t)h * head_dim;
     float *row_scores = score_out + (uint64_t)h * n_score;
-    const float scale = rsqrtf((float)head_dim);
+    const float scale = ds4_cuda_rsqrtf((float)head_dim);
 
     for (uint32_t g = g0 + threadIdx.x; g < g1; g += blockDim.x) {
         float s = -INFINITY;
@@ -7715,7 +7724,7 @@ __global__ static void attention_decode_score_split_scores_ldg_kernel(
     const uint32_t g1 = g0 + cnt;
     const float *qh = q + (uint64_t)h * head_dim;
     float *row_scores = score_out + (uint64_t)h * n_score;
-    const float scale = rsqrtf((float)head_dim);
+    const float scale = ds4_cuda_rsqrtf((float)head_dim);
 
     for (uint32_t g = g0 + threadIdx.x; g < g1; g += blockDim.x) {
         float s = -INFINITY;
@@ -7872,7 +7881,7 @@ __global__ static void attention_decode_score_split_scores_tile512_kernel(
     const uint32_t h = h_base + (threadIdx.x >> 4u);
     const uint32_t g = g_base + r;
     if (h >= n_head || g >= n_score) return;
-    const float scale = rsqrtf((float)head_dim);
+    const float scale = ds4_cuda_rsqrtf((float)head_dim);
     float *row_scores = score_out + (uint64_t)h * n_score;
     const float *qh = sh_q + (uint64_t)(threadIdx.x >> 4u) * DS4_SCORE_TILE_STRIDE;
     const float *kvrow = sh_kv + (uint64_t)r * DS4_SCORE_TILE_STRIDE;
@@ -8013,7 +8022,7 @@ __global__ static void attention_decode_score_split_scores_tile512_rows_kernel(
     const uint32_t h = h_base + (threadIdx.x >> 4u);
     const uint32_t g = g_base + r;
     if (h >= n_head || g >= n_score) return;
-    const float scale = rsqrtf((float)head_dim);
+    const float scale = ds4_cuda_rsqrtf((float)head_dim);
     float *row_scores = score_out +
         ((uint64_t)row * n_head + h) * score_stride;
     const float *qh = sh_q +
@@ -8136,7 +8145,7 @@ __global__ static void attention_decode_score_split_scores_vec4_kernel(
     const uint32_t g1 = g0 + cnt;
     const float *qh = q + (uint64_t)h * head_dim;
     float *row_scores = score_out + (uint64_t)h * n_score;
-    const float scale = rsqrtf((float)head_dim);
+    const float scale = ds4_cuda_rsqrtf((float)head_dim);
 
     for (uint32_t g = g0 + threadIdx.x; g < g1; g += blockDim.x) {
         float s = -INFINITY;
@@ -8215,7 +8224,7 @@ __global__ static void attention_decode_score_split_scores_vec4_plain_kernel(
     const uint32_t g1 = g0 + cnt;
     const float *qh = q + (uint64_t)h * head_dim;
     float *row_scores = score_out + (uint64_t)h * n_score;
-    const float scale = rsqrtf((float)head_dim);
+    const float scale = ds4_cuda_rsqrtf((float)head_dim);
 
     for (uint32_t g = g0 + threadIdx.x; g < g1; g += blockDim.x) {
         float s = -INFINITY;
@@ -9219,7 +9228,7 @@ __global__ static void attention_decode_splitkv_kernel(
     __shared__ float l_s;
     __shared__ uint32_t raw_count;
     __shared__ uint32_t raw_first_idx;
-    float scale = rsqrtf((float)head_dim);
+    float scale = ds4_cuda_rsqrtf((float)head_dim);
     if (threadIdx.x == 0) {
         raw_count = 0;
         raw_first_idx = 0;
@@ -9488,7 +9497,7 @@ __global__ static void attention_indexed_mixed_kernel(
     __shared__ uint32_t raw_first_idx;
     __shared__ uint32_t comp_count;
     __shared__ uint32_t comp_warp_offsets[8];
-    float scale = rsqrtf((float)head_dim);
+    float scale = ds4_cuda_rsqrtf((float)head_dim);
     if (threadIdx.x == 0) {
         raw_count = 0;
         raw_first_idx = 0;
@@ -9634,7 +9643,7 @@ __global__ static void attention_indexed_mixed_decode_rows_kernel(
     __shared__ uint32_t raw_first_idx;
     __shared__ uint32_t comp_count;
     __shared__ uint32_t comp_warp_offsets[8];
-    const float scale = rsqrtf((float)head_dim);
+    const float scale = ds4_cuda_rsqrtf((float)head_dim);
     if (threadIdx.x == 0u) {
         raw_count = 0u;
         raw_first_idx = 0u;
@@ -9847,7 +9856,7 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
     __syncthreads();
 
     const uint32_t n_score = raw_count + comp_count;
-    const float scale = rsqrtf((float)head_dim);
+    const float scale = ds4_cuda_rsqrtf((float)head_dim);
     const float4 *q4 = valid_head
         ? (const float4 *)(q + ((uint64_t)t * n_head + head) * head_dim)
         : NULL;
@@ -10016,7 +10025,7 @@ attention_indexed_mixed_heads8_online_kernel(
     uint32_t comp_count = top_k < visible_comp ? top_k : visible_comp;
     if (comp_count > 512u) comp_count = 512u;
     const uint32_t n_score = raw_count + comp_count;
-    const float scale = rsqrtf((float)head_dim);
+    const float scale = ds4_cuda_rsqrtf((float)head_dim);
     const float4 *q4 = valid_head
         ? (const float4 *)(q + ((uint64_t)t * n_head + head) * head_dim)
         : NULL;
@@ -10143,7 +10152,7 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
         if (comp_count > n_comp) comp_count = n_comp;
     }
     const uint32_t n_score = raw_count + comp_count;
-    const float scale = rsqrtf((float)head_dim);
+    const float scale = ds4_cuda_rsqrtf((float)head_dim);
     const float4 *q4 = valid_head
         ? (const float4 *)(q + ((uint64_t)t * n_head + head) * head_dim)
         : NULL;
@@ -11056,7 +11065,7 @@ __global__ static void __launch_bounds__(512, 1) attention_tokentile_hmma_kernel
     const uint32_t n_score = raw_union_count + comp_union_count;
     const uint64_t union_tile_off = (uint64_t)tile_idx * rec_stride;
     const int2 * __restrict__ union_records_tile = union_records + union_tile_off;
-    const float score_scale = rsqrtf((float)kTTHeadDim);
+    const float score_scale = ds4_cuda_rsqrtf((float)kTTHeadDim);
 
     extern __shared__ unsigned char smem[];
     unsigned char *p = tt_align16(smem);
@@ -11355,7 +11364,7 @@ attention_decode_mixed_heads8_online_kernel(
     __syncthreads();
 
     const uint32_t n_score = raw_count + comp_count;
-    const float scale = rsqrtf((float)head_dim);
+    const float scale = ds4_cuda_rsqrtf((float)head_dim);
     const float4 *q4 = valid_head
         ? (const float4 *)(q + ((uint64_t)t * n_head + head) * head_dim)
         : NULL;
@@ -11623,7 +11632,7 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         if (d < stride) partial[d] += partial[d + stride];
         __syncthreads();
     }
-    const float norm_scale = rsqrtf(partial[0] / (float)n_embd + norm_eps);
+    const float norm_scale = ds4_cuda_rsqrtf(partial[0] / (float)n_embd + norm_eps);
     for (uint32_t col = d; col < n_embd; col += blockDim.x) {
         const float v = out[(uint64_t)t * n_embd + col];
         norm_out[(uint64_t)t * n_embd + col] = v * norm_scale * norm_w[col];
@@ -15946,7 +15955,7 @@ __global__ static void attention_noncausal_raw_batch_heads_kernel(
     if (tok >= n_tokens || h >= n_head) return;
     extern __shared__ float sh_scores[]; /* n_raw floats */
     const float *qh = q + ((uint64_t)tok * n_head + h) * head_dim;
-    const float scale = rsqrtf((float)head_dim);
+    const float scale = ds4_cuda_rsqrtf((float)head_dim);
     for (uint32_t r = threadIdx.x; r < n_raw; r += blockDim.x) {
         const uint32_t row = (raw_start + r) % raw_cap;
         const float *kv = raw_kv + (uint64_t)row * head_dim;
@@ -17378,7 +17387,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
         if (!tmp) return 0;
         float *scores = tmp;
         float *out_tmp = (float *)((char *)tmp + out_offset);
-        const float alpha = rsqrtf((float)head_dim);
+        const float alpha = ds4_cuda_rsqrtf((float)head_dim);
         const float beta = 0.0f;
         cublasStatus_t st = cublasSgemmStridedBatched(cuda_cublas_for_tier(logical_tier),
                                                       CUBLAS_OP_T,
@@ -18035,7 +18044,7 @@ static int attention_prefill_mixed_launch(
                 n_comp,
                 head_dim);
         if (!cuda_ok(cudaGetLastError(), "attention mixed kv pack launch")) return 0;
-        const float alpha = rsqrtf((float)head_dim);
+        const float alpha = ds4_cuda_rsqrtf((float)head_dim);
         const float beta = 0.0f;
         cublasStatus_t st = cublasSgemmStridedBatched(cuda_cublas_for_tier(logical_tier),
                                                       CUBLAS_OP_T,
@@ -26314,7 +26323,7 @@ __global__ static void glm_add_rms_norm_weight_kernel(
         if (tid == 0u) sh[0] = sumsq;
     }
     __syncthreads();
-    const float scale = rsqrtf(sh[0] / (float)n + eps);
+    const float scale = ds4_cuda_rsqrtf(sh[0] / (float)n + eps);
     for (uint32_t i = tid; i < n; i += nth) {
         norm_out[i] = (sum_out[i] * scale) * w[i];
     }
@@ -27970,7 +27979,7 @@ __global__ static void glm_kv_lora_rms_norm_kernel(
         if (tid < step) scratch[tid] += scratch[tid + step];
         __syncthreads();
     }
-    const float inv = rsqrtf(scratch[0] / (float)kv_lora_dim + eps);
+    const float inv = ds4_cuda_rsqrtf(scratch[0] / (float)kv_lora_dim + eps);
     for (uint32_t i = tid; i < kv_lora_dim; i += nth) {
         out[i] = x[i] * inv * w[i];
     }
@@ -28216,7 +28225,7 @@ __global__ static void glm_qkv_norm_store_compact_kv_kernel(
         if (tid == 0u) sh[0] = sumf;
     }
     __syncthreads();
-    const float scale = rsqrtf(sh[0] / (float)n + eps);
+    const float scale = ds4_cuda_rsqrtf(sh[0] / (float)n + eps);
 
     if (!kv_task) {
         float *y = q_dst + (uint64_t)token * q_n;
@@ -29736,7 +29745,7 @@ __global__ static void glm_store_indexer_k_kernel(
         if (tid < step) scratch[tid] += scratch[tid + step];
         __syncthreads();
     }
-    const float inv = rsqrtf(scratch[0] / (float)head_dim + eps);
+    const float inv = ds4_cuda_rsqrtf(scratch[0] / (float)head_dim + eps);
 
     float corr_dims[2] = {0.0f, 0.0f};
     if (ext_factor != 0.0f) {
