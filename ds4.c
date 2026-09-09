@@ -883,6 +883,47 @@ typedef struct {
     uint16_t qs[QK_K / 8];
 } block_iq2_xxs;
 
+/* Qwen3.8 mixed-quant blocks (formats adapted from ggml, MIT). */
+typedef struct {
+    uint16_t d;
+    uint16_t qs[QK_K / 8];
+    uint8_t  scales[QK_K / 32];
+} block_iq2_xs;
+
+typedef struct {
+    uint16_t d;
+    uint8_t  qs[QK_K / 4];
+    uint8_t  qh[QK_K / 32];
+    uint8_t  scales[QK_K / 32];
+} block_iq2_s;
+
+typedef struct {
+    uint16_t d;
+    uint8_t  qs[3 * QK_K / 8];
+} block_iq3_xxs;
+
+typedef struct {
+    uint16_t d;
+    uint8_t  qs[QK_K / 4];
+    uint8_t  qh[QK_K / 32];
+    uint8_t  signs[QK_K / 8];
+    uint8_t  scales[QK_K / 64];
+} block_iq3_s;
+
+typedef struct {
+    uint16_t d;
+    uint16_t scales_h;
+    uint8_t  scales_l[QK_K / 64];
+    uint8_t  qs[QK_K / 2];
+} block_iq4_xs;
+
+/* iq1_m rows have a 16-bit scale appended after the blocks (see ggml). */
+typedef struct {
+    uint8_t qs[QK_K / 8];
+    uint8_t qh[QK_K / 16];
+    uint8_t scales[QK_K / 32];
+} block_iq1_m;
+
 typedef struct {
     uint8_t e;
     uint8_t qs[QK_MXFP4 / 2];
@@ -895,6 +936,12 @@ DS4_STATIC_ASSERT(ds4_block_q5_k_size, sizeof(block_q5_K) == 176);
 DS4_STATIC_ASSERT(ds4_block_q6_k_size, sizeof(block_q6_K) == 210);
 DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
+DS4_STATIC_ASSERT(ds4_block_iq2_xs_size, sizeof(block_iq2_xs) == 74);
+DS4_STATIC_ASSERT(ds4_block_iq2_s_size, sizeof(block_iq2_s) == 82);
+DS4_STATIC_ASSERT(ds4_block_iq3_xxs_size, sizeof(block_iq3_xxs) == 98);
+DS4_STATIC_ASSERT(ds4_block_iq3_s_size, sizeof(block_iq3_s) == 110);
+DS4_STATIC_ASSERT(ds4_block_iq4_xs_size, sizeof(block_iq4_xs) == 136);
+DS4_STATIC_ASSERT(ds4_block_iq1_m_size, sizeof(block_iq1_m) == 56);
 DS4_STATIC_ASSERT(ds4_block_mxfp4_size, sizeof(block_mxfp4) == 17);
 
 typedef struct {
@@ -2142,7 +2189,13 @@ enum {
     DS4_TENSOR_Q6_K     = 14,
     DS4_TENSOR_Q8_K     = 15,
     DS4_TENSOR_IQ2_XXS  = 16,
+    DS4_TENSOR_IQ2_XS   = 17,
+    DS4_TENSOR_IQ3_XXS  = 18,
+    DS4_TENSOR_IQ3_S    = 21,
+    DS4_TENSOR_IQ2_S    = 22,
+    DS4_TENSOR_IQ4_XS   = 23,
     DS4_TENSOR_I32      = 26,
+    DS4_TENSOR_IQ1_M    = 29,
     DS4_TENSOR_BF16     = 30,
     DS4_TENSOR_MXFP4    = 39,
 };
@@ -4003,6 +4056,203 @@ static float ds4_vec_dot_iq2_xxs_f32(int n, const block_iq2_xxs *x, const float 
 
     return sumf;
 }
+
+/* Qwen3.8 IQ dequant + dot products (reference CPU). Formats and tables
+ * adapted from ggml (llama.cpp), MIT: dequantize_row_iq* in ggml-quants.c. */
+#include "ds4_iq_tables.inc"
+
+#define DS4_IQ1S_DELTA 0.125f
+
+static DS4_MAYBE_UNUSED void ds4_dequant_row_iq2_xs(const block_iq2_xs *x, float *y, int64_t k) {
+    const int64_t nb = k / QK_K;
+    for (int i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d);
+        float db[2];
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            db[0] = d * (0.5f + (x[i].scales[ib32] & 0xf)) * 0.25f;
+            db[1] = d * (0.5f + (x[i].scales[ib32] >> 4)) * 0.25f;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t *grid = (const uint8_t *)(iq2xs_grid + (x[i].qs[4 * ib32 + l] & 511));
+                const uint8_t signs = ksigns_iq2xs[x[i].qs[4 * ib32 + l] >> 9];
+                for (int j = 0; j < 8; ++j) {
+                    y[j] = db[l / 2] * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+                }
+                y += 8;
+            }
+        }
+    }
+}
+
+static DS4_MAYBE_UNUSED void ds4_dequant_row_iq2_s(const block_iq2_s *x, float *y, int64_t k) {
+    const int64_t nb = k / QK_K;
+    for (int i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d);
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        const uint8_t *signs = qs + QK_K / 8;
+        float db[2];
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            db[0] = d * (0.5f + (x[i].scales[ib32] & 0xf)) * 0.25f;
+            db[1] = d * (0.5f + (x[i].scales[ib32] >> 4)) * 0.25f;
+            for (int l = 0; l < 4; ++l) {
+                const float dl = db[l / 2];
+                const uint8_t *grid = (const uint8_t *)(iq2s_grid + (qs[l] | (qh[ib32] << (8 - 2 * l) & 0x300)));
+                for (int j = 0; j < 8; ++j) {
+                    y[j] = dl * grid[j] * (signs[l] & kmask_iq2xs[j] ? -1.f : 1.f);
+                }
+                y += 8;
+            }
+            qs += 4;
+            signs += 4;
+        }
+    }
+}
+
+static DS4_MAYBE_UNUSED void ds4_dequant_row_iq3_xxs(const block_iq3_xxs *x, float *y, int64_t k) {
+    const int64_t nb = k / QK_K;
+    for (int i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d);
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *scales_and_signs = qs + QK_K / 4;
+        uint32_t aux32;
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            memcpy(&aux32, scales_and_signs + 4 * ib32, sizeof(uint32_t));
+            const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * l) & 127];
+                const uint8_t *grid1 = (const uint8_t *)(iq3xxs_grid + qs[2 * l + 0]);
+                const uint8_t *grid2 = (const uint8_t *)(iq3xxs_grid + qs[2 * l + 1]);
+                for (int j = 0; j < 4; ++j) {
+                    y[j + 0] = db * grid1[j] * (signs & kmask_iq2xs[j + 0] ? -1.f : 1.f);
+                    y[j + 4] = db * grid2[j] * (signs & kmask_iq2xs[j + 4] ? -1.f : 1.f);
+                }
+                y += 8;
+            }
+            qs += 8;
+        }
+    }
+}
+
+static DS4_MAYBE_UNUSED void ds4_dequant_row_iq3_s(const block_iq3_s *x, float *y, int64_t k) {
+    const int64_t nb = k / QK_K;
+    for (int i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d);
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        const uint8_t *signs = x[i].signs;
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            const float db1 = d * (1 + 2 * (x[i].scales[ib32 / 2] & 0xf));
+            const float db2 = d * (1 + 2 * (x[i].scales[ib32 / 2] >> 4));
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t *grid1 = (const uint8_t *)(iq3s_grid + (qs[2 * l + 0] | ((qh[0] << (8 - 2 * l)) & 256)));
+                const uint8_t *grid2 = (const uint8_t *)(iq3s_grid + (qs[2 * l + 1] | ((qh[0] << (7 - 2 * l)) & 256)));
+                for (int j = 0; j < 4; ++j) {
+                    y[j + 0] = db1 * grid1[j] * (signs[l] & kmask_iq2xs[j + 0] ? -1.f : 1.f);
+                    y[j + 4] = db1 * grid2[j] * (signs[l] & kmask_iq2xs[j + 4] ? -1.f : 1.f);
+                }
+                y += 8;
+            }
+            qs += 8;
+            signs += 4;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t *grid1 = (const uint8_t *)(iq3s_grid + (qs[2 * l + 0] | ((qh[1] << (8 - 2 * l)) & 256)));
+                const uint8_t *grid2 = (const uint8_t *)(iq3s_grid + (qs[2 * l + 1] | ((qh[1] << (7 - 2 * l)) & 256)));
+                for (int j = 0; j < 4; ++j) {
+                    y[j + 0] = db2 * grid1[j] * (signs[l] & kmask_iq2xs[j + 0] ? -1.f : 1.f);
+                    y[j + 4] = db2 * grid2[j] * (signs[l] & kmask_iq2xs[j + 4] ? -1.f : 1.f);
+                }
+                y += 8;
+            }
+            qh += 2;
+            qs += 8;
+            signs += 4;
+        }
+    }
+}
+
+static DS4_MAYBE_UNUSED void ds4_dequant_row_iq1_m(const block_iq1_m *x, float *y, int64_t k) {
+    const int64_t nb = k / QK_K;
+    for (int i = 0; i < nb; i++) {
+        float delta[4];
+        uint16_t idx[4];
+        const uint16_t *sc = (const uint16_t *)x[i].scales;
+        const uint16_t scale_u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+        const float d = f16_to_f32(scale_u16);
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        for (int ib = 0; ib < QK_K / 32; ++ib) {
+            const float dl1 = d * (2 * ((sc[ib / 2] >> (6 * (ib % 2) + 0)) & 0x7) + 1);
+            const float dl2 = d * (2 * ((sc[ib / 2] >> (6 * (ib % 2) + 3)) & 0x7) + 1);
+            idx[0] = qs[0] | ((qh[0] << 8) & 0x700);
+            idx[1] = qs[1] | ((qh[0] << 4) & 0x700);
+            idx[2] = qs[2] | ((qh[1] << 8) & 0x700);
+            idx[3] = qs[3] | ((qh[1] << 4) & 0x700);
+            delta[0] = qh[0] & 0x08 ? -DS4_IQ1S_DELTA : DS4_IQ1S_DELTA;
+            delta[1] = qh[0] & 0x80 ? -DS4_IQ1S_DELTA : DS4_IQ1S_DELTA;
+            delta[2] = qh[1] & 0x08 ? -DS4_IQ1S_DELTA : DS4_IQ1S_DELTA;
+            delta[3] = qh[1] & 0x80 ? -DS4_IQ1S_DELTA : DS4_IQ1S_DELTA;
+            for (int l = 0; l < 2; ++l) {
+                const int8_t *grid = (const int8_t *)(iq1s_grid + idx[l]);
+                for (int j = 0; j < 8; ++j) {
+                    y[j] = dl1 * (grid[j] + delta[l]);
+                }
+                y += 8;
+            }
+            for (int l = 2; l < 4; ++l) {
+                const int8_t *grid = (const int8_t *)(iq1s_grid + idx[l]);
+                for (int j = 0; j < 8; ++j) {
+                    y[j] = dl2 * (grid[j] + delta[l]);
+                }
+                y += 8;
+            }
+            qs += 4;
+            qh += 2;
+        }
+    }
+}
+
+static DS4_MAYBE_UNUSED void ds4_dequant_row_iq4_xs(const block_iq4_xs *x, float *y, int64_t k) {
+    const int64_t nb = k / QK_K;
+    for (int i = 0; i < nb; i++) {
+        const uint8_t *qs = x[i].qs;
+        const float d = f16_to_f32(x[i].d);
+        for (int ib = 0; ib < QK_K / 32; ++ib) {
+            const int ls = ((x[i].scales_l[ib / 2] >> 4 * (ib % 2)) & 0xf) | (((x[i].scales_h >> 2 * ib) & 3) << 4);
+            const float dl = d * (ls - 32);
+            for (int j = 0; j < 16; ++j) {
+                y[j + 0] = dl * kvalues_iq4nl[qs[j] & 0xf];
+                y[j + 16] = dl * kvalues_iq4nl[qs[j] >> 4];
+            }
+            y += 32;
+            qs += 16;
+        }
+    }
+}
+
+/* Dequant-based reference dot products: one block dequantized to a local
+ * buffer, then a plain dot with the float row. Correctness over speed — the
+ * CPU path is the reference implementation. */
+#define DS4_IQ_VEC_DOT(name, block_t, dequant_fn)                                                    \
+    static DS4_MAYBE_UNUSED float name(int n, const block_t *x, const float *y) {                   \
+        const int nb = n / QK_K;                                                                     \
+        float sumf = 0.0f;                                                                           \
+        float buf[QK_K];                                                                             \
+        for (int i = 0; i < nb; i++) {                                                               \
+            dequant_fn(x + i, buf, QK_K);                                                            \
+            const float *yb = y + (uint64_t)i * QK_K;                                                \
+            for (int j = 0; j < QK_K; j++) {                                                         \
+                sumf += buf[j] * yb[j];                                                              \
+            }                                                                                        \
+        }                                                                                            \
+        return sumf;                                                                                 \
+    }
+
+DS4_IQ_VEC_DOT(ds4_vec_dot_iq2_xs_f32, block_iq2_xs, ds4_dequant_row_iq2_xs)
+DS4_IQ_VEC_DOT(ds4_vec_dot_iq2_s_f32, block_iq2_s, ds4_dequant_row_iq2_s)
+DS4_IQ_VEC_DOT(ds4_vec_dot_iq3_xxs_f32, block_iq3_xxs, ds4_dequant_row_iq3_xxs)
+DS4_IQ_VEC_DOT(ds4_vec_dot_iq3_s_f32, block_iq3_s, ds4_dequant_row_iq3_s)
+DS4_IQ_VEC_DOT(ds4_vec_dot_iq1_m_f32, block_iq1_m, ds4_dequant_row_iq1_m)
+DS4_IQ_VEC_DOT(ds4_vec_dot_iq4_xs_f32, block_iq4_xs, ds4_dequant_row_iq4_xs)
 
 static void ds4_vec_dot_q8_K_q8_K(int n, float *s,
                                   const block_q8_K *x,
