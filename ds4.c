@@ -939,7 +939,7 @@ typedef struct {
     uint8_t  qs[QK_K / 2];
 } block_iq4_xs;
 
-/* iq1_m rows have a 16-bit scale appended after the blocks (see ggml). */
+/* IQ1_M packs each block's fp16 scale into the high nibbles of scales. */
 typedef struct {
     uint8_t qs[QK_K / 8];
     uint8_t qh[QK_K / 16];
@@ -4254,6 +4254,75 @@ static DS4_MAYBE_UNUSED void ds4_dequant_row_iq4_xs(const block_iq4_xs *x, float
 /* Dequant-based reference dot products: one block dequantized to a local
  * buffer, then a plain dot with the float row. Correctness over speed — the
  * CPU path is the reference implementation. */
+static DS4_MAYBE_UNUSED void ds4_dequant_row_iq2_xxs(const block_iq2_xxs *x, float *y, int64_t k) {
+    pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
+    const int64_t nb = k / QK_K;
+    uint32_t aux32[2];
+    const uint8_t *aux8 = (const uint8_t *)aux32;
+    for (int i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d);
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            memcpy(aux32, x[i].qs + 4 * ib32, 2 * sizeof(uint32_t));
+            const float db = d * (0.5f + (aux32[1] >> 28)) * 0.25f;
+            for (int l = 0; l < 4; ++l) {
+                const uint32_t sign_idx = (aux32[1] >> (7 * l)) & 127u;
+                const int8_t *grid = iq2xxs_signed_grid[aux8[l]][sign_idx];
+                for (int j = 0; j < 8; ++j) y[j] = db * (float)grid[j];
+                y += 8;
+            }
+        }
+    }
+}
+
+static void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
+    if (j < 4) { *d = q[j] & 63; *m = q[j + 4] & 63; }
+    else { *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); *m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4); }
+}
+
+static DS4_MAYBE_UNUSED void ds4_dequant_row_q4_K(const block_q4_K *x, float *y, int64_t k) {
+    const int64_t nb = k / QK_K;
+    for (int i = 0; i < nb; i++) {
+        const uint8_t *q = x[i].qs;
+        const float d = f16_to_f32(x[i].d);
+        const float min = f16_to_f32(x[i].dmin);
+        int is = 0;
+        uint8_t sc, m;
+        for (int j = 0; j < QK_K; j += 64) {
+            get_scale_min_k4(is + 0, x[i].scales, &sc, &m);
+            const float d1 = d * sc; const float m1 = min * m;
+            get_scale_min_k4(is + 1, x[i].scales, &sc, &m);
+            const float d2 = d * sc; const float m2 = min * m;
+            for (int l = 0; l < 32; ++l) *y++ = d1 * (q[l] & 0xF) - m1;
+            for (int l = 0; l < 32; ++l) *y++ = d2 * (q[l] >> 4) - m2;
+            q += 32; is += 2;
+        }
+    }
+}
+
+static DS4_MAYBE_UNUSED void ds4_dequant_row_q2_K(const block_q2_K *x, float *y, int64_t k) {
+    const int64_t nb = k / QK_K;
+    for (int i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d);
+        const float min = f16_to_f32(x[i].dmin);
+        const uint8_t *q = x[i].qs;
+        int is = 0;
+        float dl, ml;
+        for (int n = 0; n < QK_K; n += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                uint8_t sc = x[i].scales[is++];
+                dl = d * (sc & 0xF); ml = min * (sc >> 4);
+                for (int l = 0; l < 16; ++l) *y++ = dl * ((int8_t)((q[l] >> shift) & 3)) - ml;
+                sc = x[i].scales[is++];
+                dl = d * (sc & 0xF); ml = min * (sc >> 4);
+                for (int l = 0; l < 16; ++l) *y++ = dl * ((int8_t)((q[l + 16] >> shift) & 3)) - ml;
+                shift += 2;
+            }
+            q += 32;
+        }
+    }
+}
+
 #define DS4_IQ_VEC_DOT(name, block_t, dequant_fn)                                                    \
     static DS4_MAYBE_UNUSED float name(int n, const block_t *x, const float *y) {                   \
         const int nb = n / QK_K;                                                                     \
@@ -7128,6 +7197,586 @@ static void weights_bind_qwen38(ds4_qwen38_weights *w, const ds4_model *m) {
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         weights_bind_qwen38_layer(&w->layer[il], m, il);
     }
+}
+
+/* ===== Qwen3.8-27B CPU reference forward (fase 1d) =====
+ * Autoregressive form only: prefill replays tokens one at a time.  This is
+ * the numerical reference the CUDA graph must match.  Math follows llama.cpp
+ * qwen35.cpp + delta-net-base.cpp + ggml-quants.c (MIT). */
+
+static void rms_norm_weight(float *out, const float *x, const float *weight,
+                            uint64_t n, float eps);
+
+static float qwen38_silu(float x) {
+    return x / (1.0f + expf(-x));
+}
+
+static float qwen38_sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+typedef struct {
+    /* GDN state per linear-attention layer (48), layer order gdn_idx = il - il/4.
+     * S is [n_v_head][ssm_dim][ssm_dim] per layer. */
+    float *ssm_state;
+    /* Conv1d history per GDN layer: (conv_kernel-1) x conv_dim. */
+    float *conv_state;
+    /* GQA K/V per full-attention layer (16): [ctx][n_head_kv*head_dim]. */
+    float *attn_k;
+    float *attn_v;
+    float *xnorm;   /* 5120 — norm scratch */
+    float *hidden;  /* 5120 — live hidden state (residual target) */
+    float *qkv;     /* 10240 */
+    float *z;       /* 6144 */
+    float *beta;    /* 48 */
+    float *alpha;   /* 48 */
+    float *o;       /* 6144 */
+    float *attn;    /* 6144 — GA head output, also used for 5120-wide residuals */
+    float *ffn_g;   /* 17408 */
+    float *ffn_u;   /* 17408 */
+    float *ffn_m;   /* 17408 */
+    float *scores;  /* 24 * ctx_size; one independent row per query head */
+    float *q_full;  /* 24*512 */
+    uint32_t ctx_size;
+} ds4_qwen38_cpu_state;
+
+static ds4_context_memory qwen38_cpu_memory_estimate(int ctx_size) {
+    const uint64_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
+    ds4_context_memory m = {0};
+    m.raw_cap = (uint32_t)ctx;
+    /* GA K/V plus fixed GDN recurrent state and raw convolution history.
+     * None of this state is a DeepSeek compressed-KV cache. */
+    m.raw_bytes = (16ull * ctx * 1024 * 2 + 48ull * 48 * 128 * 128 +
+                   48ull * 3 * QWEN38_CONV_DIM) * sizeof(float);
+    m.scratch_bytes = (2ull * QWEN38_N_EMBD + QWEN38_CONV_DIM +
+                       3ull * QWEN38_VALUE_DIM + 2ull * QWEN38_N_V_HEAD +
+                       3ull * QWEN38_N_FF + QWEN38_N_HEAD * ctx +
+                       24ull * 512 + DS4_N_VOCAB) * sizeof(float);
+    m.total_bytes = m.raw_bytes + m.scratch_bytes;
+    return m;
+}
+
+static void qwen38_cpu_state_init(ds4_qwen38_cpu_state *st, uint32_t ctx_size) {
+    memset(st, 0, sizeof(*st));
+    st->ctx_size = ctx_size;
+    st->ssm_state = xcalloc(48ull * 48 * 128 * 128, sizeof(float));
+    st->conv_state = xcalloc(48ull * 3 * QWEN38_CONV_DIM, sizeof(float));
+    st->attn_k = xcalloc(16ull * ctx_size * 1024, sizeof(float));
+    st->attn_v = xcalloc(16ull * ctx_size * 1024, sizeof(float));
+    st->xnorm = xmalloc(QWEN38_N_EMBD * sizeof(float));
+    st->hidden = xmalloc(QWEN38_N_EMBD * sizeof(float));
+    st->qkv = xmalloc(QWEN38_CONV_DIM * sizeof(float));
+    st->z = xmalloc(QWEN38_VALUE_DIM * sizeof(float));
+    st->beta = xmalloc(QWEN38_N_V_HEAD * sizeof(float));
+    st->alpha = xmalloc(QWEN38_N_V_HEAD * sizeof(float));
+    st->o = xmalloc(QWEN38_VALUE_DIM * sizeof(float));
+    st->attn = xmalloc(24 * 256 * sizeof(float)); /* GA attn out needs 24*256 */
+    st->ffn_g = xmalloc(QWEN38_N_FF * sizeof(float));
+    st->ffn_u = xmalloc(QWEN38_N_FF * sizeof(float));
+    st->ffn_m = xmalloc(QWEN38_N_FF * sizeof(float));
+    st->scores = xmalloc(QWEN38_N_HEAD * (uint64_t)ctx_size * sizeof(float));
+    st->q_full = xmalloc(24 * 512 * sizeof(float));
+}
+
+static void qwen38_cpu_state_free(ds4_qwen38_cpu_state *st) {
+    free(st->ssm_state);
+    free(st->conv_state);
+    free(st->attn_k);
+    free(st->attn_v);
+    free(st->xnorm);
+    free(st->hidden);
+    free(st->qkv);
+    free(st->z);
+    free(st->beta);
+    free(st->alpha);
+    free(st->o);
+    free(st->attn);
+    free(st->ffn_g);
+    free(st->ffn_u);
+    free(st->ffn_m);
+    free(st->scores);
+    free(st->q_full);
+    memset(st, 0, sizeof(*st));
+}
+
+static void qwen38_cpu_state_zero(ds4_qwen38_cpu_state *st) {
+    memset(st->ssm_state, 0, 48ull * 48 * 128 * 128 * sizeof(float));
+    memset(st->conv_state, 0, 48ull * 3 * QWEN38_CONV_DIM * sizeof(float));
+    memset(st->attn_k, 0, 16ull * st->ctx_size * 1024 * sizeof(float));
+    memset(st->attn_v, 0, 16ull * st->ctx_size * 1024 * sizeof(float));
+}
+
+static void qwen38_dequant_row(uint32_t type, const uint8_t *row, uint64_t n, float *out) {
+    switch (type) {
+    case DS4_TENSOR_F32:
+        memcpy(out, row, n * sizeof(float));
+        return;
+    case DS4_TENSOR_F16: {
+        const uint16_t *r = (const uint16_t *)row;
+        for (uint64_t i = 0; i < n; i++) out[i] = f16_to_f32(r[i]);
+        return;
+    }
+    case DS4_TENSOR_BF16: {
+        const uint16_t *r = (const uint16_t *)row;
+        for (uint64_t i = 0; i < n; i++) {
+            uint32_t bits = (uint32_t)r[i] << 16;
+            float f;
+            memcpy(&f, &bits, sizeof(f));
+            out[i] = f;
+        }
+        return;
+    }
+    case DS4_TENSOR_Q2_K:
+        ds4_dequant_row_q2_K((const block_q2_K *)row, out, (int64_t)n);
+        return;
+    case DS4_TENSOR_Q4_K:
+        ds4_dequant_row_q4_K((const block_q4_K *)row, out, (int64_t)n);
+        return;
+    case DS4_TENSOR_IQ2_XXS:
+        ds4_dequant_row_iq2_xxs((const block_iq2_xxs *)row, out, (int64_t)n);
+        return;
+    case DS4_TENSOR_IQ2_XS:
+        ds4_dequant_row_iq2_xs((const block_iq2_xs *)row, out, (int64_t)n);
+        return;
+    case DS4_TENSOR_IQ2_S:
+        ds4_dequant_row_iq2_s((const block_iq2_s *)row, out, (int64_t)n);
+        return;
+    case DS4_TENSOR_IQ3_XXS:
+        ds4_dequant_row_iq3_xxs((const block_iq3_xxs *)row, out, (int64_t)n);
+        return;
+    case DS4_TENSOR_IQ3_S:
+        ds4_dequant_row_iq3_s((const block_iq3_s *)row, out, (int64_t)n);
+        return;
+    case DS4_TENSOR_IQ1_M:
+        ds4_dequant_row_iq1_m((const block_iq1_m *)row, out, (int64_t)n);
+        return;
+    case DS4_TENSOR_IQ4_XS:
+        ds4_dequant_row_iq4_xs((const block_iq4_xs *)row, out, (int64_t)n);
+        return;
+    default:
+        ds4_die("qwen38 dequant: unsupported tensor type");
+    }
+}
+
+static float qwen38_row_dot(uint32_t type, int n, const uint8_t *row, const float *x) {
+    switch (type) {
+    case DS4_TENSOR_F32: {
+        const float *r = (const float *)row;
+        float s = 0.0f;
+        for (int i = 0; i < n; i++) s += r[i] * x[i];
+        return s;
+    }
+    case DS4_TENSOR_F16: {
+        const uint16_t *r = (const uint16_t *)row;
+        float s = 0.0f;
+        for (int i = 0; i < n; i++) s += f16_to_f32(r[i]) * x[i];
+        return s;
+    }
+    case DS4_TENSOR_BF16: {
+        const uint16_t *r = (const uint16_t *)row;
+        float s = 0.0f;
+        for (int i = 0; i < n; i++) {
+            uint32_t bits = (uint32_t)r[i] << 16;
+            float f;
+            memcpy(&f, &bits, sizeof(f));
+            s += f * x[i];
+        }
+        return s;
+    }
+    case DS4_TENSOR_Q2_K:
+        return ds4_vec_dot_q2_K_f32(n, (const block_q2_K *)row, x);
+    case DS4_TENSOR_Q4_K:
+        return ds4_vec_dot_q4_K_f32(n, (const block_q4_K *)row, x);
+    case DS4_TENSOR_Q5_K:
+    case DS4_TENSOR_Q6_K:
+        return ds4_vec_dot_q5_q6_K_f32(type, n, row, x);
+    case DS4_TENSOR_IQ2_XXS:
+        return ds4_vec_dot_iq2_xxs_f32(n, (const block_iq2_xxs *)row, x);
+    case DS4_TENSOR_IQ2_XS:
+        return ds4_vec_dot_iq2_xs_f32(n, (const block_iq2_xs *)row, x);
+    case DS4_TENSOR_IQ2_S:
+        return ds4_vec_dot_iq2_s_f32(n, (const block_iq2_s *)row, x);
+    case DS4_TENSOR_IQ3_XXS:
+        return ds4_vec_dot_iq3_xxs_f32(n, (const block_iq3_xxs *)row, x);
+    case DS4_TENSOR_IQ3_S:
+        return ds4_vec_dot_iq3_s_f32(n, (const block_iq3_s *)row, x);
+    case DS4_TENSOR_IQ1_M:
+        return ds4_vec_dot_iq1_m_f32(n, (const block_iq1_m *)row, x);
+    case DS4_TENSOR_IQ4_XS:
+        return ds4_vec_dot_iq4_xs_f32(n, (const block_iq4_xs *)row, x);
+    default:
+        ds4_die("qwen38 row dot: unsupported tensor type");
+    }
+    return 0.0f;
+}
+
+typedef struct {
+    float *out;
+    const ds4_tensor *w;
+    const uint8_t *data;
+    const float *x;
+    uint64_t row_bytes;
+    uint32_t type;
+    int in_dim;
+} qwen38_matvec_ctx;
+
+static void qwen38_matvec_worker(void *vctx, uint64_t r0, uint64_t r1) {
+    qwen38_matvec_ctx *ctx = vctx;
+    for (uint64_t r = r0; r < r1; r++) {
+        ctx->out[r] = qwen38_row_dot(ctx->type, ctx->in_dim,
+                                     ctx->data + r * ctx->row_bytes, ctx->x);
+    }
+}
+
+static void qwen38_matvec(float *out, const ds4_model *m, const ds4_tensor *w, const float *x) {
+    uint64_t row_bytes = 0;
+    if (!tensor_nbytes(w->type, w->dim[0], &row_bytes)) ds4_die("qwen38 matvec: bad tensor");
+    qwen38_matvec_ctx ctx = {
+        .out = out,
+        .w = w,
+        .data = (const uint8_t *)tensor_data(m, w),
+        .x = x,
+        .row_bytes = row_bytes,
+        .type = w->type,
+        .in_dim = (int)w->dim[0],
+    };
+    ds4_parallel_for(w->dim[1], qwen38_matvec_worker, &ctx);
+}
+
+static void qwen38_rope_inplace(float *v, uint32_t n_rot, uint32_t pos) {
+    /* Text IMRoPE has identical t/h/w positions, but still uses NeoX
+     * split-half pairs, not adjacent pairs. The unrotated head tail is kept. */
+    const uint32_t half = n_rot / 2;
+    for (uint32_t i = 0; i < half; i++) {
+        const float inv_freq = 1.0f / powf(1.0e7f, (float)(2 * i) / (float)n_rot);
+        const float angle = (float)pos * inv_freq;
+        const float c = cosf(angle), s = sinf(angle);
+        const float a = v[i], b = v[i + half];
+        v[i] = a * c - b * s;
+        v[i + half] = a * s + b * c;
+    }
+}
+
+static void qwen38_ffn_tail(ds4_qwen38_cpu_state *st,
+                            const ds4_qwen38_layer_weights *l,
+                            const ds4_model *m,
+                            float *x) {
+    rms_norm_weight(st->xnorm, x,
+                    (const float *)tensor_data(m, l->attn_post_norm),
+                    QWEN38_N_EMBD, 1.0e-6f);
+    qwen38_matvec(st->ffn_g, m, l->ffn_gate, st->xnorm);
+    qwen38_matvec(st->ffn_u, m, l->ffn_up, st->xnorm);
+    for (uint32_t i = 0; i < QWEN38_N_FF; i++) {
+        st->ffn_m[i] = qwen38_silu(st->ffn_g[i]) * st->ffn_u[i];
+    }
+    qwen38_matvec(st->attn, m, l->ffn_down, st->ffn_m);
+    for (uint32_t i = 0; i < QWEN38_N_EMBD; i++) x[i] += st->attn[i];
+}
+
+typedef struct {
+    float *S;
+    const float *q;
+    const float *k;
+    const float *v;
+    const float *beta;
+    const float *alpha;
+    const float *a;
+    const float *dt;
+    float *o;
+    const float *z;
+    const float *ssm_norm;
+    float q_scale;
+    float eps;
+} qwen38_gdn_head_ctx;
+
+static void qwen38_gdn_head_worker(void *vctx, uint64_t h0, uint64_t h1) {
+    qwen38_gdn_head_ctx *c = vctx;
+    for (uint32_t h = (uint32_t)h0; h < (uint32_t)h1; h++) {
+        float *Sh = c->S + (uint64_t)h * 128 * 128;
+        const float *qh = c->q + (uint64_t)(h % QWEN38_N_QK_HEAD) * QWEN38_SSM_DIM;
+        const float *kh = c->k + (uint64_t)(h % QWEN38_N_QK_HEAD) * QWEN38_SSM_DIM;
+        const float *vh = c->v + (uint64_t)h * QWEN38_SSM_DIM;
+        const float beta_h = qwen38_sigmoid(c->beta[h]);
+        const float decay = expf(log1pf(expf(c->alpha[h] + c->dt[h])) * c->a[h]);
+
+        for (uint32_t i = 0; i < 128; i++) {
+            float *row = Sh + (uint64_t)i * 128;
+            for (uint32_t j = 0; j < 128; j++) row[j] *= decay;
+        }
+        /* sk = Sᵀ·k (ggml sum_rows reduces ne[0]). */
+        float sk[128];
+        for (uint32_t j = 0; j < 128; j++) {
+            float s = 0.0f;
+            for (uint32_t i = 0; i < 128; i++) s += Sh[(uint64_t)i * 128 + j] * kh[i];
+            sk[j] = s;
+        }
+        float d[128];
+        for (uint32_t i = 0; i < 128; i++) d[i] = (vh[i] - sk[i]) * beta_h;
+        for (uint32_t i = 0; i < 128; i++) {
+            float *row = Sh + (uint64_t)i * 128;
+            const float ki = kh[i];
+            for (uint32_t j = 0; j < 128; j++) row[j] += ki * d[j];
+        }
+        /* o = Sᵀ·q. */
+        float *oh = c->o + (uint64_t)h * 128;
+        for (uint32_t j = 0; j < 128; j++) {
+            float s = 0.0f;
+            for (uint32_t i = 0; i < 128; i++) s += Sh[(uint64_t)i * 128 + j] * qh[i] * c->q_scale;
+            oh[j] = s;
+        }
+        rms_norm_weight(oh, oh, c->ssm_norm, 128, c->eps);
+        const float *zh = c->z + (uint64_t)h * 128;
+        for (uint32_t i = 0; i < 128; i++) oh[i] *= qwen38_silu(zh[i]);
+    }
+}
+
+static void qwen38_conv_step(float *qkv, float *history, const float *weights) {
+    /* Causal depthwise conv1d: t-3,t-2,t-1 plus the raw current projection.
+     * Save raw inputs before SiLU; channels have independent histories. */
+    for (uint32_t d = 0; d < QWEN38_CONV_DIM; d++) {
+        float y = 0.0f;
+        for (uint32_t k = 0; k < 3; k++) {
+            y += weights[(uint64_t)d * QWEN38_SSM_CONV + k] *
+                 history[(uint64_t)k * QWEN38_CONV_DIM + d];
+        }
+        const float raw = qkv[d];
+        y += weights[(uint64_t)d * QWEN38_SSM_CONV + 3] * raw;
+        history[d] = history[QWEN38_CONV_DIM + d];
+        history[QWEN38_CONV_DIM + d] = history[2ull * QWEN38_CONV_DIM + d];
+        history[2ull * QWEN38_CONV_DIM + d] = raw;
+        qkv[d] = qwen38_silu(y);
+    }
+}
+
+static void qwen38_layer_gdn(ds4_qwen38_cpu_state *st,
+                             const ds4_qwen38_layer_weights *l,
+                             const ds4_model *m,
+                             uint32_t gdn_idx,
+                             float *x) {
+    const float eps = 1.0e-6f;
+    rms_norm_weight(st->xnorm, x,
+                    (const float *)tensor_data(m, l->attn_norm),
+                    QWEN38_N_EMBD, eps);
+    qwen38_matvec(st->qkv, m, l->attn_qkv, st->xnorm);
+    qwen38_matvec(st->z, m, l->attn_gate, st->xnorm);
+    qwen38_matvec(st->alpha, m, l->ssm_alpha, st->xnorm);
+    qwen38_matvec(st->beta, m, l->ssm_beta, st->xnorm);
+
+    float *cs = st->conv_state + (uint64_t)gdn_idx * 3 * QWEN38_CONV_DIM;
+    qwen38_conv_step(st->qkv, cs, (const float *)tensor_data(m, l->ssm_conv1d));
+
+    float *q = st->qkv;
+    float *k = st->qkv + QWEN38_KEY_DIM;
+    float *v = st->qkv + 2 * QWEN38_KEY_DIM;
+
+    /* L2-normalize q and k per head: x / sqrt(sum(x^2) + eps). */
+    for (uint32_t h = 0; h < QWEN38_N_QK_HEAD; h++) {
+        float *qh = q + (uint64_t)h * QWEN38_SSM_DIM;
+        float *kh = k + (uint64_t)h * QWEN38_SSM_DIM;
+        float sq = 0.0f, sk = 0.0f;
+        for (uint32_t i = 0; i < QWEN38_SSM_DIM; i++) {
+            sq += qh[i] * qh[i];
+            sk += kh[i] * kh[i];
+        }
+        const float nq = 1.0f / sqrtf(sq + eps);
+        const float nk = 1.0f / sqrtf(sk + eps);
+        for (uint32_t i = 0; i < QWEN38_SSM_DIM; i++) {
+            qh[i] *= nq;
+            kh[i] *= nk;
+        }
+    }
+
+    const float *a = (const float *)tensor_data(m, l->ssm_a);
+    const float *dt = (const float *)tensor_data(m, l->ssm_dt);
+    float *S = st->ssm_state + (uint64_t)gdn_idx * 48 * 128 * 128;
+    const float q_scale = 1.0f / sqrtf((float)QWEN38_SSM_DIM);
+
+
+    qwen38_gdn_head_ctx gdn_ctx = {
+        .S = S,
+        .q = q,
+        .k = k,
+        .v = v,
+        .beta = st->beta,
+        .alpha = st->alpha,
+        .a = a,
+        .dt = dt,
+        .o = st->o,
+        .z = st->z,
+        .ssm_norm = (const float *)tensor_data(m, l->ssm_norm),
+        .q_scale = q_scale,
+        .eps = eps,
+    };
+    ds4_parallel_for(QWEN38_N_V_HEAD, qwen38_gdn_head_worker, &gdn_ctx);
+
+    qwen38_matvec(st->attn, m, l->ssm_out, st->o);
+    for (uint32_t i = 0; i < QWEN38_N_EMBD; i++) x[i] += st->attn[i];
+    qwen38_ffn_tail(st, l, m, x);
+}
+
+typedef struct {
+    float *scores;
+    const float *kcache;
+    const float *vcache;
+    const float *q_full;
+    float *out;
+    uint32_t n_attend;
+    uint32_t ctx_size;
+    float kq_scale;
+} qwen38_ga_head_ctx;
+
+static void qwen38_ga_head_worker(void *vctx, uint64_t h0, uint64_t h1) {
+    qwen38_ga_head_ctx *c = vctx;
+    for (uint32_t hq = (uint32_t)h0; hq < (uint32_t)h1; hq++) {
+        const float *qh = c->q_full + (uint64_t)hq * 512;
+        const float *gh = qh + QWEN38_HEAD_DIM;
+        float *out = c->out + (uint64_t)hq * QWEN38_HEAD_DIM;
+        float *scores = c->scores + (uint64_t)hq * c->ctx_size;
+
+        /* GQA maps six consecutive query heads to one KV head. Softmax
+         * spans causal positions only, not the other KV heads. */
+        const uint32_t hkv = hq / (QWEN38_N_HEAD / QWEN38_N_HEAD_KV);
+        float max_s = -INFINITY;
+        for (uint32_t t = 0; t < c->n_attend; t++) {
+            const float *kh = c->kcache + (uint64_t)t * 1024 + (uint64_t)hkv * QWEN38_HEAD_DIM;
+            float s = 0.0f;
+            for (uint32_t d = 0; d < QWEN38_HEAD_DIM; d++) s += qh[d] * kh[d];
+            scores[t] = s * c->kq_scale;
+            if (scores[t] > max_s) max_s = scores[t];
+        }
+        float sum = 0.0f;
+        for (uint32_t t = 0; t < c->n_attend; t++) {
+            scores[t] = expf(scores[t] - max_s);
+            sum += scores[t];
+        }
+        const float inv = 1.0f / sum;
+        memset(out, 0, QWEN38_HEAD_DIM * sizeof(float));
+        for (uint32_t t = 0; t < c->n_attend; t++) {
+            const float *vh = c->vcache + (uint64_t)t * 1024 + (uint64_t)hkv * QWEN38_HEAD_DIM;
+            const float wv = scores[t] * inv;
+            for (uint32_t d = 0; d < QWEN38_HEAD_DIM; d++) out[d] += wv * vh[d];
+        }
+        for (uint32_t d = 0; d < QWEN38_HEAD_DIM; d++) {
+            out[d] *= qwen38_sigmoid(gh[d]);
+        }
+    }
+}
+
+static void qwen38_layer_ga(ds4_qwen38_cpu_state *st,
+                            const ds4_qwen38_layer_weights *l,
+                            const ds4_model *m,
+                            uint32_t ga_idx,
+                            uint32_t pos,
+                            float *x) {
+    const float eps = 1.0e-6f;
+    rms_norm_weight(st->xnorm, x,
+                    (const float *)tensor_data(m, l->attn_norm),
+                    QWEN38_N_EMBD, eps);
+    qwen38_matvec(st->q_full, m, l->attn_q, st->xnorm);
+    qwen38_matvec(st->z, m, l->attn_k, st->xnorm);       /* k, 1024 */
+    qwen38_matvec(st->attn, m, l->attn_v, st->xnorm);    /* v, 1024 */
+
+    const float *qn = (const float *)tensor_data(m, l->attn_q_norm);
+    const float *kn = (const float *)tensor_data(m, l->attn_k_norm);
+
+    /* q_norm + rope per head; gate part collected separately. */
+    for (uint32_t h = 0; h < QWEN38_N_HEAD; h++) {
+        float *qh = st->q_full + (uint64_t)h * 512;
+        rms_norm_weight(qh, qh, qn, QWEN38_HEAD_DIM, eps);
+        qwen38_rope_inplace(qh, 64, pos);
+    }
+    float *kt = st->z;
+    for (uint32_t h = 0; h < QWEN38_N_HEAD_KV; h++) {
+        float *kh = kt + (uint64_t)h * QWEN38_HEAD_DIM;
+        rms_norm_weight(kh, kh, kn, QWEN38_HEAD_DIM, eps);
+        qwen38_rope_inplace(kh, 64, pos);
+    }
+
+    if (pos < st->ctx_size) {
+        float *kc = st->attn_k + (uint64_t)ga_idx * st->ctx_size * 1024 + (uint64_t)pos * 1024;
+        float *vc = st->attn_v + (uint64_t)ga_idx * st->ctx_size * 1024 + (uint64_t)pos * 1024;
+        memcpy(kc, kt, 1024 * sizeof(float));
+        memcpy(vc, st->attn, 1024 * sizeof(float));
+    }
+
+    const float kq_scale = 1.0f / sqrtf((float)QWEN38_HEAD_DIM);
+    const float *kcache = st->attn_k + (uint64_t)ga_idx * st->ctx_size * 1024;
+    const float *vcache = st->attn_v + (uint64_t)ga_idx * st->ctx_size * 1024;
+    const uint32_t n_attend = pos < st->ctx_size ? pos + 1 : st->ctx_size;
+
+    qwen38_ga_head_ctx ga_ctx = {
+        .scores = st->scores,
+        .kcache = kcache,
+        .vcache = vcache,
+        .q_full = st->q_full,
+        .out = st->attn,
+        .n_attend = n_attend,
+        .ctx_size = st->ctx_size,
+        .kq_scale = kq_scale,
+    };
+    ds4_parallel_for(QWEN38_N_HEAD, qwen38_ga_head_worker, &ga_ctx);
+
+    qwen38_matvec(st->z, m, l->attn_output, st->attn);
+    for (uint32_t i = 0; i < QWEN38_N_EMBD; i++) x[i] += st->z[i];
+    qwen38_ffn_tail(st, l, m, x);
+}
+
+static void qwen38_cpu_forward_token(ds4_qwen38_cpu_state *st,
+                                     const ds4_model *m,
+                                     const ds4_qwen38_weights *w,
+                                     int token, uint32_t pos,
+                                     float *logits) {
+    uint64_t row_bytes = 0;
+    if (!tensor_nbytes(w->token_embd->type, w->token_embd->dim[0], &row_bytes)) {
+        ds4_die("qwen38 forward: bad token_embd");
+    }
+    const uint8_t *emb = (const uint8_t *)tensor_data(m, w->token_embd) +
+                         (uint64_t)token * row_bytes;
+    qwen38_dequant_row(w->token_embd->type, emb, w->token_embd->dim[0], st->hidden);
+
+    if (getenv("DS4_EMBD_DUMP")) {
+        for (int i = 0; i < 16; i++) {
+            fprintf(stderr, "E%d %.6f\n", i, st->hidden[i]);
+        }
+    }
+
+    static long hidden_layer = -2;
+    static bool hidden_layer_init = false;
+    static long hidden_tok = -2;
+    static bool hidden_tok_init = false;
+    if (!hidden_layer_init) {
+        hidden_layer_init = true;
+        const char *env = getenv("DS4_HIDDEN_LAYER");
+        hidden_layer = env ? atol(env) : -1;
+    }
+    if (!hidden_tok_init) {
+        hidden_tok_init = true;
+        const char *env = getenv("DS4_HIDDEN_TOK");
+        hidden_tok = env ? atol(env) : -1;
+    }
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if ((long)il == hidden_layer && ((long)pos == hidden_tok || hidden_tok < 0)) {
+            for (int i = 0; i < 8; i++) {
+                fprintf(stderr, "H%d %.6f\n", i, st->hidden[i]);
+            }
+        }
+        if (((il + 1) % 4) != 0) {
+            qwen38_layer_gdn(st, &w->layer[il], m, il - il / 4, st->hidden);
+        } else {
+            qwen38_layer_ga(st, &w->layer[il], m, il / 4, pos, st->hidden);
+        }
+    }
+
+    rms_norm_weight(st->xnorm, st->hidden,
+                    (const float *)tensor_data(m, w->output_norm),
+                    QWEN38_N_EMBD, 1.0e-6f);
+    if (hidden_layer == 64 && ((long)pos == hidden_tok || hidden_tok < 0)) {
+        for (int i = 0; i < 8; i++) {
+            fprintf(stderr, "H%d %.6f\n", i, st->xnorm[i]);
+        }
+    }
+    qwen38_matvec(logits, m, w->output, st->xnorm);
 }
 
 static void weights_bind(
@@ -38782,6 +39431,8 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         int         ctx_size,
         uint32_t    prefill_chunk,
         bool        ssd_streaming) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN38 && backend == DS4_BACKEND_CPU)
+        return qwen38_cpu_memory_estimate(ctx_size);
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
 
@@ -40163,7 +40814,7 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, t
             }
             if (last_nl > pos) {
                 pos = last_nl;
-            } else if (p5 - pos > 1 && p5 < len) {
+            } else if (last_ws_start > pos && p5 < len) {
                 /* Rule 6: \s+(?!\S) — leave one whitespace character so it
                  * can join the following word (GPT-4 backtracking semantics). */
                 pos = last_ws_start;
@@ -54403,6 +55054,8 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
     (void)backend;
     (void)prefill_chunk;
     (void)ssd_streaming;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN38)
+        return qwen38_cpu_memory_estimate(ctx_size);
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
 
@@ -55115,6 +55768,7 @@ struct ds4_session {
 #endif
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
+    ds4_qwen38_cpu_state qwen38_state;
     token_vec checkpoint;
     ds4_vision_identity *checkpoint_images;
     size_t checkpoint_image_count;
@@ -56094,6 +56748,10 @@ static void ds4_session_dspark_capture_note_checkpoint(ds4_session *s) {
 #else
     (void)s;
 #endif
+}
+
+static bool ds4_session_is_qwen38(const ds4_session *s) {
+    return s && s->engine && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN38;
 }
 
 static bool ds4_session_is_glm(const ds4_session *s) {
@@ -57195,7 +57853,7 @@ static void session_greedy_splitkv_reset(ds4_session *s) {
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
     if (!s || !s->checkpoint_valid) return 0;
-    if (s->distributed) return 0;
+    if (s->distributed || ds4_session_is_qwen38(s)) return 0;
     if (ds4_session_is_cpu(s)) {
         uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
         bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
@@ -57323,6 +57981,10 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
+        return 1;
+    }
+    if (ds4_session_is_qwen38(s)) {
+        payload_set_err(err, errlen, "Qwen3.8 recurrent-state serialization is not implemented");
         return 1;
     }
     if (s->distributed) {
@@ -57663,6 +58325,10 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
+        return 1;
+    }
+    if (ds4_session_is_qwen38(s)) {
+        payload_set_err(err, errlen, "Qwen3.8 recurrent-state serialization is not implemented");
         return 1;
     }
     if (s->distributed) {
@@ -59429,6 +60095,83 @@ static int ds4_session_eval_splitkv_spec_after_first(
  * 4. fall back to ordinary one-token decode if the fast verifier cannot prove
  *    the target stream. */
 
+/* Qwen3.8 CPU generation: session loop with greedy argmax sampling.  The
+ * CPU reference has no graph/TP/distributed paths yet. */
+static int qwen38_generate_cpu(
+        ds4_engine        *e,
+        const ds4_tokens  *prompt,
+        int                n_predict,
+        int                ctx_size,
+        ds4_token_emit_fn  emit,
+        ds4_generation_done_fn done,
+        void              *emit_ud,
+        ds4_session_progress_fn progress,
+        void              *progress_ud) {
+    ds4_session *s = NULL;
+    char err[256] = {0};
+    if (ds4_session_create(&s, e, ctx_size) != 0) {
+        fprintf(stderr, "ds4: failed to create Qwen3.8 CPU session\n");
+        return 1;
+    }
+    ds4_session_set_progress(s, progress, progress_ud);
+    if (ds4_session_sync(s, prompt, err, sizeof(err)) != 0) {
+        ds4_session_set_progress(s, NULL, NULL);
+        fprintf(stderr, "ds4: Qwen3.8 prefill failed: %s\n", err);
+        ds4_session_free(s);
+        return 1;
+    }
+    ds4_session_set_progress(s, NULL, NULL);
+
+    if (getenv("DS4_LOGIT_DUMP")) {
+        uint32_t best[16] = {0};
+        float bv[16];
+        for (int k = 0; k < 16; k++) bv[k] = -INFINITY;
+        for (uint32_t v = 0; v < DS4_N_VOCAB; v++) {
+            const float lv = s->logits[v];
+            for (int k = 0; k < 16; k++) {
+                if (lv > bv[k]) {
+                    for (int m = 15; m > k; m--) { bv[m] = bv[m - 1]; best[m] = best[m - 1]; }
+                    bv[k] = lv;
+                    best[k] = v;
+                    break;
+                }
+            }
+        }
+        for (int k = 0; k < 16; k++) {
+            fprintf(stderr, "%u %.6f\n", best[k], bv[k]);
+        }
+    }
+
+    ds4_tokens toks = {0};
+    ds4_tokens_copy(&toks, prompt);
+    const int eos = e->vocab.eos_id;
+    int generated = 0;
+    while (generated < n_predict) {
+        const float *logits = s->logits;
+        int best = 0;
+        float bv = logits[0];
+        for (uint32_t i = 1; i < DS4_N_VOCAB; i++) {
+            if (logits[i] > bv) { bv = logits[i]; best = (int)i; }
+        }
+        if (eos >= 0 && best == eos) break;
+        emit(emit_ud, best);
+        generated++;
+        /* No next-token logits are needed after the final emitted token. */
+        if (generated == n_predict || toks.len + 1 >= ctx_size) break;
+        token_vec_push(&toks, best);
+        if (ds4_session_sync(s, &toks, err, sizeof(err)) != 0) {
+            fprintf(stderr, "ds4: Qwen3.8 decode failed: %s\n", err);
+            ds4_tokens_free(&toks);
+            ds4_session_free(s);
+            return 1;
+        }
+    }
+    if (done) done(emit_ud);
+    ds4_tokens_free(&toks);
+    ds4_session_free(s);
+    return 0;
+}
+
 int ds4_engine_generate_argmax(
         ds4_engine        *e,
         const ds4_tokens  *prompt,
@@ -59442,6 +60185,11 @@ int ds4_engine_generate_argmax(
     const ds4_model *model = &e->model;
     const ds4_vocab *vocab = &e->vocab;
     const ds4_weights *weights = &e->weights;
+
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN38) {
+        return qwen38_generate_cpu(e, prompt, n_predict, ctx_size, emit, done,
+                                   emit_ud, progress, progress_ud);
+    }
 
     if (ds4_backend_uses_graph(e->backend)) {
 #ifndef DS4_NO_GPU
@@ -64077,12 +64825,26 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = e;
             return 0;
         }
-        fprintf(stderr,
-                "ds4: Qwen3.8 inference is not implemented yet "
-                "(CPU reference in progress); --inspect works\n");
-        ds4_engine_close(e);
-        *out = NULL;
-        return 1;
+        if (load_slice || opt->distributed.role != DS4_DISTRIBUTED_NONE ||
+            opt->tp.role != DS4_TP_NONE || opt->mtp_path || opt->glm_mtp ||
+            opt->dspark || opt->directional_steering_file) {
+            fprintf(stderr, "ds4: Qwen3.8 CPU reference does not support layer slicing, "
+                            "distributed/TP, MTP or steering yet\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (e->backend != DS4_BACKEND_CPU) {
+            fprintf(stderr,
+                    "ds4: Qwen3.8 currently supports the CPU reference only; "
+                    "pass --cpu\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        vocab_load(&e->vocab, &e->model);
+        *out = e;
+        return 0;
     } else if (!opt->inspect_only) {
         vocab_load(&e->vocab, &e->model);
     }
@@ -65724,8 +66486,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->ctx_size = ctx_size;
         s->prefill_cap = ds4_prefill_cap_for_prompt(ctx_size,
                                                      e->prefill_chunk);
-        kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
-        cpu_decode_scratch_init(&s->cpu_scratch, (uint32_t)ctx_size);
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN38) {
+            qwen38_cpu_state_init(&s->qwen38_state, (uint32_t)ctx_size);
+        } else {
+            kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
+            cpu_decode_scratch_init(&s->cpu_scratch, (uint32_t)ctx_size);
+        }
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
         if (!ds4_session_tp_register(s)) {
@@ -66074,8 +66840,12 @@ void ds4_session_free(ds4_session *s) {
 #endif
     ds4_dist_session_free(s->distributed);
     if (ds4_session_is_cpu(s)) {
-        kv_cache_free(&s->cpu_cache);
-        cpu_decode_scratch_free(&s->cpu_scratch);
+        if (ds4_session_is_qwen38(s)) {
+            qwen38_cpu_state_free(&s->qwen38_state);
+        } else {
+            kv_cache_free(&s->cpu_cache);
+            cpu_decode_scratch_free(&s->cpu_scratch);
+        }
     }
 #ifndef DS4_NO_GPU
     else {
@@ -67612,6 +68382,65 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
+        if (ds4_session_is_qwen38(s)) {
+            if (s->checkpoint_valid &&
+                prompt->len >= s->checkpoint.len &&
+                ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+                for (int i = s->checkpoint.len; i < prompt->len; i++) {
+                    if (ds4_session_cancelled(s)) {
+                        snprintf(err, errlen, "interrupted");
+                        s->checkpoint_valid = true;
+                        return DS4_SESSION_SYNC_INTERRUPTED;
+                    }
+                    qwen38_cpu_forward_token(&s->qwen38_state, &e->model,
+                                             &e->qwen38_weights, prompt->v[i],
+                                             (uint32_t)s->checkpoint.len, s->logits);
+                    token_vec_push(&s->checkpoint, prompt->v[i]);
+                    if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+                }
+                s->checkpoint_valid = true;
+                s->greedy_splitkv_segment.len = 0;
+                s->greedy_splitkv_anchor_valid = false;
+                return 0;
+            }
+            qwen38_cpu_state_zero(&s->qwen38_state);
+            s->checkpoint.len = 0;
+            const bool nll_dump = getenv("DS4_NLL_DUMP") != NULL;
+            double nll_sum = 0.0;
+            for (int i = 0; i < prompt->len; i++) {
+                if (ds4_session_cancelled(s)) {
+                    snprintf(err, errlen, "interrupted");
+                    return DS4_SESSION_SYNC_INTERRUPTED;
+                }
+                if (nll_dump && i > 0) {
+                    float max_l = s->logits[0];
+                    for (uint32_t v = 1; v < DS4_N_VOCAB; v++) {
+                        if (s->logits[v] > max_l) max_l = s->logits[v];
+                    }
+                    double z = 0.0;
+                    for (uint32_t v = 0; v < DS4_N_VOCAB; v++) {
+                        z += exp((double)(s->logits[v] - max_l));
+                    }
+                    const double lp = (double)(s->logits[prompt->v[i]] - max_l) - log(z);
+                    nll_sum += -lp;
+                    fprintf(stderr, "ds4: nll[%d] tok=%d lp=%.6f\n", i, prompt->v[i], lp);
+                }
+                qwen38_cpu_forward_token(&s->qwen38_state, &e->model,
+                                         &e->qwen38_weights, prompt->v[i],
+                                         (uint32_t)i, s->logits);
+                token_vec_push(&s->checkpoint, prompt->v[i]);
+                if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+            }
+            if (nll_dump && prompt->len > 1) {
+                fprintf(stderr, "ds4: mean nll %.6f (%.2f ppl) over %d tokens\n",
+                        nll_sum / (prompt->len - 1),
+                        exp(nll_sum / (prompt->len - 1)),
+                        prompt->len - 1);
+            }
+            s->checkpoint_valid = true;
+            s->mtp_draft_valid = false;
+            return 0;
+        }
         if (s->checkpoint_valid &&
             prompt->len >= s->checkpoint.len &&
             ds4_tokens_starts_with(prompt, &s->checkpoint))
@@ -69468,6 +70297,21 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
+        if (ds4_session_is_qwen38(s)) {
+            if ((uint32_t)s->checkpoint.len >= s->qwen38_state.ctx_size) {
+                if (errlen) snprintf(err, errlen, "Qwen3.8 CPU context reached (%u)",
+                                     s->qwen38_state.ctx_size);
+                s->checkpoint_valid = false;
+                return 1;
+            }
+            qwen38_cpu_forward_token(&s->qwen38_state, &e->model, &e->qwen38_weights,
+                                     token, (uint32_t)s->checkpoint.len, s->logits);
+            token_vec_push(&s->checkpoint, token);
+            s->checkpoint_valid = true;
+            s->mtp_draft_valid = false;
+            (void)probe_mtp;
+            return 0;
+        }
         forward_token_raw_swa_cpu_decode_scratch(s->logits,
                                                  &e->model,
                                                  &e->weights,

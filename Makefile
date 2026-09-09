@@ -712,7 +712,7 @@ test-frontends: ds4_test ds4_agent_test
 	./ds4_test --server
 	./ds4_agent_test
 
-test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory \
+test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-qwen38-cpu test-session-state test-linux-memory \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	tests/test_deepseek4_vision_image tests/test_prompt_prefix $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --validate-cases
@@ -751,6 +751,17 @@ mtp-verify-depth: ds4_test
 	else \
 		DS4_TEST_MODEL="$(DS4_TEST_MODEL)" DS4_TEST_MTP="$(DS4_TEST_MTP)" ./ds4_test --mtp-verify-depth; \
 	fi
+
+.PHONY: test-qwen38-cpu
+test-qwen38-cpu:
+ifeq ($(UNAME_S),Linux)
+	CC="$(CC)" tests/run_qwen38_cpu.sh
+else
+	@echo "Qwen CPU reference tests: Linux only (no CPU inference on macOS)"
+endif
+
+# The private-kernel tests include ds4.c; table changes must rebuild all users.
+ds4.o ds4_cpu.o ds4_cpu_test_hooks.o tests/test_session_state.o: ds4_iq_tables.inc
 
 q4k-dot-test: tests/test_q4k_dot.c
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_q4k_dot tests/test_q4k_dot.c -lm -pthread
