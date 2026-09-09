@@ -7061,6 +7061,7 @@ static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_
 #define QWEN38_KEY_DIM     (QWEN38_N_QK_HEAD * QWEN38_SSM_DIM)      /* 2048 */
 #define QWEN38_VALUE_DIM   (QWEN38_N_V_HEAD * QWEN38_SSM_DIM)       /* 6144 */
 #define QWEN38_CONV_DIM    (2 * QWEN38_KEY_DIM + QWEN38_VALUE_DIM)  /* 10240 */
+#define QWEN38_CUDA_PREFILL_CHUNK 128u
 
 typedef struct {
     const ds4_tensor *attn_norm;
@@ -7250,15 +7251,25 @@ static ds4_context_memory qwen38_memory_estimate(int ctx_size, bool cuda) {
     const uint64_t ga_elements = 16ull * ctx * 1024 * 2;
     m.raw_bytes = ga_elements * (cuda ? sizeof(uint16_t) : sizeof(float)) +
         (48ull * 48 * 128 * 128 + 48ull * 3 * QWEN38_CONV_DIM) * sizeof(float);
-    m.scratch_bytes = (2ull * QWEN38_N_EMBD + QWEN38_CONV_DIM +
-                       3ull * QWEN38_VALUE_DIM + 2ull * QWEN38_N_V_HEAD +
-                       3ull * QWEN38_N_FF + QWEN38_N_HEAD * ctx +
-                       24ull * 512 + DS4_N_VOCAB) * sizeof(float);
+    if (cuda) {
+        const uint64_t chunk = QWEN38_CUDA_PREFILL_CHUNK;
+        m.scratch_bytes = (chunk * (3ull * QWEN38_N_EMBD +
+            QWEN38_CONV_DIM + 3ull * QWEN38_VALUE_DIM +
+            2ull * QWEN38_N_V_HEAD + 3ull * QWEN38_N_FF +
+            2ull * QWEN38_N_HEAD * QWEN38_HEAD_DIM +
+            2ull * QWEN38_N_HEAD_KV * QWEN38_HEAD_DIM) +
+            DS4_N_VOCAB) * sizeof(float);
+    } else {
+        m.scratch_bytes = (2ull * QWEN38_N_EMBD + QWEN38_CONV_DIM +
+                           3ull * QWEN38_VALUE_DIM + 2ull * QWEN38_N_V_HEAD +
+                           3ull * QWEN38_N_FF + QWEN38_N_HEAD * ctx +
+                           24ull * 512 + DS4_N_VOCAB) * sizeof(float);
+    }
     m.total_bytes = m.raw_bytes + m.scratch_bytes;
     return m;
 }
 
-static ds4_context_memory qwen38_cpu_memory_estimate(int ctx_size) {
+static DS4_MAYBE_UNUSED ds4_context_memory qwen38_cpu_memory_estimate(int ctx_size) {
     return qwen38_memory_estimate(ctx_size, false);
 }
 
@@ -7338,6 +7349,8 @@ typedef struct {
     ds4_gpu_tensor *ffn_u;
     ds4_gpu_tensor *ffn_m;
     ds4_gpu_tensor *logits;
+    ds4_gpu_tensor *hidden_row[QWEN38_CUDA_PREFILL_CHUNK];
+    ds4_gpu_tensor *xnorm_row[QWEN38_CUDA_PREFILL_CHUNK];
     uint32_t ctx_size;
 } ds4_qwen38_gpu_state;
 
@@ -7364,6 +7377,10 @@ static void qwen38_gpu_state_free(ds4_qwen38_gpu_state *st) {
         ds4_gpu_tensor_free(st->attn_k_layer[i]);
         ds4_gpu_tensor_free(st->attn_v_layer[i]);
     }
+    for (uint32_t i = 0; i < QWEN38_CUDA_PREFILL_CHUNK; i++) {
+        ds4_gpu_tensor_free(st->hidden_row[i]);
+        ds4_gpu_tensor_free(st->xnorm_row[i]);
+    }
 #define QWEN38_GPU_FREE(name) ds4_gpu_tensor_free(st->name)
     QWEN38_GPU_FREE(ssm_state); QWEN38_GPU_FREE(conv_state);
     QWEN38_GPU_FREE(attn_k); QWEN38_GPU_FREE(attn_v);
@@ -7389,23 +7406,35 @@ static int qwen38_gpu_state_init(ds4_qwen38_gpu_state *st, uint32_t ctx_size) {
             16ull * ctx_size * 1024 * sizeof(uint16_t), "attn_k")) goto fail;
     if (!qwen38_gpu_alloc_bytes(&st->attn_v,
             16ull * ctx_size * 1024 * sizeof(uint16_t), "attn_v")) goto fail;
-    QWEN38_GPU_ALLOC(hidden, QWEN38_N_EMBD);
-    QWEN38_GPU_ALLOC(xnorm, QWEN38_N_EMBD);
-    QWEN38_GPU_ALLOC(qkv, QWEN38_CONV_DIM);
-    QWEN38_GPU_ALLOC(z, QWEN38_VALUE_DIM);
-    QWEN38_GPU_ALLOC(alpha, QWEN38_N_V_HEAD);
-    QWEN38_GPU_ALLOC(beta, QWEN38_N_V_HEAD);
-    QWEN38_GPU_ALLOC(o, QWEN38_VALUE_DIM);
-    QWEN38_GPU_ALLOC(attn, QWEN38_VALUE_DIM);
-    QWEN38_GPU_ALLOC(proj, QWEN38_N_EMBD);
-    QWEN38_GPU_ALLOC(q_full, 2ull * QWEN38_N_HEAD * QWEN38_HEAD_DIM);
-    QWEN38_GPU_ALLOC(k, QWEN38_N_HEAD_KV * QWEN38_HEAD_DIM);
-    QWEN38_GPU_ALLOC(v, QWEN38_N_HEAD_KV * QWEN38_HEAD_DIM);
-    QWEN38_GPU_ALLOC(ffn_g, QWEN38_N_FF);
-    QWEN38_GPU_ALLOC(ffn_u, QWEN38_N_FF);
-    QWEN38_GPU_ALLOC(ffn_m, QWEN38_N_FF);
+    QWEN38_GPU_ALLOC(hidden, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_N_EMBD);
+    QWEN38_GPU_ALLOC(xnorm, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_N_EMBD);
+    QWEN38_GPU_ALLOC(qkv, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_CONV_DIM);
+    QWEN38_GPU_ALLOC(z, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_VALUE_DIM);
+    QWEN38_GPU_ALLOC(alpha, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_N_V_HEAD);
+    QWEN38_GPU_ALLOC(beta, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_N_V_HEAD);
+    QWEN38_GPU_ALLOC(o, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_VALUE_DIM);
+    QWEN38_GPU_ALLOC(attn, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_VALUE_DIM);
+    QWEN38_GPU_ALLOC(proj, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_N_EMBD);
+    QWEN38_GPU_ALLOC(q_full, QWEN38_CUDA_PREFILL_CHUNK *
+                              2ull * QWEN38_N_HEAD * QWEN38_HEAD_DIM);
+    QWEN38_GPU_ALLOC(k, QWEN38_CUDA_PREFILL_CHUNK *
+                         QWEN38_N_HEAD_KV * QWEN38_HEAD_DIM);
+    QWEN38_GPU_ALLOC(v, QWEN38_CUDA_PREFILL_CHUNK *
+                         QWEN38_N_HEAD_KV * QWEN38_HEAD_DIM);
+    QWEN38_GPU_ALLOC(ffn_g, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_N_FF);
+    QWEN38_GPU_ALLOC(ffn_u, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_N_FF);
+    QWEN38_GPU_ALLOC(ffn_m, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_N_FF);
     QWEN38_GPU_ALLOC(logits, DS4_N_VOCAB);
 #undef QWEN38_GPU_ALLOC
+    for (uint32_t i = 0; i < QWEN38_CUDA_PREFILL_CHUNK; i++) {
+        st->hidden_row[i] = ds4_gpu_tensor_view(st->hidden,
+            (uint64_t)i * QWEN38_N_EMBD * sizeof(float),
+            QWEN38_N_EMBD * sizeof(float));
+        st->xnorm_row[i] = ds4_gpu_tensor_view(st->xnorm,
+            (uint64_t)i * QWEN38_N_EMBD * sizeof(float),
+            QWEN38_N_EMBD * sizeof(float));
+        if (!st->hidden_row[i] || !st->xnorm_row[i]) goto fail;
+    }
     for (uint32_t i = 0; i < 48; i++) {
         st->ssm_layer[i] = ds4_gpu_tensor_view(st->ssm_state,
             i * (48ull * 128 * 128 * sizeof(float)),
@@ -7918,20 +7947,40 @@ static void qwen38_cpu_forward_token(ds4_qwen38_cpu_state *st,
 }
 
 #ifndef DS4_NO_GPU
-static int qwen38_gpu_matvec(ds4_gpu_tensor *out, const ds4_model *m,
-                             const ds4_tensor *weight,
-                             const ds4_gpu_tensor *x) {
+static int qwen38_gpu_matvec_rows(ds4_gpu_tensor *out, const ds4_model *m,
+                                  const ds4_tensor *weight,
+                                  const ds4_gpu_tensor *x,
+                                  uint32_t n_tokens) {
+    if (n_tokens == 0 || n_tokens > QWEN38_CUDA_PREFILL_CHUNK) return 0;
+    if (weight->type == DS4_TENSOR_IQ1_M && n_tokens > 8u) {
+        for (uint32_t first = 0; first < n_tokens; first += 8u) {
+            const uint32_t rows = n_tokens - first < 8u ?
+                n_tokens - first : 8u;
+            ds4_gpu_tensor *x_rows = ds4_gpu_tensor_view(x,
+                (uint64_t)first * weight->dim[0] * sizeof(float),
+                (uint64_t)rows * weight->dim[0] * sizeof(float));
+            ds4_gpu_tensor *out_rows = ds4_gpu_tensor_view(out,
+                (uint64_t)first * weight->dim[1] * sizeof(float),
+                (uint64_t)rows * weight->dim[1] * sizeof(float));
+            const int ok = x_rows && out_rows && qwen38_gpu_matvec_rows(
+                out_rows, m, weight, x_rows, rows);
+            ds4_gpu_tensor_free(x_rows);
+            ds4_gpu_tensor_free(out_rows);
+            if (!ok) return 0;
+        }
+        return 1;
+    }
     switch (weight->type) {
     case DS4_TENSOR_F32:
         return ds4_gpu_matmul_f32_tensor(out, m->map, m->size,
-            weight->abs_offset, weight->dim[0], weight->dim[1], x, 1);
+            weight->abs_offset, weight->dim[0], weight->dim[1], x, n_tokens);
     case DS4_TENSOR_F16:
         return ds4_gpu_matmul_f16_tensor(out, m->map, m->size,
-            weight->abs_offset, weight->dim[0], weight->dim[1], x, 1);
+            weight->abs_offset, weight->dim[0], weight->dim[1], x, n_tokens);
     case DS4_TENSOR_BF16:
         return ds4_gpu_glm53_matmul_bf16(out, m->map, m->size,
             weight->abs_offset, (uint32_t)weight->dim[0],
-            (uint32_t)weight->dim[1], x, 1);
+            (uint32_t)weight->dim[1], x, n_tokens);
     case DS4_TENSOR_Q2_K:
     case DS4_TENSOR_Q4_K:
     case DS4_TENSOR_IQ2_XXS:
@@ -7943,10 +7992,16 @@ static int qwen38_gpu_matvec(ds4_gpu_tensor *out, const ds4_model *m,
     case DS4_TENSOR_IQ1_M:
         return ds4_gpu_matmul_quant_tensor(out, m->map, m->size,
             weight->abs_offset, weight->type, weight->dim[0],
-            weight->dim[1], x, 1);
+            weight->dim[1], x, n_tokens);
     default:
         return 0;
     }
+}
+
+static int qwen38_gpu_matvec(ds4_gpu_tensor *out, const ds4_model *m,
+                             const ds4_tensor *weight,
+                             const ds4_gpu_tensor *x) {
+    return qwen38_gpu_matvec_rows(out, m, weight, x, 1u);
 }
 
 static int qwen38_gpu_debug_prefix(const ds4_gpu_tensor *t, uint32_t count,
@@ -8046,6 +8101,102 @@ static int qwen38_gpu_forward_token(ds4_qwen38_gpu_state *st,
     QWEN38_GPU_CHECK(ds4_gpu_tensor_read(st->logits, 0, logits,
                                          (uint64_t)DS4_N_VOCAB * sizeof(float)), "logit read");
 #undef QWEN38_GPU_CHECK
+    return 1;
+}
+
+static int qwen38_gpu_forward_chunk(ds4_qwen38_gpu_state *st,
+                                    const ds4_model *m,
+                                    const ds4_qwen38_weights *w,
+                                    const int *tokens, uint32_t n_tokens,
+                                    uint32_t start_pos, float *logits) {
+#define QWEN38_CHUNK_CHECK(expr, label) \
+    do { if (!(expr)) { fprintf(stderr, "ds4: Qwen CUDA chunk %s failed\n", label); return 0; } } while (0)
+    if (!tokens || n_tokens == 0 || n_tokens > QWEN38_CUDA_PREFILL_CHUNK ||
+        start_pos >= st->ctx_size || n_tokens > st->ctx_size - start_pos ||
+        w->token_embd->type != DS4_TENSOR_IQ2_S) return 0;
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        if (tokens[i] < 0 || (uint32_t)tokens[i] >= DS4_N_VOCAB) return 0;
+        QWEN38_CHUNK_CHECK(ds4_gpu_embed_token_quant_tensor(
+            st->hidden_row[i], m->map, m->size, w->token_embd->abs_offset,
+            w->token_embd->type, DS4_N_VOCAB, (uint32_t)tokens[i],
+            QWEN38_N_EMBD), "token embedding");
+    }
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_qwen38_layer_weights *l = &w->layer[il];
+        QWEN38_CHUNK_CHECK(ds4_gpu_rms_norm_weight_rows_tensor(
+            st->xnorm, st->hidden, m->map, m->size,
+            l->attn_norm->abs_offset, QWEN38_N_EMBD, n_tokens, 1.0e-6f),
+            "attention norm");
+        if (((il + 1u) % 4u) != 0u) {
+            const uint32_t gdn = il - il / 4u;
+            QWEN38_CHUNK_CHECK(qwen38_gpu_matvec_rows(
+                st->qkv, m, l->attn_qkv, st->xnorm, n_tokens), "GDN QKV");
+            QWEN38_CHUNK_CHECK(qwen38_gpu_matvec_rows(
+                st->z, m, l->attn_gate, st->xnorm, n_tokens), "GDN gate");
+            QWEN38_CHUNK_CHECK(qwen38_gpu_matvec_rows(
+                st->beta, m, l->ssm_beta, st->xnorm, n_tokens), "GDN beta");
+            QWEN38_CHUNK_CHECK(qwen38_gpu_matvec_rows(
+                st->alpha, m, l->ssm_alpha, st->xnorm, n_tokens), "GDN alpha");
+            QWEN38_CHUNK_CHECK(ds4_gpu_qwen38_gdn_chunk(
+                st->o, st->conv_layer[gdn], st->ssm_layer[gdn],
+                st->qkv, st->z, st->alpha, st->beta,
+                m->map, m->size, l->ssm_conv1d->abs_offset,
+                l->ssm_a->abs_offset, l->ssm_dt->abs_offset,
+                l->ssm_norm->abs_offset, n_tokens), "GDN recurrence");
+            QWEN38_CHUNK_CHECK(qwen38_gpu_matvec_rows(
+                st->proj, m, l->ssm_out, st->o, n_tokens), "GDN output");
+        } else {
+            const uint32_t ga = il / 4u;
+            QWEN38_CHUNK_CHECK(qwen38_gpu_matvec_rows(
+                st->q_full, m, l->attn_q, st->xnorm, n_tokens), "GA Q");
+            QWEN38_CHUNK_CHECK(qwen38_gpu_matvec_rows(
+                st->k, m, l->attn_k, st->xnorm, n_tokens), "GA K");
+            QWEN38_CHUNK_CHECK(qwen38_gpu_matvec_rows(
+                st->v, m, l->attn_v, st->xnorm, n_tokens), "GA V");
+            QWEN38_CHUNK_CHECK(ds4_gpu_qwen38_ga_prepare_chunk(
+                st->q_full, st->attn_k_layer[ga], st->attn_v_layer[ga],
+                st->k, st->v, m->map, m->size,
+                l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
+                start_pos, n_tokens, st->ctx_size), "GA prepare");
+            QWEN38_CHUNK_CHECK(ds4_gpu_qwen38_ga_chunk(
+                st->attn, st->q_full, st->attn_k_layer[ga],
+                st->attn_v_layer[ga], start_pos, n_tokens, st->ctx_size),
+                "GA attention");
+            QWEN38_CHUNK_CHECK(qwen38_gpu_matvec_rows(
+                st->proj, m, l->attn_output, st->attn, n_tokens), "GA output");
+        }
+        QWEN38_CHUNK_CHECK(ds4_gpu_add_tensor(
+            st->hidden, st->hidden, st->proj,
+            n_tokens * QWEN38_N_EMBD), "attention residual");
+        QWEN38_CHUNK_CHECK(ds4_gpu_rms_norm_weight_rows_tensor(
+            st->xnorm, st->hidden, m->map, m->size,
+            l->attn_post_norm->abs_offset, QWEN38_N_EMBD, n_tokens, 1.0e-6f),
+            "FFN norm");
+        QWEN38_CHUNK_CHECK(qwen38_gpu_matvec_rows(
+            st->ffn_g, m, l->ffn_gate, st->xnorm, n_tokens), "FFN gate");
+        QWEN38_CHUNK_CHECK(qwen38_gpu_matvec_rows(
+            st->ffn_u, m, l->ffn_up, st->xnorm, n_tokens), "FFN up");
+        QWEN38_CHUNK_CHECK(ds4_gpu_swiglu_tensor(
+            st->ffn_m, st->ffn_g, st->ffn_u,
+            n_tokens * QWEN38_N_FF, 0.0f, 1.0f), "SwiGLU");
+        QWEN38_CHUNK_CHECK(qwen38_gpu_matvec_rows(
+            st->proj, m, l->ffn_down, st->ffn_m, n_tokens), "FFN down");
+        QWEN38_CHUNK_CHECK(ds4_gpu_add_tensor(
+            st->hidden, st->hidden, st->proj,
+            n_tokens * QWEN38_N_EMBD), "FFN residual");
+    }
+    QWEN38_CHUNK_CHECK(ds4_gpu_rms_norm_weight_tensor(
+        st->xnorm_row[n_tokens - 1u], st->hidden_row[n_tokens - 1u],
+        m->map, m->size, w->output_norm->abs_offset,
+        QWEN38_N_EMBD, 1.0e-6f), "output norm");
+    QWEN38_CHUNK_CHECK(qwen38_gpu_matvec(
+        st->logits, m, w->output, st->xnorm_row[n_tokens - 1u]),
+        "output projection");
+    QWEN38_CHUNK_CHECK(ds4_gpu_tensor_read(
+        st->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)),
+        "logit read");
+#undef QWEN38_CHUNK_CHECK
     return 1;
 }
 #endif
@@ -68822,8 +68973,19 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             s->checkpoint.len = 0;
         }
         const bool nll_dump = getenv("DS4_NLL_DUMP") != NULL;
+        const bool sequential = nll_dump || getenv("DS4_EMBD_DUMP") ||
+            getenv("DS4_HIDDEN_LAYER") || getenv("DS4_HIDDEN_TOK") ||
+            getenv("DS4_QWEN38_PREFILL_SEQUENTIAL");
+        uint32_t chunk_cap = QWEN38_CUDA_PREFILL_CHUNK;
+        const char *chunk_env = getenv("DS4_QWEN38_PREFILL_CHUNK");
+        if (chunk_env && chunk_env[0]) {
+            const long requested = strtol(chunk_env, NULL, 10);
+            if (requested >= 1 && requested <= QWEN38_CUDA_PREFILL_CHUNK)
+                chunk_cap = (uint32_t)requested;
+        }
         double nll_sum = 0.0;
-        for (int i = s->checkpoint.len; i < prompt->len; i++) {
+        int i = s->checkpoint.len;
+        while (i < prompt->len) {
             if (ds4_session_cancelled(s)) {
                 snprintf(err, errlen, "interrupted");
                 s->checkpoint_valid = true;
@@ -68840,15 +69002,27 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 nll_sum += -lp;
                 fprintf(stderr, "ds4: nll[%d] tok=%d lp=%.6f\n", i, prompt->v[i], lp);
             }
-            if (!qwen38_gpu_forward_token(&s->qwen38_gpu_state, &e->model,
-                                           &e->qwen38_weights, prompt->v[i],
-                                           (uint32_t)i, s->logits)) {
+            uint32_t chunk = 1u;
+            if (!sequential) {
+                const uint32_t left = (uint32_t)(prompt->len - i);
+                chunk = left < chunk_cap ? left : chunk_cap;
+            }
+            const int ok = sequential ?
+                qwen38_gpu_forward_token(&s->qwen38_gpu_state, &e->model,
+                    &e->qwen38_weights, prompt->v[i], (uint32_t)i, s->logits) :
+                qwen38_gpu_forward_chunk(&s->qwen38_gpu_state, &e->model,
+                    &e->qwen38_weights, prompt->v + i, chunk,
+                    (uint32_t)i, s->logits);
+            if (!ok) {
                 snprintf(err, errlen, "Qwen CUDA forward failed at token %d", i);
                 s->checkpoint_valid = false;
                 return 1;
             }
-            token_vec_push(&s->checkpoint, prompt->v[i]);
-            if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+            for (uint32_t j = 0; j < chunk; j++)
+                token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
+            i += (int)chunk;
+            if (s->progress)
+                s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
         }
         if (nll_dump && prompt->len > 1 && !continued) {
             fprintf(stderr, "ds4: mean nll %.6f (%.2f ppl) over %d tokens\n",

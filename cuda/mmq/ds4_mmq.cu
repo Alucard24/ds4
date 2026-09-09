@@ -4961,6 +4961,27 @@ extern "C" int ds4_mmq_iq2_s_get_row(
     return 0;
 }
 
+extern "C" int ds4_mmq_quant_dense(
+        const void *W, uint32_t weight_type, const float *X, float *out,
+        int M, int N, int K, cudaStream_t stream) {
+#define DS4_MMQ_CASE(type, name) \
+    case type: return ds4_mmq_dense_impl<type>(name, W, X, out, M, N, K, stream)
+    switch ((ggml_type)weight_type) {
+        DS4_MMQ_CASE(GGML_TYPE_Q2_K,    "ds4_mmq_q2_K_dense");
+        DS4_MMQ_CASE(GGML_TYPE_Q4_K,    "ds4_mmq_q4_K_dense");
+        DS4_MMQ_CASE(GGML_TYPE_IQ2_XXS, "ds4_mmq_iq2_xxs_dense");
+        DS4_MMQ_CASE(GGML_TYPE_IQ2_XS,  "ds4_mmq_iq2_xs_dense");
+        DS4_MMQ_CASE(GGML_TYPE_IQ2_S,   "ds4_mmq_iq2_s_dense");
+        DS4_MMQ_CASE(GGML_TYPE_IQ3_XXS, "ds4_mmq_iq3_xxs_dense");
+        DS4_MMQ_CASE(GGML_TYPE_IQ3_S,   "ds4_mmq_iq3_s_dense");
+        DS4_MMQ_CASE(GGML_TYPE_IQ4_XS,  "ds4_mmq_iq4_xs_dense");
+        default:
+            fprintf(stderr, "ds4_mmq_quant_dense: unsupported type %u\n", weight_type);
+            return -1;
+    }
+#undef DS4_MMQ_CASE
+}
+
 extern "C" int ds4_mmq_quant_dense_vec(
         const void *W, uint32_t weight_type, const float *X, float *out,
         int M, int N, int K, cudaStream_t stream) {
@@ -5006,6 +5027,16 @@ template void mul_mat_q_case<GGML_TYPE_Q8_0>(
 template void mul_mat_q_case<GGML_TYPE_Q2_K>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_IQ2_XXS>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_IQ2_XS>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_IQ2_S>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_IQ3_XXS>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_IQ3_S>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_IQ4_XS>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_Q4_K>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);

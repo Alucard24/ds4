@@ -14,23 +14,32 @@ static void require(int ok, const char *message) {
     if (!ok) { fprintf(stderr, "FAIL: %s\n", message); exit(1); }
 }
 
+static double rebuild_logit_tolerance;
+
 static void same_logits(ds4_session *s, const float *want, int n) {
     float *got = malloc(n*sizeof(float));
     require(got != NULL, "logit allocation");
     require(ds4_session_copy_logits(s, got, n) == n, "copy logits");
     double maxerr = 0;
+    int got_best = 0, want_best = 0;
     for (int i = 0; i < n; i++) {
         require(isfinite(got[i]) && isfinite(want[i]), "non-finite logits");
         maxerr = fmax(maxerr, fabs((double)got[i]-want[i]));
+        if (got[i] > got[got_best]) got_best = i;
+        if (want[i] > want[want_best]) want_best = i;
     }
-    printf("LOGIT_MAX_ERROR %.9g\n", maxerr);
-    require(maxerr == 0, "sync/eval/reset mismatch");
+    printf("LOGIT_MAX_ERROR %.9g ARGMAX %d\n", maxerr, got_best);
+    require(got_best == want_best, "sync/eval/reset changed argmax");
+    require(maxerr <= rebuild_logit_tolerance, "sync/eval/reset mismatch");
     free(got);
 }
 
 int main(int argc, char **argv) {
     require(argc == 3, "usage: test_qwen38_session MODEL TEXT");
     const int use_cuda = getenv("DS4_TEST_QWEN38_CUDA") != NULL;
+    /* Batched MMQ prefill changes reduction order from MMVQ decode. Its
+     * rebuild gate is numerical + argmax-stable; CPU remains bit-exact. */
+    rebuild_logit_tolerance = use_cuda ? 0.5 : 0.0;
     ds4_engine_options opt = {.model_path=argv[1],
         .backend=use_cuda ? DS4_BACKEND_CUDA : DS4_BACKEND_CPU,
         .context_size=128, .power_percent=100};

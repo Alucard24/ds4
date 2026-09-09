@@ -1,7 +1,7 @@
 # Qwen3.8 CPU reference checks (Linux)
 
 This documents the text reference and the first end-to-end CUDA text path, not
-the requested CUDA + vision MVP. Vision, fast chunked CUDA prefill, full
+the requested CUDA + vision MVP. Vision, competitive CUDA performance, full
 chat/tool template parity and recurrent disk cache serialization are not
 implemented yet. Unsupported cache operations fail
 explicitly; they must not save a DeepSeek-shaped payload.
@@ -44,7 +44,9 @@ external-library run as sanitizer-clean.
 The explicit CUDA target checks all nine packed formats used by the language
 GGUF at K=5120. Constant activations give a near-exact format/layout oracle;
 varied activations include expected Q8_1 activation-quantization error. IQ2_S
-also checks the exact get-row path needed by the token embedding.
+also checks the exact get-row path needed by the token embedding. A 16-row MMQ
+case covers the eight formats supported by tiled prefill; IQ1_M is deliberately
+row-sliced through its validated MMVQ path.
 
 ```sh
 make clean
@@ -75,11 +77,32 @@ make test-qwen38-cuda-session CUDA_ARCH=sm_120 \
 
 The session gate checks token-at-a-time eval, no-op sync, changed-prefix
 rebuild, shortening plus extension, finite logits, and explicit rejection of
-an unsupported recurrent payload. Repeated CUDA paths must reproduce their
-own logits exactly. On the canonical six-token sentence its CUDA mean NLL was
-2.44172788 versus 2.43708414 for the FP32 CPU-state oracle, and both generated
-` Paris` greedily. CUDA prefill is still sequential at this checkpoint and is
-not a performance result.
+an unsupported recurrent payload. No-op sync remains bit-exact; rebuilds
+across MMVQ/MMQ batch shapes must preserve argmax within the numerical gate
+below. On the canonical six-token sentence its CUDA mean NLL was
+2.43385090 versus 2.43708414 for the FP32 CPU-state oracle, and both generated
+` Paris` greedily.
+
+CUDA prefill is layer-major in bounded chunks of at most 128 tokens. Batches up
+to eight use MMVQ; larger batches use native packed-weight MMQ, with the lone
+IQ1_M matrix row-sliced through MMVQ. `DS4_QWEN38_PREFILL_CHUNK=1..128` and
+`DS4_QWEN38_PREFILL_SEQUENTIAL=1` are diagnostic comparison controls, not
+alternate release modes. MMQ and MMVQ change floating-point reduction order;
+the rebuild test therefore requires stable argmax and a bounded 0.5 maximum
+logit delta rather than claiming bit identity across batch shapes.
+
+A warm-process benchmark can be built and run with:
+
+```sh
+make tests/test_qwen38_cuda_perf CUDA_ARCH=sm_120
+./tests/test_qwen38_cuda_perf "$Q/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf" \
+  /tmp/prompt.txt 128
+```
+
+On the RTX 5070 Ti, a 494-token local prompt measured 203.926 prefill tok/s and
+33.359 decode tok/s at the resulting context. This is a real improvement over
+token-replay prefill but remains well below the recorded llama.cpp baselines
+(pp512 1628.69 tok/s, tg128 53.24 tok/s), so performance work is not complete.
 
 ## Real-model session and continuation checks
 

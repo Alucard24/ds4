@@ -100,5 +100,57 @@ int main(int argc,char **argv) {
             cudaFree(dy); cudaFree(dx); cudaFree(dw);
         }
     }
+    constexpr int BN=16;
+    std::vector<float> bx((size_t)BN*K), bxq((size_t)BN*K);
+    std::vector<float> bref((size_t)BN*M), bgot((size_t)BN*M);
+    for(int n=0;n<BN;n++) for(int i=0;i<K;i++)
+        bx[(size_t)n*K+i]=std::sin((i+17*n)*0.071f)*1.3f+
+                          std::cos((i-11*n)*0.023f)*0.4f;
+    for(int n=0;n<BN;n++) for(int ib=0;ib<K/32;ib++) {
+        float amax=0; for(int j=0;j<32;j++)
+            amax=std::fmax(amax,std::fabs(bx[(size_t)n*K+ib*32+j]));
+        float d=__half2float(__float2half_rn(amax/127));
+        for(int j=0;j<32;j++) bxq[(size_t)n*K+ib*32+j]=
+            d*std::round(bx[(size_t)n*K+ib*32+j]/d);
+    }
+    for(const auto &t:types) {
+        if(t.type==29) continue; /* IQ1_M has MMVQ only and is row-sliced by ds4. */
+        char sym[96]; std::snprintf(sym,sizeof(sym),"dequantize_row_%s",t.name);
+        using deq_fn=void(*)(const void*,float*,int64_t);
+        deq_fn deq=(deq_fn)dlsym(lib,sym); if(!deq) die(sym);
+        const size_t row_bytes=(K/256)*t.bytes;
+        std::vector<uint8_t> w((size_t)M*row_bytes);
+        for(int r=0;r<M;r++) for(int ib=0;ib<K/256;ib++) {
+            uint8_t *b=w.data()+(size_t)r*row_bytes+(size_t)ib*t.bytes;
+            for(uint32_t j=0;j<t.bytes;j++) b[j]=(uint8_t)next_u32();
+            make_finite_block(b,t.type);
+        }
+        for(int r=0;r<M;r++) {
+            deq(w.data()+(size_t)r*row_bytes,row.data(),K);
+            for(int n=0;n<BN;n++) {
+                double sum=0; for(int i=0;i<K;i++)
+                    sum+=(double)row[i]*bxq[(size_t)n*K+i];
+                bref[(size_t)n*M+r]=(float)sum;
+            }
+        }
+        void *dw=nullptr; float *dx=nullptr,*dy=nullptr;
+        cuda_check(cudaMalloc(&dw,w.size()),"batch alloc W");
+        cuda_check(cudaMalloc(&dx,(size_t)BN*K*4),"batch alloc X");
+        cuda_check(cudaMalloc(&dy,(size_t)BN*M*4),"batch alloc Y");
+        cuda_check(cudaMemcpy(dw,w.data(),w.size(),cudaMemcpyHostToDevice),"batch copy W");
+        cuda_check(cudaMemcpy(dx,bx.data(),(size_t)BN*K*4,cudaMemcpyHostToDevice),"batch copy X");
+        if(ds4_mmq_quant_dense(dw,t.type,dx,dy,M,BN,K,0)!=0) die(t.name);
+        cuda_check(cudaDeviceSynchronize(),"batch sync");
+        cuda_check(cudaMemcpy(bgot.data(),dy,(size_t)BN*M*4,cudaMemcpyDeviceToHost),"batch copy Y");
+        double worst=0;
+        for(size_t i=0;i<bgot.size();i++) {
+            const double e=std::fabs((double)bgot[i]-bref[i]);
+            worst=std::fmax(worst,e);
+            if(!std::isfinite(bgot[i]) || !std::isfinite(bref[i]) ||
+               e>0.35+0.025*std::fabs(bref[i])) die("batch MMQ mismatch");
+        }
+        std::printf("%s/batch16 max_abs %.7g PASS\n",t.name,worst);
+        cudaFree(dy); cudaFree(dx); cudaFree(dw);
+    }
     dlclose(lib); return 0;
 }

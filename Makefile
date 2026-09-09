@@ -343,7 +343,14 @@ test-qwen38-cuda-session: tests/test_qwen38_session_cuda
 		echo "error: set DS4_TEST_QWEN38_MODEL=/path/to/Qwen3.8-27B.gguf"; exit 2; \
 	fi
 	DS4_TEST_QWEN38_CUDA=1 ./tests/test_qwen38_session_cuda \
-		"$(DS4_TEST_QWEN38_MODEL)" 'The capital of France is Paris.'
+		"$(DS4_TEST_QWEN38_MODEL)" \
+		'The capital of France is Paris. The largest ocean on Earth is the Pacific Ocean.'
+
+tests/test_qwen38_cuda_perf.o: tests/test_qwen38_cuda_perf.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_qwen38_cuda_perf: tests/test_qwen38_cuda_perf.o $(CORE_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 endif
 
 ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_linux_memory.h
@@ -812,6 +819,7 @@ clean:
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_cuda_q8_scratch
 	rm -f tests/test_cuda_dspark_moe
+	rm -f tests/test_qwen38_cuda tests/test_qwen38_session_cuda tests/test_qwen38_cuda_perf
 	rm -f tests/test_quality_api
 	rm -f tests/test_linux_memory tests/test_rocm_memory
 	rm -f tests/test_glm_attention tests/test_glm_attention_rocm

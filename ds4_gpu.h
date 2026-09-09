@@ -3115,6 +3115,21 @@ int ds4_gpu_qwen38_gdn_decode(
         uint64_t              a_offset,
         uint64_t              dt_offset,
         uint64_t              norm_offset);
+int ds4_gpu_qwen38_gdn_chunk(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *qkv,
+        const ds4_gpu_tensor *z,
+        const ds4_gpu_tensor *alpha,
+        const ds4_gpu_tensor *beta,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              conv_weight_offset,
+        uint64_t              a_offset,
+        uint64_t              dt_offset,
+        uint64_t              norm_offset,
+        uint32_t              n_tokens);
 int ds4_gpu_qwen38_ga_prepare(
         ds4_gpu_tensor       *q_full,
         ds4_gpu_tensor       *k_cache,
@@ -3127,12 +3142,33 @@ int ds4_gpu_qwen38_ga_prepare(
         uint64_t              k_norm_offset,
         uint32_t              pos,
         uint32_t              ctx_size);
+int ds4_gpu_qwen38_ga_prepare_chunk(
+        ds4_gpu_tensor       *q_full,
+        ds4_gpu_tensor       *k_cache,
+        ds4_gpu_tensor       *v_cache,
+        ds4_gpu_tensor       *k,
+        const ds4_gpu_tensor *v,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_norm_offset,
+        uint64_t              k_norm_offset,
+        uint32_t              start_pos,
+        uint32_t              n_tokens,
+        uint32_t              ctx_size);
 int ds4_gpu_qwen38_ga_decode(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *q_full,
         const ds4_gpu_tensor *k_cache,
         const ds4_gpu_tensor *v_cache,
         uint32_t              pos,
+        uint32_t              ctx_size);
+int ds4_gpu_qwen38_ga_chunk(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q_full,
+        const ds4_gpu_tensor *k_cache,
+        const ds4_gpu_tensor *v_cache,
+        uint32_t              start_pos,
+        uint32_t              n_tokens,
         uint32_t              ctx_size);
 
 #ifndef DS4_GLM53_VISION_TYPES_DEFINED
