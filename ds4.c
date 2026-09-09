@@ -39205,6 +39205,7 @@ struct ds4_vocab {
     int arg_value_start_id;
     int arg_value_end_id;
     int dsml_id;
+    int im_end_id;
     str_i32_table token_to_id;
     str_i32_table merge_rank;
 };
@@ -40030,7 +40031,160 @@ static void bpe_tokenize_text_glm4(const ds4_vocab *vocab, const char *text, tok
  * word (for example ">;\n").  Splitting those newlines separately changes the
  * token stream for code prompts and produces wrong long-context logits.
  */
+/* Qwen3.5/Qwen3.8 pre-tokenization (tokenizer.ggml.pre = "qwen35").  Port of
+ * the GPT-4-style regex llama.cpp uses (llama-vocab.cpp, MIT):
+ *
+ *   (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])
+ *   |[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}
+ *   | ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+ *
+ * Rules are tried in order with the leftmost match winning. */
+static bool qwen35_is_letter(uint32_t cp) {
+    if (cp < 128) return ascii_alpha((uint8_t)cp);
+    return (cp >= 0x00c0 && cp <= 0x017f) ||   /* Latin-1 supplement, ext A */
+           (cp >= 0x0180 && cp <= 0x024f) ||   /* Latin ext B, IPA */
+           (cp >= 0x0370 && cp <= 0x03ff) ||   /* Greek and Coptic */
+           (cp >= 0x0400 && cp <= 0x052f) ||   /* Cyrillic */
+           (cp >= 0x1e00 && cp <= 0x1eff) ||   /* Latin ext additional */
+           (cp >= 0x3040 && cp <= 0x30ff) ||   /* Hiragana, Katakana */
+           (cp >= 0x3400 && cp <= 0x4dbf) ||   /* CJK ext A */
+           (cp >= 0x4e00 && cp <= 0x9fff) ||   /* CJK unified */
+           (cp >= 0xac00 && cp <= 0xd7af) ||   /* Hangul */
+           (cp >= 0xf900 && cp <= 0xfaff) ||   /* CJK compat */
+           (cp >= 0x2e80 && cp <= 0x2fdf) ||   /* CJK radicals, kangxi */
+           (cp >= 0xff21 && cp <= 0xff3a) ||   /* fullwidth A-Z */
+           (cp >= 0xff41 && cp <= 0xff5a);     /* fullwidth a-z */
+}
+
+static bool qwen35_is_mark(uint32_t cp) {
+    return (cp >= 0x0300 && cp <= 0x036f) ||   /* combining diacritics */
+           (cp >= 0x1ab0 && cp <= 0x1aff) ||
+           (cp >= 0x1dc0 && cp <= 0x1dff) ||
+           (cp >= 0x20d0 && cp <= 0x20ff) ||
+           (cp >= 0xfe20 && cp <= 0xfe2f);
+}
+
+static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    const uint64_t len = strlen(text);
+    uint64_t pos = 0;
+
+    while (pos < len) {
+        uint64_t start = pos;
+        uint64_t next = 0;
+        uint32_t cp = utf8_peek_one(text, len, pos, &next);
+
+        /* Rule 1: case-insensitive contractions. */
+        uint64_t clen = 0;
+        if (cp == '\'' && pos + 1 < len) {
+            const uint8_t c1 = (uint8_t)text[pos + 1];
+            const uint8_t c2 = pos + 2 < len ? (uint8_t)text[pos + 2] : 0;
+            const uint8_t lo = (uint8_t)(c1 | 0x20);
+            const uint8_t lo2 = (uint8_t)(c2 | 0x20);
+            if (lo == 's' || lo == 't' || lo == 'm' || lo == 'd') {
+                clen = 2;
+            } else if ((lo == 'r' || lo == 'v') && lo2 == 'e') {
+                clen = 3;
+            } else if (lo == 'l' && lo2 == 'l') {
+                clen = 3;
+            }
+        }
+        if (clen) {
+            pos += clen;
+            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            continue;
+        }
+
+        /* Rule 2: optional one non-L/N/non-newline char, then [\p{L}\p{M}]+. */
+        uint64_t p = pos;
+        if (cp != '\r' && cp != '\n' &&
+            !qwen35_is_letter(cp) && !glm4_unicode_number(cp)) {
+            p = next;
+        }
+        uint64_t q = p;
+        while (q < len) {
+            uint64_t qn = 0;
+            uint32_t qc = utf8_peek_one(text, len, q, &qn);
+            if (!qwen35_is_letter(qc) && !qwen35_is_mark(qc)) break;
+            q = qn;
+        }
+        if (q > p) {
+            pos = q;
+            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            continue;
+        }
+
+        /* Rule 3: a single number character. */
+        if (glm4_unicode_number(cp)) {
+            pos = next;
+            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            continue;
+        }
+
+        /* Rule 4: optional space + [^\s\p{L}\p{M}\p{N}]+ + trailing newlines. */
+        uint64_t p4 = pos;
+        if (cp == ' ') p4 = next;
+        if (p4 < len) {
+            uint64_t q4 = p4;
+            bool any = false;
+            while (q4 < len) {
+                uint64_t qn4 = 0;
+                uint32_t qc = utf8_peek_one(text, len, q4, &qn4);
+                if (glm4_unicode_whitespace(qc) || qwen35_is_letter(qc) ||
+                    qwen35_is_mark(qc) || glm4_unicode_number(qc)) break;
+                q4 = qn4;
+                any = true;
+            }
+            if (any) {
+                while (q4 < len &&
+                       ((uint8_t)text[q4] == '\r' || (uint8_t)text[q4] == '\n')) {
+                    q4++;
+                }
+                pos = q4;
+                bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+                continue;
+            }
+        }
+
+        /* Whitespace rules 5/6/7 (llama.cpp custom_qwen35 semantics). */
+        uint64_t p5 = pos;
+        uint64_t last_ws_start = pos;
+        while (p5 < len) {
+            uint64_t pn = 0;
+            uint32_t pc = utf8_peek_one(text, len, p5, &pn);
+            if (!glm4_unicode_whitespace(pc)) break;
+            last_ws_start = p5;
+            p5 = pn;
+        }
+        if (p5 > pos) {
+            /* Rule 5: \s*[\r\n]+ — stop after the last newline of the run. */
+            uint64_t last_nl = pos;
+            for (uint64_t i = pos; i < p5; i++) {
+                if (text[i] == '\r' || text[i] == '\n') last_nl = i + 1;
+            }
+            if (last_nl > pos) {
+                pos = last_nl;
+            } else if (p5 - pos > 1 && p5 < len) {
+                /* Rule 6: \s+(?!\S) — leave one whitespace character so it
+                 * can join the following word (GPT-4 backtracking semantics). */
+                pos = last_ws_start;
+            } else {
+                /* Rule 7: \s+ — whole run. */
+                pos = p5;
+            }
+            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            continue;
+        }
+
+        pos = next_utf8_char(text, len, pos);
+        bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+    }
+}
+
 static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN38) {
+        bpe_tokenize_text_qwen35(vocab, text, out);
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         bpe_tokenize_text_glm4(vocab, text, out);
         return;
@@ -40155,6 +40309,33 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         table_put(&vocab->merge_rank, merge, (int)i);
     }
 
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN38) {
+        if (!model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id)) {
+            vocab->bos_id = vocab_lookup_optional(vocab, "<|endoftext|>");
+        }
+        if (!model_get_token_id(model, "tokenizer.ggml.eos_token_id", &vocab->eos_id)) {
+            vocab->eos_id = vocab_lookup_optional(vocab, "<|im_end|>");
+        }
+        vocab->system_id = vocab_lookup_optional(vocab, "<|im_start|>");
+        vocab->user_id = vocab->system_id;
+        vocab->assistant_id = vocab->system_id;
+        vocab->im_end_id = vocab_lookup_optional(vocab, "<|im_end|>");
+        vocab->observation_id = -1;
+        vocab->sop_id = -1;
+        vocab->think_start_id = vocab_lookup_optional(vocab, "<think>");
+        vocab->think_end_id = vocab_lookup_optional(vocab, "</think>");
+        vocab->tool_call_start_id = vocab_lookup_optional(vocab, "<tool_call>");
+        vocab->tool_call_end_id = vocab_lookup_optional(vocab, "</tool_call>");
+        vocab->tool_response_start_id = vocab_lookup_optional(vocab, "<tool_response>");
+        vocab->tool_response_end_id = vocab_lookup_optional(vocab, "</tool_response>");
+        vocab->arg_key_start_id = -1;
+        vocab->arg_key_end_id = -1;
+        vocab->arg_value_start_id = -1;
+        vocab->arg_value_end_id = -1;
+        vocab->dsml_id = -1;
+        return;
+    }
+
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (!model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id)) {
             vocab->bos_id = vocab_lookup_optional(vocab, "<sop>");
@@ -40246,6 +40427,33 @@ static void encode_chat_prompt(
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN38) {
+        /* Qwen3.8 chat template (text-only, CLI subset): no BOS; optional
+         * system turn; user turn; assistant turn with <think> when enabled. */
+        if (vocab->system_id < 0 || vocab->im_end_id < 0) {
+            ds4_die("this tokenizer does not provide the Qwen chat markers; use raw prompt tokenization");
+        }
+        if (system && system[0]) {
+            token_vec_push(out, vocab->system_id);
+            bpe_tokenize_text(vocab, "system\n", out);
+            bpe_tokenize_text(vocab, system, out);
+            token_vec_push(out, vocab->im_end_id);
+            bpe_tokenize_text(vocab, "\n", out);
+        }
+        token_vec_push(out, vocab->user_id);
+        bpe_tokenize_text(vocab, "user\n", out);
+        bpe_tokenize_text(vocab, prompt, out);
+        token_vec_push(out, vocab->im_end_id);
+        bpe_tokenize_text(vocab, "\n", out);
+        token_vec_push(out, vocab->assistant_id);
+        bpe_tokenize_text(vocab, "assistant\n", out);
+        if (ds4_think_mode_enabled(think_mode) && vocab->think_start_id >= 0) {
+            token_vec_push(out, vocab->think_start_id);
+            bpe_tokenize_text(vocab, "\n", out);
+        }
+        return;
+    }
+
     const bool need_think_start =
         ds4_think_mode_enabled(think_mode) ||
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
