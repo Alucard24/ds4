@@ -1,7 +1,7 @@
 # Qwen3.8 CPU reference checks (Linux)
 
-This documents the text reference and initial CUDA quant-kernel checks, not the
-requested CUDA + vision MVP. End-to-end CUDA Qwen inference, vision, full
+This documents the text reference and the first end-to-end CUDA text path, not
+the requested CUDA + vision MVP. Vision, fast chunked CUDA prefill, full
 chat/tool template parity and recurrent disk cache serialization are not
 implemented yet. Unsupported cache operations fail
 explicitly; they must not save a DeepSeek-shaped payload.
@@ -55,7 +55,31 @@ make test-qwen38-cuda CUDA_ARCH=sm_120 \
 
 The external ggml CPU library supplies only independent host dequantization.
 Weights and activations are copied to the RTX GPU; ds4's vendored MIT MMVQ runs
-the matvec. This does not validate the not-yet-integrated Qwen CUDA graph.
+the matvec.
+
+## CUDA text graph
+
+The CUDA correctness path runs the complete 64-layer model: native mixed-IQ
+MMVQ, depthwise convolution and GDN recurrence, gated GQA, SwiGLU FFN and
+output logits. GDN state remains FP32. The 16 global-attention layers use FP16
+K/V (64 KiB per context token), matching the practical memory class of normal
+llama.cpp CUDA inference. At context 32768 the measured process peak was
+14100 MiB on the RTX 5070 Ti, including the approximately 10.95 GiB model.
+
+```sh
+make clean
+make cuda CUDA_ARCH=sm_120
+make test-qwen38-cuda-session CUDA_ARCH=sm_120 \
+  DS4_TEST_QWEN38_MODEL="$Q/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf"
+```
+
+The session gate checks token-at-a-time eval, no-op sync, changed-prefix
+rebuild, shortening plus extension, finite logits, and explicit rejection of
+an unsupported recurrent payload. Repeated CUDA paths must reproduce their
+own logits exactly. On the canonical six-token sentence its CUDA mean NLL was
+2.44172788 versus 2.43708414 for the FP32 CPU-state oracle, and both generated
+` Paris` greedily. CUDA prefill is still sequential at this checkpoint and is
+not a performance result.
 
 ## Real-model session and continuation checks
 

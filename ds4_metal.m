@@ -46038,6 +46038,39 @@ int ds4_gpu_glm53_matmul_bf16(
     }
 }
 
+int ds4_gpu_qwen38_gdn_decode(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *conv_state,
+        ds4_gpu_tensor *recurrent_state, ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *z, const ds4_gpu_tensor *alpha,
+        const ds4_gpu_tensor *beta, const void *model_map, uint64_t model_size,
+        uint64_t conv_weight_offset, uint64_t a_offset, uint64_t dt_offset,
+        uint64_t norm_offset) {
+    (void)out; (void)conv_state; (void)recurrent_state; (void)qkv;
+    (void)z; (void)alpha; (void)beta; (void)model_map; (void)model_size;
+    (void)conv_weight_offset; (void)a_offset; (void)dt_offset; (void)norm_offset;
+    return 0;
+}
+
+int ds4_gpu_qwen38_ga_prepare(
+        ds4_gpu_tensor *q_full, ds4_gpu_tensor *k_cache,
+        ds4_gpu_tensor *v_cache, ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
+        const void *model_map, uint64_t model_size, uint64_t q_norm_offset,
+        uint64_t k_norm_offset, uint32_t pos, uint32_t ctx_size) {
+    (void)q_full; (void)k_cache; (void)v_cache; (void)k; (void)v;
+    (void)model_map; (void)model_size; (void)q_norm_offset;
+    (void)k_norm_offset; (void)pos; (void)ctx_size;
+    return 0;
+}
+
+int ds4_gpu_qwen38_ga_decode(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q_full,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        uint32_t pos, uint32_t ctx_size) {
+    (void)out; (void)q_full; (void)k_cache; (void)v_cache;
+    (void)pos; (void)ctx_size;
+    return 0;
+}
+
 int ds4_gpu_glm53_matmul_bf16_qkv(
         ds4_gpu_tensor       *out_q,
         ds4_gpu_tensor       *out_k,

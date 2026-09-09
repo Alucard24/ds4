@@ -1,4 +1,4 @@
-/* Real-model CPU test through the public engine boundary. Build after make cpu:
+/* Real-model CPU/CUDA test through the public engine boundary. Build after make cpu:
  * cc -O2 -std=c99 -I. tests/test_qwen38_session.c ds4_cpu.o ds4_image.o \
  *   ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o -lm -pthread -o /tmp/qwen-session
  * /tmp/qwen-session MODEL 'The capital of France is Paris.'
@@ -30,7 +30,9 @@ static void same_logits(ds4_session *s, const float *want, int n) {
 
 int main(int argc, char **argv) {
     require(argc == 3, "usage: test_qwen38_session MODEL TEXT");
-    ds4_engine_options opt = {.model_path=argv[1], .backend=DS4_BACKEND_CPU,
+    const int use_cuda = getenv("DS4_TEST_QWEN38_CUDA") != NULL;
+    ds4_engine_options opt = {.model_path=argv[1],
+        .backend=use_cuda ? DS4_BACKEND_CUDA : DS4_BACKEND_CPU,
         .context_size=128, .power_percent=100};
     ds4_engine *e = NULL;
     require(ds4_engine_open(&e, &opt) == 0, "engine open");
@@ -81,6 +83,6 @@ int main(int argc, char **argv) {
     ds4_session_free(s);
     ds4_tokens_free(&tokens);
     ds4_engine_close(e);
-    puts("Qwen CPU session PASS");
+    printf("Qwen %s session PASS\n", use_cuda ? "CUDA" : "CPU");
     return 0;
 }

@@ -27212,6 +27212,289 @@ extern "C" int ds4_gpu_glm53_matmul_bf16(
 }
 
 enum {
+    QWEN38_CUDA_EMBD = 5120,
+    QWEN38_CUDA_CONV_DIM = 10240,
+    QWEN38_CUDA_VALUE_DIM = 6144,
+    QWEN38_CUDA_HEAD_DIM = 128,
+    QWEN38_CUDA_HEADS_QK = 16,
+    QWEN38_CUDA_HEADS_V = 48,
+    QWEN38_CUDA_GA_HEAD_DIM = 256,
+    QWEN38_CUDA_GA_HEADS = 24,
+    QWEN38_CUDA_GA_HEADS_KV = 4,
+};
+
+__global__ static void qwen38_conv_silu_kernel(
+        float *qkv, float *history, const float *weights) {
+    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= QWEN38_CUDA_CONV_DIM) return;
+    float y = 0.0f;
+#pragma unroll
+    for (uint32_t k = 0; k < 3u; k++) {
+        y = fmaf(history[(uint64_t)k * QWEN38_CUDA_CONV_DIM + d],
+                 weights[(uint64_t)d * 4u + k], y);
+    }
+    const float raw = qkv[d];
+    y = fmaf(raw, weights[(uint64_t)d * 4u + 3u], y);
+    history[d] = history[QWEN38_CUDA_CONV_DIM + d];
+    history[QWEN38_CUDA_CONV_DIM + d] =
+        history[2ull * QWEN38_CUDA_CONV_DIM + d];
+    history[2ull * QWEN38_CUDA_CONV_DIM + d] = raw;
+    qkv[d] = y / (1.0f + expf(-y));
+}
+
+__global__ static void qwen38_gdn_decode_kernel(
+        float *out, float *state, const float *qkv, const float *z,
+        const float *alpha, const float *beta,
+        const float *a, const float *dt, const float *norm) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    if (head >= QWEN38_CUDA_HEADS_V || tid >= QWEN38_CUDA_HEAD_DIM) return;
+
+    __shared__ float q[QWEN38_CUDA_HEAD_DIM];
+    __shared__ float k[QWEN38_CUDA_HEAD_DIM];
+    __shared__ float o[QWEN38_CUDA_HEAD_DIM];
+    __shared__ float rq[4], rk[4], ro[4];
+    __shared__ float q_inv, k_inv, decay, beta_h;
+    const uint32_t qk_head = head % QWEN38_CUDA_HEADS_QK;
+    q[tid] = qkv[(uint64_t)qk_head * QWEN38_CUDA_HEAD_DIM + tid];
+    k[tid] = qkv[(uint64_t)QWEN38_CUDA_HEADS_QK * QWEN38_CUDA_HEAD_DIM +
+                 (uint64_t)qk_head * QWEN38_CUDA_HEAD_DIM + tid];
+    float qs = warp_sum_f32(q[tid] * q[tid]);
+    float ks = warp_sum_f32(k[tid] * k[tid]);
+    if (lane == 0u) { rq[warp] = qs; rk[warp] = ks; }
+    __syncthreads();
+    if (tid == 0u) {
+        float qsum = 0.0f, ksum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; i++) { qsum += rq[i]; ksum += rk[i]; }
+        q_inv = ds4_cuda_rsqrtf(qsum + 1.0e-6f);
+        k_inv = ds4_cuda_rsqrtf(ksum + 1.0e-6f);
+        const float x = alpha[head] + dt[head];
+        const float softplus = x > 20.0f ? x : log1pf(expf(x));
+        decay = expf(a[head] * softplus);
+        beta_h = 1.0f / (1.0f + expf(-beta[head]));
+    }
+    __syncthreads();
+    q[tid] *= q_inv;
+    k[tid] *= k_inv;
+    __syncthreads();
+
+    const uint32_t key0 = lane * 4u;
+    const float4 q4 = *(const float4 *)(q + key0);
+    const float4 k4 = *(const float4 *)(k + key0);
+    const uint64_t state_head =
+        (uint64_t)head * QWEN38_CUDA_HEAD_DIM * QWEN38_CUDA_HEAD_DIM;
+    for (uint32_t value = warp; value < QWEN38_CUDA_HEAD_DIM; value += 4u) {
+        float4 *hp = (float4 *)(state + state_head +
+            (uint64_t)value * QWEN38_CUDA_HEAD_DIM + key0);
+        float4 h = *hp;
+        h.x *= decay; h.y *= decay; h.z *= decay; h.w *= decay;
+        const float pred = __shfl_sync(0xffffffffu,
+            warp_sum_f32(dot4_f32(h, k4)), 0);
+        const float vv = qkv[2u * QWEN38_CUDA_HEADS_QK * QWEN38_CUDA_HEAD_DIM +
+            (uint64_t)head * QWEN38_CUDA_HEAD_DIM + value];
+        const float delta = (vv - pred) * beta_h;
+        h.x = fmaf(k4.x, delta, h.x);
+        h.y = fmaf(k4.y, delta, h.y);
+        h.z = fmaf(k4.z, delta, h.z);
+        h.w = fmaf(k4.w, delta, h.w);
+        *hp = h;
+        const float result = __shfl_sync(0xffffffffu,
+            warp_sum_f32(dot4_f32(h, q4)), 0) * 0.08838834764831845f;
+        if (lane == 0u) o[value] = result;
+    }
+    __syncthreads();
+    float os = warp_sum_f32(o[tid] * o[tid]);
+    if (lane == 0u) ro[warp] = os;
+    __syncthreads();
+    if (tid == 0u) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; i++) sum += ro[i];
+        ro[0] = ds4_cuda_rsqrtf(sum / QWEN38_CUDA_HEAD_DIM + 1.0e-6f);
+    }
+    __syncthreads();
+    const float zg = z[(uint64_t)head * QWEN38_CUDA_HEAD_DIM + tid];
+    out[(uint64_t)head * QWEN38_CUDA_HEAD_DIM + tid] =
+        o[tid] * ro[0] * norm[tid] * (zg / (1.0f + expf(-zg)));
+}
+
+__global__ static void qwen38_ga_q_prepare_kernel(
+        float *q_full, const float *norm, uint32_t pos) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (head >= QWEN38_CUDA_GA_HEADS || tid >= QWEN38_CUDA_GA_HEAD_DIM) return;
+    float *q = q_full + (uint64_t)head * 2u * QWEN38_CUDA_GA_HEAD_DIM;
+    __shared__ float part[QWEN38_CUDA_GA_HEAD_DIM];
+    part[tid] = q[tid] * q[tid];
+    __syncthreads();
+    for (uint32_t stride = 128u; stride; stride >>= 1u) {
+        if (tid < stride) part[tid] += part[tid + stride];
+        __syncthreads();
+    }
+    q[tid] *= ds4_cuda_rsqrtf(part[0] / QWEN38_CUDA_GA_HEAD_DIM + 1.0e-6f) * norm[tid];
+    __syncthreads();
+    if (tid < 32u) {
+        const float inv = powf(1.0e7f, -(float)(2u * tid) / 64.0f);
+        const float angle = (float)pos * inv;
+        const float c = cosf(angle), s = sinf(angle);
+        const float a0 = q[tid], a1 = q[tid + 32u];
+        q[tid] = a0 * c - a1 * s;
+        q[tid + 32u] = a0 * s + a1 * c;
+    }
+}
+
+__global__ static void qwen38_ga_kv_prepare_kernel(
+        float *k, const float *v, __half *k_cache, __half *v_cache,
+        const float *norm, uint32_t pos, uint32_t ctx_size) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (head >= QWEN38_CUDA_GA_HEADS_KV || tid >= QWEN38_CUDA_GA_HEAD_DIM || pos >= ctx_size) return;
+    float *kh = k + (uint64_t)head * QWEN38_CUDA_GA_HEAD_DIM;
+    __shared__ float part[QWEN38_CUDA_GA_HEAD_DIM];
+    part[tid] = kh[tid] * kh[tid];
+    __syncthreads();
+    for (uint32_t stride = 128u; stride; stride >>= 1u) {
+        if (tid < stride) part[tid] += part[tid + stride];
+        __syncthreads();
+    }
+    kh[tid] *= ds4_cuda_rsqrtf(part[0] / QWEN38_CUDA_GA_HEAD_DIM + 1.0e-6f) * norm[tid];
+    __syncthreads();
+    if (tid < 32u) {
+        const float inv = powf(1.0e7f, -(float)(2u * tid) / 64.0f);
+        const float angle = (float)pos * inv;
+        const float c = cosf(angle), s = sinf(angle);
+        const float a0 = kh[tid], a1 = kh[tid + 32u];
+        kh[tid] = a0 * c - a1 * s;
+        kh[tid + 32u] = a0 * s + a1 * c;
+    }
+    __syncthreads();
+    const uint64_t dst = (uint64_t)pos * 1024u +
+        (uint64_t)head * QWEN38_CUDA_GA_HEAD_DIM + tid;
+    k_cache[dst] = __float2half_rn(kh[tid]);
+    v_cache[dst] = __float2half_rn(
+        v[(uint64_t)head * QWEN38_CUDA_GA_HEAD_DIM + tid]);
+}
+
+__global__ static void qwen38_ga_decode_kernel(
+        float *out, const float *q_full, const __half *k_cache,
+        const __half *v_cache, uint32_t pos) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (head >= QWEN38_CUDA_GA_HEADS || tid >= QWEN38_CUDA_GA_HEAD_DIM) return;
+    const uint32_t kv_head = head / (QWEN38_CUDA_GA_HEADS / QWEN38_CUDA_GA_HEADS_KV);
+    const float *q = q_full + (uint64_t)head * 2u * QWEN38_CUDA_GA_HEAD_DIM;
+    const float gate = q[QWEN38_CUDA_GA_HEAD_DIM + tid];
+    __shared__ float partial[QWEN38_CUDA_GA_HEAD_DIM];
+    __shared__ float old_scale, probability, denominator, maximum;
+    if (tid == 0u) { denominator = 0.0f; maximum = -INFINITY; }
+    __syncthreads();
+    float acc = 0.0f;
+    for (uint32_t token = 0; token <= pos; token++) {
+        const uint64_t base = (uint64_t)token * 1024u +
+            (uint64_t)kv_head * QWEN38_CUDA_GA_HEAD_DIM;
+        partial[tid] = q[tid] * __half2float(k_cache[base + tid]);
+        __syncthreads();
+        for (uint32_t stride = 128u; stride; stride >>= 1u) {
+            if (tid < stride) partial[tid] += partial[tid + stride];
+            __syncthreads();
+        }
+        if (tid == 0u) {
+            const float score = partial[0] * 0.0625f;
+            const float next_max = fmaxf(maximum, score);
+            old_scale = isfinite(maximum) ? expf(maximum - next_max) : 0.0f;
+            probability = expf(score - next_max);
+            denominator = denominator * old_scale + probability;
+            maximum = next_max;
+        }
+        __syncthreads();
+        acc = acc * old_scale + probability * __half2float(v_cache[base + tid]);
+        __syncthreads();
+    }
+    out[(uint64_t)head * QWEN38_CUDA_GA_HEAD_DIM + tid] =
+        acc / denominator * (1.0f / (1.0f + expf(-gate)));
+}
+
+static const float *qwen38_cuda_f32_weight(
+        const void *model_map, uint64_t model_size, uint64_t offset,
+        uint64_t count, int tier, const char *label) {
+    const uint64_t bytes = count * sizeof(float);
+    if (!model_map || offset > model_size || bytes > model_size - offset) return nullptr;
+    return (const float *)cuda_resolve_weight_ptr(model_map, offset, bytes, tier, label);
+}
+
+extern "C" int ds4_gpu_qwen38_gdn_decode(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *conv_state,
+        ds4_gpu_tensor *recurrent_state, ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *z, const ds4_gpu_tensor *alpha,
+        const ds4_gpu_tensor *beta, const void *model_map, uint64_t model_size,
+        uint64_t conv_weight_offset, uint64_t a_offset, uint64_t dt_offset,
+        uint64_t norm_offset) {
+    const uint64_t state_count = 48ull * 128 * 128;
+    if (!out || !conv_state || !recurrent_state || !qkv || !z || !alpha || !beta ||
+        out->bytes < 6144ull*4 || conv_state->bytes < 3ull*10240*4 ||
+        recurrent_state->bytes < state_count*4 || qkv->bytes < 10240ull*4 ||
+        z->bytes < 6144ull*4 || alpha->bytes < 48ull*4 || beta->bytes < 48ull*4) return 0;
+    const int tier = ds4_tensor_device_idx(out);
+    const float *conv = qwen38_cuda_f32_weight(model_map, model_size,
+        conv_weight_offset, 10240ull*4, tier, "Qwen GDN convolution");
+    const float *a = qwen38_cuda_f32_weight(model_map, model_size,
+        a_offset, 48, tier, "Qwen GDN A");
+    const float *dt = qwen38_cuda_f32_weight(model_map, model_size,
+        dt_offset, 48, tier, "Qwen GDN dt");
+    const float *norm = qwen38_cuda_f32_weight(model_map, model_size,
+        norm_offset, 128, tier, "Qwen GDN norm");
+    if (!conv || !a || !dt || !norm) return 0;
+    qwen38_conv_silu_kernel<<<40,256,0,cuda_decode_stream()>>>(
+        (float *)qkv->ptr, (float *)conv_state->ptr, conv);
+    if (!cuda_ok(cudaGetLastError(), "Qwen GDN convolution launch")) return 0;
+    qwen38_gdn_decode_kernel<<<48,128,0,cuda_decode_stream()>>>(
+        (float *)out->ptr, (float *)recurrent_state->ptr,
+        (const float *)qkv->ptr, (const float *)z->ptr,
+        (const float *)alpha->ptr, (const float *)beta->ptr, a, dt, norm);
+    return cuda_ok(cudaGetLastError(), "Qwen GDN decode launch");
+}
+
+extern "C" int ds4_gpu_qwen38_ga_prepare(
+        ds4_gpu_tensor *q_full, ds4_gpu_tensor *k_cache,
+        ds4_gpu_tensor *v_cache, ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
+        const void *model_map, uint64_t model_size, uint64_t q_norm_offset,
+        uint64_t k_norm_offset, uint32_t pos, uint32_t ctx_size) {
+    if (!q_full || !k_cache || !v_cache || !k || !v || pos >= ctx_size ||
+        q_full->bytes < 12288ull*4 || k->bytes < 1024ull*4 || v->bytes < 1024ull*4 ||
+        k_cache->bytes < (uint64_t)ctx_size*1024*2 ||
+        v_cache->bytes < (uint64_t)ctx_size*1024*2) return 0;
+    const int tier = ds4_tensor_device_idx(q_full);
+    const float *qn = qwen38_cuda_f32_weight(model_map, model_size,
+        q_norm_offset, 256, tier, "Qwen Q norm");
+    const float *kn = qwen38_cuda_f32_weight(model_map, model_size,
+        k_norm_offset, 256, tier, "Qwen K norm");
+    if (!qn || !kn) return 0;
+    qwen38_ga_q_prepare_kernel<<<24,256,0,cuda_decode_stream()>>>(
+        (float *)q_full->ptr, qn, pos);
+    qwen38_ga_kv_prepare_kernel<<<4,256,0,cuda_decode_stream()>>>(
+        (float *)k->ptr, (const float *)v->ptr,
+        (__half *)k_cache->ptr, (__half *)v_cache->ptr, kn, pos, ctx_size);
+    return cuda_ok(cudaGetLastError(), "Qwen GA prepare launch");
+}
+
+extern "C" int ds4_gpu_qwen38_ga_decode(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q_full,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        uint32_t pos, uint32_t ctx_size) {
+    if (!out || !q_full || !k_cache || !v_cache || pos >= ctx_size ||
+        out->bytes < 6144ull*4 || q_full->bytes < 12288ull*4 ||
+        k_cache->bytes < (uint64_t)ctx_size*1024*2 ||
+        v_cache->bytes < (uint64_t)ctx_size*1024*2) return 0;
+    qwen38_ga_decode_kernel<<<24,256,0,cuda_decode_stream()>>>(
+        (float *)out->ptr, (const float *)q_full->ptr,
+        (const __half *)k_cache->ptr, (const __half *)v_cache->ptr, pos);
+    return cuda_ok(cudaGetLastError(), "Qwen GA decode launch");
+}
+
+enum {
     GLM53_CUDA_KDA_DIM = 128,
     GLM53_CUDA_KDA_HISTORY = 3,
 };

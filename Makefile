@@ -330,6 +330,20 @@ test-qwen38-cuda: tests/test_qwen38_cuda
 		echo "error: set DS4_TEST_GGML_CPU=/path/to/libggml-cpu.so"; exit 2; \
 	fi
 	./tests/test_qwen38_cuda "$(DS4_TEST_GGML_CPU)"
+
+tests/test_qwen38_session_cuda.o: tests/test_qwen38_session.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_qwen38_session_cuda: tests/test_qwen38_session_cuda.o $(CORE_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+.PHONY: test-qwen38-cuda-session
+test-qwen38-cuda-session: tests/test_qwen38_session_cuda
+	@if [ ! -f "$(DS4_TEST_QWEN38_MODEL)" ]; then \
+		echo "error: set DS4_TEST_QWEN38_MODEL=/path/to/Qwen3.8-27B.gguf"; exit 2; \
+	fi
+	DS4_TEST_QWEN38_CUDA=1 ./tests/test_qwen38_session_cuda \
+		"$(DS4_TEST_QWEN38_MODEL)" 'The capital of France is Paris.'
 endif
 
 ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_linux_memory.h

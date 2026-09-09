@@ -7240,20 +7240,26 @@ typedef struct {
     uint32_t ctx_size;
 } ds4_qwen38_cpu_state;
 
-static ds4_context_memory qwen38_cpu_memory_estimate(int ctx_size) {
+static ds4_context_memory qwen38_memory_estimate(int ctx_size, bool cuda) {
     const uint64_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
     ds4_context_memory m = {0};
     m.raw_cap = (uint32_t)ctx;
-    /* GA K/V plus fixed GDN recurrent state and raw convolution history.
-     * None of this state is a DeepSeek compressed-KV cache. */
-    m.raw_bytes = (16ull * ctx * 1024 * 2 + 48ull * 48 * 128 * 128 +
-                   48ull * 3 * QWEN38_CONV_DIM) * sizeof(float);
+    /* CUDA stores the 16 GA-layer K/V rows as FP16 (64 KiB/token); GDN
+     * recurrence and convolution histories stay FP32. The CPU oracle keeps
+     * every component FP32. None is a DeepSeek compressed-KV cache. */
+    const uint64_t ga_elements = 16ull * ctx * 1024 * 2;
+    m.raw_bytes = ga_elements * (cuda ? sizeof(uint16_t) : sizeof(float)) +
+        (48ull * 48 * 128 * 128 + 48ull * 3 * QWEN38_CONV_DIM) * sizeof(float);
     m.scratch_bytes = (2ull * QWEN38_N_EMBD + QWEN38_CONV_DIM +
                        3ull * QWEN38_VALUE_DIM + 2ull * QWEN38_N_V_HEAD +
                        3ull * QWEN38_N_FF + QWEN38_N_HEAD * ctx +
                        24ull * 512 + DS4_N_VOCAB) * sizeof(float);
     m.total_bytes = m.raw_bytes + m.scratch_bytes;
     return m;
+}
+
+static ds4_context_memory qwen38_cpu_memory_estimate(int ctx_size) {
+    return qwen38_memory_estimate(ctx_size, false);
 }
 
 static void qwen38_cpu_state_init(ds4_qwen38_cpu_state *st, uint32_t ctx_size) {
@@ -7305,6 +7311,138 @@ static void qwen38_cpu_state_zero(ds4_qwen38_cpu_state *st) {
     memset(st->attn_k, 0, 16ull * st->ctx_size * 1024 * sizeof(float));
     memset(st->attn_v, 0, 16ull * st->ctx_size * 1024 * sizeof(float));
 }
+
+#ifndef DS4_NO_GPU
+typedef struct {
+    ds4_gpu_tensor *ssm_state;
+    ds4_gpu_tensor *conv_state;
+    ds4_gpu_tensor *attn_k;
+    ds4_gpu_tensor *attn_v;
+    ds4_gpu_tensor *ssm_layer[48];
+    ds4_gpu_tensor *conv_layer[48];
+    ds4_gpu_tensor *attn_k_layer[16];
+    ds4_gpu_tensor *attn_v_layer[16];
+    ds4_gpu_tensor *hidden;
+    ds4_gpu_tensor *xnorm;
+    ds4_gpu_tensor *qkv;
+    ds4_gpu_tensor *z;
+    ds4_gpu_tensor *alpha;
+    ds4_gpu_tensor *beta;
+    ds4_gpu_tensor *o;
+    ds4_gpu_tensor *attn;
+    ds4_gpu_tensor *proj;
+    ds4_gpu_tensor *q_full;
+    ds4_gpu_tensor *k;
+    ds4_gpu_tensor *v;
+    ds4_gpu_tensor *ffn_g;
+    ds4_gpu_tensor *ffn_u;
+    ds4_gpu_tensor *ffn_m;
+    ds4_gpu_tensor *logits;
+    uint32_t ctx_size;
+} ds4_qwen38_gpu_state;
+
+static int qwen38_gpu_alloc_bytes(ds4_gpu_tensor **out, uint64_t bytes,
+                                  const char *label) {
+    *out = ds4_gpu_tensor_alloc(bytes);
+    if (*out) return 1;
+    fprintf(stderr, "ds4: failed to allocate Qwen CUDA tensor %s (%.2f MiB)\n",
+            label, (double)bytes / 1048576.0);
+    return 0;
+}
+
+static int qwen38_gpu_alloc_tensor(ds4_gpu_tensor **out, uint64_t count,
+                                   const char *label) {
+    return qwen38_gpu_alloc_bytes(out, count * sizeof(float), label);
+}
+
+static void qwen38_gpu_state_free(ds4_qwen38_gpu_state *st) {
+    for (uint32_t i = 0; i < 48; i++) {
+        ds4_gpu_tensor_free(st->ssm_layer[i]);
+        ds4_gpu_tensor_free(st->conv_layer[i]);
+    }
+    for (uint32_t i = 0; i < 16; i++) {
+        ds4_gpu_tensor_free(st->attn_k_layer[i]);
+        ds4_gpu_tensor_free(st->attn_v_layer[i]);
+    }
+#define QWEN38_GPU_FREE(name) ds4_gpu_tensor_free(st->name)
+    QWEN38_GPU_FREE(ssm_state); QWEN38_GPU_FREE(conv_state);
+    QWEN38_GPU_FREE(attn_k); QWEN38_GPU_FREE(attn_v);
+    QWEN38_GPU_FREE(hidden); QWEN38_GPU_FREE(xnorm);
+    QWEN38_GPU_FREE(qkv); QWEN38_GPU_FREE(z);
+    QWEN38_GPU_FREE(alpha); QWEN38_GPU_FREE(beta);
+    QWEN38_GPU_FREE(o); QWEN38_GPU_FREE(attn); QWEN38_GPU_FREE(proj);
+    QWEN38_GPU_FREE(q_full); QWEN38_GPU_FREE(k); QWEN38_GPU_FREE(v);
+    QWEN38_GPU_FREE(ffn_g); QWEN38_GPU_FREE(ffn_u); QWEN38_GPU_FREE(ffn_m);
+    QWEN38_GPU_FREE(logits);
+#undef QWEN38_GPU_FREE
+    memset(st, 0, sizeof(*st));
+}
+
+static int qwen38_gpu_state_init(ds4_qwen38_gpu_state *st, uint32_t ctx_size) {
+    memset(st, 0, sizeof(*st));
+    st->ctx_size = ctx_size;
+#define QWEN38_GPU_ALLOC(name, count) \
+    do { if (!qwen38_gpu_alloc_tensor(&st->name, (count), #name)) goto fail; } while (0)
+    QWEN38_GPU_ALLOC(ssm_state, 48ull * 48 * 128 * 128);
+    QWEN38_GPU_ALLOC(conv_state, 48ull * 3 * QWEN38_CONV_DIM);
+    if (!qwen38_gpu_alloc_bytes(&st->attn_k,
+            16ull * ctx_size * 1024 * sizeof(uint16_t), "attn_k")) goto fail;
+    if (!qwen38_gpu_alloc_bytes(&st->attn_v,
+            16ull * ctx_size * 1024 * sizeof(uint16_t), "attn_v")) goto fail;
+    QWEN38_GPU_ALLOC(hidden, QWEN38_N_EMBD);
+    QWEN38_GPU_ALLOC(xnorm, QWEN38_N_EMBD);
+    QWEN38_GPU_ALLOC(qkv, QWEN38_CONV_DIM);
+    QWEN38_GPU_ALLOC(z, QWEN38_VALUE_DIM);
+    QWEN38_GPU_ALLOC(alpha, QWEN38_N_V_HEAD);
+    QWEN38_GPU_ALLOC(beta, QWEN38_N_V_HEAD);
+    QWEN38_GPU_ALLOC(o, QWEN38_VALUE_DIM);
+    QWEN38_GPU_ALLOC(attn, QWEN38_VALUE_DIM);
+    QWEN38_GPU_ALLOC(proj, QWEN38_N_EMBD);
+    QWEN38_GPU_ALLOC(q_full, 2ull * QWEN38_N_HEAD * QWEN38_HEAD_DIM);
+    QWEN38_GPU_ALLOC(k, QWEN38_N_HEAD_KV * QWEN38_HEAD_DIM);
+    QWEN38_GPU_ALLOC(v, QWEN38_N_HEAD_KV * QWEN38_HEAD_DIM);
+    QWEN38_GPU_ALLOC(ffn_g, QWEN38_N_FF);
+    QWEN38_GPU_ALLOC(ffn_u, QWEN38_N_FF);
+    QWEN38_GPU_ALLOC(ffn_m, QWEN38_N_FF);
+    QWEN38_GPU_ALLOC(logits, DS4_N_VOCAB);
+#undef QWEN38_GPU_ALLOC
+    for (uint32_t i = 0; i < 48; i++) {
+        st->ssm_layer[i] = ds4_gpu_tensor_view(st->ssm_state,
+            i * (48ull * 128 * 128 * sizeof(float)),
+            48ull * 128 * 128 * sizeof(float));
+        st->conv_layer[i] = ds4_gpu_tensor_view(st->conv_state,
+            i * (3ull * QWEN38_CONV_DIM * sizeof(float)),
+            3ull * QWEN38_CONV_DIM * sizeof(float));
+        if (!st->ssm_layer[i] || !st->conv_layer[i]) goto fail;
+    }
+    for (uint32_t i = 0; i < 16; i++) {
+        st->attn_k_layer[i] = ds4_gpu_tensor_view(st->attn_k,
+            i * ((uint64_t)ctx_size * 1024 * sizeof(uint16_t)),
+            (uint64_t)ctx_size * 1024 * sizeof(uint16_t));
+        st->attn_v_layer[i] = ds4_gpu_tensor_view(st->attn_v,
+            i * ((uint64_t)ctx_size * 1024 * sizeof(uint16_t)),
+            (uint64_t)ctx_size * 1024 * sizeof(uint16_t));
+        if (!st->attn_k_layer[i] || !st->attn_v_layer[i]) goto fail;
+    }
+    if (!ds4_gpu_tensor_fill_f32(st->ssm_state, 0.0f, 48ull * 48 * 128 * 128) ||
+        !ds4_gpu_tensor_fill_f32(st->conv_state, 0.0f,
+                                  48ull * 3 * QWEN38_CONV_DIM)) goto fail;
+    return 1;
+fail:
+#undef QWEN38_GPU_ALLOC
+    qwen38_gpu_state_free(st);
+    return 0;
+}
+
+static int qwen38_gpu_state_zero(ds4_qwen38_gpu_state *st) {
+    /* KV rows are overwritten before use after a reset, so only persistent
+     * recurrent and convolution state needs an explicit clear. */
+    return ds4_gpu_tensor_fill_f32(st->ssm_state, 0.0f,
+                                    48ull * 48 * 128 * 128) &&
+        ds4_gpu_tensor_fill_f32(st->conv_state, 0.0f,
+                                48ull * 3 * QWEN38_CONV_DIM);
+}
+#endif
 
 static void qwen38_dequant_row(uint32_t type, const uint8_t *row, uint64_t n, float *out) {
     switch (type) {
@@ -7778,6 +7916,139 @@ static void qwen38_cpu_forward_token(ds4_qwen38_cpu_state *st,
     }
     qwen38_matvec(logits, m, w->output, st->xnorm);
 }
+
+#ifndef DS4_NO_GPU
+static int qwen38_gpu_matvec(ds4_gpu_tensor *out, const ds4_model *m,
+                             const ds4_tensor *weight,
+                             const ds4_gpu_tensor *x) {
+    switch (weight->type) {
+    case DS4_TENSOR_F32:
+        return ds4_gpu_matmul_f32_tensor(out, m->map, m->size,
+            weight->abs_offset, weight->dim[0], weight->dim[1], x, 1);
+    case DS4_TENSOR_F16:
+        return ds4_gpu_matmul_f16_tensor(out, m->map, m->size,
+            weight->abs_offset, weight->dim[0], weight->dim[1], x, 1);
+    case DS4_TENSOR_BF16:
+        return ds4_gpu_glm53_matmul_bf16(out, m->map, m->size,
+            weight->abs_offset, (uint32_t)weight->dim[0],
+            (uint32_t)weight->dim[1], x, 1);
+    case DS4_TENSOR_Q2_K:
+    case DS4_TENSOR_Q4_K:
+    case DS4_TENSOR_IQ2_XXS:
+    case DS4_TENSOR_IQ2_XS:
+    case DS4_TENSOR_IQ2_S:
+    case DS4_TENSOR_IQ3_XXS:
+    case DS4_TENSOR_IQ3_S:
+    case DS4_TENSOR_IQ4_XS:
+    case DS4_TENSOR_IQ1_M:
+        return ds4_gpu_matmul_quant_tensor(out, m->map, m->size,
+            weight->abs_offset, weight->type, weight->dim[0],
+            weight->dim[1], x, 1);
+    default:
+        return 0;
+    }
+}
+
+static int qwen38_gpu_debug_prefix(const ds4_gpu_tensor *t, uint32_t count,
+                                   const char *prefix) {
+    float values[16];
+    if (count > 16 || !ds4_gpu_tensor_read(t, 0, values, count * sizeof(float))) return 0;
+    for (uint32_t i = 0; i < count; i++) fprintf(stderr, "%s%u %.6f\n", prefix, i, values[i]);
+    return 1;
+}
+
+static int qwen38_gpu_forward_token(ds4_qwen38_gpu_state *st,
+                                    const ds4_model *m,
+                                    const ds4_qwen38_weights *w,
+                                    int token, uint32_t pos,
+                                    float *logits) {
+#define QWEN38_GPU_CHECK(expr, label) \
+    do { if (!(expr)) { fprintf(stderr, "ds4: Qwen CUDA %s failed\n", label); return 0; } } while (0)
+    if (token < 0 || (uint32_t)token >= DS4_N_VOCAB || pos >= st->ctx_size) return 0;
+    QWEN38_GPU_CHECK(w->token_embd->type == DS4_TENSOR_IQ2_S,
+                     "token embedding type");
+    QWEN38_GPU_CHECK(ds4_gpu_embed_token_quant_tensor(
+        st->hidden, m->map, m->size, w->token_embd->abs_offset,
+        w->token_embd->type, DS4_N_VOCAB, (uint32_t)token,
+        QWEN38_N_EMBD), "token embedding");
+    if (getenv("DS4_EMBD_DUMP"))
+        QWEN38_GPU_CHECK(qwen38_gpu_debug_prefix(st->hidden, 16, "E"), "embedding dump");
+
+    static long hidden_layer = -2;
+    static bool hidden_layer_init = false;
+    static long hidden_tok = -2;
+    static bool hidden_tok_init = false;
+    if (!hidden_layer_init) {
+        hidden_layer_init = true;
+        const char *env = getenv("DS4_HIDDEN_LAYER");
+        hidden_layer = env ? atol(env) : -1;
+    }
+    if (!hidden_tok_init) {
+        hidden_tok_init = true;
+        const char *env = getenv("DS4_HIDDEN_TOK");
+        hidden_tok = env ? atol(env) : -1;
+    }
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_qwen38_layer_weights *l = &w->layer[il];
+        if ((long)il == hidden_layer && ((long)pos == hidden_tok || hidden_tok < 0))
+            QWEN38_GPU_CHECK(qwen38_gpu_debug_prefix(st->hidden, 8, "H"), "hidden dump");
+        QWEN38_GPU_CHECK(ds4_gpu_rms_norm_weight_tensor(
+            st->xnorm, st->hidden, m->map, m->size,
+            l->attn_norm->abs_offset, QWEN38_N_EMBD, 1.0e-6f), "attention norm");
+        if (((il + 1u) % 4u) != 0u) {
+            const uint32_t gdn = il - il / 4u;
+            QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->qkv, m, l->attn_qkv, st->xnorm), "GDN QKV");
+            QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->z, m, l->attn_gate, st->xnorm), "GDN gate");
+            QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->beta, m, l->ssm_beta, st->xnorm), "GDN beta");
+            QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->alpha, m, l->ssm_alpha, st->xnorm), "GDN alpha");
+            QWEN38_GPU_CHECK(ds4_gpu_qwen38_gdn_decode(
+                st->o, st->conv_layer[gdn], st->ssm_layer[gdn],
+                st->qkv, st->z, st->alpha, st->beta,
+                m->map, m->size, l->ssm_conv1d->abs_offset,
+                l->ssm_a->abs_offset, l->ssm_dt->abs_offset,
+                l->ssm_norm->abs_offset), "GDN recurrence");
+            QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->proj, m, l->ssm_out, st->o), "GDN output");
+        } else {
+            const uint32_t ga = il / 4u;
+            QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->q_full, m, l->attn_q, st->xnorm), "GA Q");
+            QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->k, m, l->attn_k, st->xnorm), "GA K");
+            QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->v, m, l->attn_v, st->xnorm), "GA V");
+            QWEN38_GPU_CHECK(ds4_gpu_qwen38_ga_prepare(
+                st->q_full, st->attn_k_layer[ga], st->attn_v_layer[ga],
+                st->k, st->v, m->map, m->size,
+                l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
+                pos, st->ctx_size), "GA prepare");
+            QWEN38_GPU_CHECK(ds4_gpu_qwen38_ga_decode(
+                st->attn, st->q_full, st->attn_k_layer[ga],
+                st->attn_v_layer[ga], pos, st->ctx_size), "GA attention");
+            QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->proj, m, l->attn_output, st->attn), "GA output");
+        }
+        QWEN38_GPU_CHECK(ds4_gpu_add_tensor(st->hidden, st->hidden,
+                                             st->proj, QWEN38_N_EMBD), "attention residual");
+        QWEN38_GPU_CHECK(ds4_gpu_rms_norm_weight_tensor(
+            st->xnorm, st->hidden, m->map, m->size,
+            l->attn_post_norm->abs_offset, QWEN38_N_EMBD, 1.0e-6f), "FFN norm");
+        QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->ffn_g, m, l->ffn_gate, st->xnorm), "FFN gate");
+        QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->ffn_u, m, l->ffn_up, st->xnorm), "FFN up");
+        QWEN38_GPU_CHECK(ds4_gpu_swiglu_tensor(st->ffn_m, st->ffn_g,
+                                               st->ffn_u, QWEN38_N_FF, 0.0f, 1.0f), "SwiGLU");
+        QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->proj, m, l->ffn_down, st->ffn_m), "FFN down");
+        QWEN38_GPU_CHECK(ds4_gpu_add_tensor(st->hidden, st->hidden,
+                                             st->proj, QWEN38_N_EMBD), "FFN residual");
+    }
+    QWEN38_GPU_CHECK(ds4_gpu_rms_norm_weight_tensor(
+        st->xnorm, st->hidden, m->map, m->size,
+        w->output_norm->abs_offset, QWEN38_N_EMBD, 1.0e-6f), "output norm");
+    if (hidden_layer == 64 && ((long)pos == hidden_tok || hidden_tok < 0))
+        QWEN38_GPU_CHECK(qwen38_gpu_debug_prefix(st->xnorm, 8, "H"), "final hidden dump");
+    QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->logits, m, w->output, st->xnorm), "output projection");
+    QWEN38_GPU_CHECK(ds4_gpu_tensor_read(st->logits, 0, logits,
+                                         (uint64_t)DS4_N_VOCAB * sizeof(float)), "logit read");
+#undef QWEN38_GPU_CHECK
+    return 1;
+}
+#endif
 
 static void weights_bind(
         ds4_weights     *w,
@@ -39431,8 +39702,8 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         int         ctx_size,
         uint32_t    prefill_chunk,
         bool        ssd_streaming) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN38 && backend == DS4_BACKEND_CPU)
-        return qwen38_cpu_memory_estimate(ctx_size);
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN38)
+        return qwen38_memory_estimate(ctx_size, backend == DS4_BACKEND_CUDA);
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
 
@@ -55748,6 +56019,8 @@ struct ds4_session {
 #ifndef DS4_NO_GPU
     ds4_gpu_graph graph;
     ds4_glm_gpu_graph glm_graph;
+    ds4_qwen38_gpu_state qwen38_gpu_state;
+    bool qwen38_gpu_ready;
     bool glm_graph_ready;
     uint32_t glm_dense_cache_len;
     /* GLM MTP speculative state.  parent is the token that conditioned the
@@ -64828,21 +65101,39 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (load_slice || opt->distributed.role != DS4_DISTRIBUTED_NONE ||
             opt->tp.role != DS4_TP_NONE || opt->mtp_path || opt->glm_mtp ||
             opt->dspark || opt->directional_steering_file) {
-            fprintf(stderr, "ds4: Qwen3.8 CPU reference does not support layer slicing, "
+            fprintf(stderr, "ds4: Qwen3.8 does not support layer slicing, "
                             "distributed/TP, MTP or steering yet\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
-        if (e->backend != DS4_BACKEND_CPU) {
+        if (e->backend != DS4_BACKEND_CPU && e->backend != DS4_BACKEND_CUDA) {
             fprintf(stderr,
-                    "ds4: Qwen3.8 currently supports the CPU reference only; "
-                    "pass --cpu\n");
+                    "ds4: Qwen3.8 graph inference currently requires CUDA; "
+                    "pass --cpu for the reference path\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
         vocab_load(&e->vocab, &e->model);
+#ifndef DS4_NO_GPU
+        if (e->backend == DS4_BACKEND_CUDA) {
+            e->metal_ready = ds4_gpu_init() != 0;
+            if (!e->metal_ready ||
+                !ds4_gpu_set_model_map_range(e->model.map, e->model.size,
+                    e->model.tensor_data_pos,
+                    e->model.size - e->model.tensor_data_pos,
+                    e->model.max_tensor_bytes)) {
+                fprintf(stderr,
+                        "ds4: CUDA failed to initialize or map Qwen3.8 weights\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            ds4_gpu_set_quality(e->quality);
+            ds4_gpu_set_glm_model(0);
+        }
+#endif
         *out = e;
         return 0;
     } else if (!opt->inspect_only) {
@@ -66509,6 +66800,20 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     ds4_session *s = xcalloc(1, sizeof(*s));
     s->engine = e;
     s->ctx_size = ctx_size;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN38) {
+        if (e->backend != DS4_BACKEND_CUDA ||
+            !qwen38_gpu_state_init(&s->qwen38_gpu_state, (uint32_t)ctx_size)) {
+            fprintf(stderr, "ds4: failed to create Qwen3.8 CUDA session\n");
+            free(s);
+            return 1;
+        }
+        s->qwen38_gpu_ready = true;
+        s->prefill_cap = (uint32_t)ctx_size;
+        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
+        *out = s;
+        return 0;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         const uint32_t normal_layers = glm_graph_normal_layer_count();
         uint32_t layer_start = 0;
@@ -66849,7 +67154,9 @@ void ds4_session_free(ds4_session *s) {
     }
 #ifndef DS4_NO_GPU
     else {
-        if (ds4_session_is_glm(s)) {
+        if (ds4_session_is_qwen38(s)) {
+            qwen38_gpu_state_free(&s->qwen38_gpu_state);
+        } else if (ds4_session_is_glm(s)) {
             glm_graph_free(&s->glm_graph);
         } else {
             metal_graph_free(&s->graph);
@@ -68499,6 +68806,59 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     ds4_engine *e = s->engine;
     const char *backend_name = ds4_backend_name(e->backend);
     (void)backend_name; (void)e;
+    if (ds4_session_is_qwen38(s)) {
+        if (!s->qwen38_gpu_ready) {
+            snprintf(err, errlen, "Qwen CUDA graph is not initialized");
+            return 1;
+        }
+        const bool continued = s->checkpoint_valid &&
+            prompt->len >= s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint);
+        if (!continued) {
+            if (!qwen38_gpu_state_zero(&s->qwen38_gpu_state)) {
+                snprintf(err, errlen, "failed to clear Qwen CUDA recurrent state");
+                return 1;
+            }
+            s->checkpoint.len = 0;
+        }
+        const bool nll_dump = getenv("DS4_NLL_DUMP") != NULL;
+        double nll_sum = 0.0;
+        for (int i = s->checkpoint.len; i < prompt->len; i++) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                s->checkpoint_valid = true;
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            if (nll_dump && i > 0) {
+                float max_l = s->logits[0];
+                for (uint32_t v = 1; v < DS4_N_VOCAB; v++)
+                    if (s->logits[v] > max_l) max_l = s->logits[v];
+                double sum = 0.0;
+                for (uint32_t v = 0; v < DS4_N_VOCAB; v++)
+                    sum += exp((double)(s->logits[v] - max_l));
+                const double lp = (double)(s->logits[prompt->v[i]] - max_l) - log(sum);
+                nll_sum += -lp;
+                fprintf(stderr, "ds4: nll[%d] tok=%d lp=%.6f\n", i, prompt->v[i], lp);
+            }
+            if (!qwen38_gpu_forward_token(&s->qwen38_gpu_state, &e->model,
+                                           &e->qwen38_weights, prompt->v[i],
+                                           (uint32_t)i, s->logits)) {
+                snprintf(err, errlen, "Qwen CUDA forward failed at token %d", i);
+                s->checkpoint_valid = false;
+                return 1;
+            }
+            token_vec_push(&s->checkpoint, prompt->v[i]);
+            if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+        }
+        if (nll_dump && prompt->len > 1 && !continued) {
+            fprintf(stderr, "ds4: mean nll %.6f (%.2f ppl) over %d tokens\n",
+                    nll_sum / (prompt->len - 1),
+                    exp(nll_sum / (prompt->len - 1)), prompt->len - 1);
+        }
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        return 0;
+    }
     if (ds4_session_is_glm(s)) {
         /* Debug: truncate the prompt so the dumped prefill logits line up
          * with the CPU first-token reference (DS4_GLM_LOGIT_DUMP). */
@@ -70337,6 +70697,27 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     return 1;
 #else
     ds4_engine *e = s->engine;
+    if (ds4_session_is_qwen38(s)) {
+        if (!s->qwen38_gpu_ready ||
+            (uint32_t)s->checkpoint.len >= s->qwen38_gpu_state.ctx_size) {
+            if (errlen) snprintf(err, errlen, "Qwen3.8 CUDA context reached (%u)",
+                                 s->qwen38_gpu_state.ctx_size);
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        if (!qwen38_gpu_forward_token(&s->qwen38_gpu_state, &e->model,
+                                      &e->qwen38_weights, token,
+                                      (uint32_t)s->checkpoint.len, s->logits)) {
+            if (errlen) snprintf(err, errlen, "Qwen3.8 CUDA decode failed");
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, token);
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        (void)probe_mtp;
+        return 0;
+    }
     if (ds4_session_is_glm(s)) {
         if (!s->glm_graph_ready) {
             if (errlen) snprintf(err, errlen, "%s GLM graph is not initialized",
