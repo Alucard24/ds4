@@ -443,6 +443,174 @@ static void ds4_resize_rgb_bicubic(
     }
 }
 
+/* Qwen-VL preprocessing is defined in terms of Pillow bicubic resize. Adapted
+ * from llama.cpp's MIT-licensed resampler; keep the separable 22-bit
+ * fixed-point passes so photographs match before normalization. */
+typedef struct {
+    int *bounds;
+    int32_t *weights;
+    int kernel_size;
+} ds4_pillow_coefficients;
+
+static void ds4_pillow_coefficients_free(ds4_pillow_coefficients *coeff) {
+    if (!coeff) return;
+    free(coeff->bounds);
+    free(coeff->weights);
+    memset(coeff, 0, sizeof(*coeff));
+}
+
+static int ds4_pillow_bicubic_coefficients(
+        int input_size, int output_size, ds4_pillow_coefficients *out) {
+    const int precision_bits = 22;
+    const double scale = (double)input_size / output_size;
+    const double filter_scale = scale < 1.0 ? 1.0 : scale;
+    const double support = 2.0 * filter_scale;
+    const int kernel_size = (int)ceil(support) * 2 + 1;
+    if (!out || input_size <= 0 || output_size <= 0 ||
+        kernel_size <= 0 || (size_t)output_size > SIZE_MAX / 2u / sizeof(int) ||
+        (size_t)output_size > SIZE_MAX / (size_t)kernel_size /
+                                  sizeof(int32_t)) {
+        return 0;
+    }
+    memset(out, 0, sizeof(*out));
+    out->bounds = malloc((size_t)output_size * 2u * sizeof(int));
+    out->weights = malloc((size_t)output_size * kernel_size * sizeof(int32_t));
+    if (!out->bounds || !out->weights) {
+        ds4_pillow_coefficients_free(out);
+        return 0;
+    }
+    const double fixed_scale = ldexp(1.0, precision_bits);
+    for (int ox = 0; ox < output_size; ox++) {
+        const double center = ((double)ox + 0.5) * scale;
+        int first = (int)(center - support + 0.5);
+        if (first < 0) first = 0;
+        int end = (int)(center + support + 0.5);
+        if (end > input_size) end = input_size;
+        const int count = end - first;
+        const double distance_scale = 1.0 / filter_scale;
+        double total = 0.0;
+        for (int k = 0; k < count; k++) {
+            total += ds4_cubic(((double)(k + first) - center + 0.5) *
+                               distance_scale, -0.5);
+        }
+        for (int k = 0; k < kernel_size; k++) {
+            double weight = 0.0;
+            if (k < count && total != 0.0) {
+                weight = ds4_cubic(((double)(k + first) - center + 0.5) *
+                                   distance_scale, -0.5) / total;
+            }
+            const double rounded = weight * fixed_scale +
+                                   (weight < 0.0 ? -0.5 : 0.5);
+            out->weights[(size_t)ox * kernel_size + k] =
+                (int32_t)rounded;
+        }
+        out->bounds[2 * ox] = first;
+        out->bounds[2 * ox + 1] = count;
+    }
+    out->kernel_size = kernel_size;
+    return 1;
+}
+
+static uint8_t ds4_pillow_clip8(int value) {
+    if (value < 0) return 0;
+    if (value > 255) return 255;
+    return (uint8_t)value;
+}
+
+static int ds4_resize_rgb_bicubic_pillow(
+        const uint8_t *src,
+        uint32_t src_width,
+        uint32_t src_height,
+        float *dst,
+        uint32_t dst_width,
+        uint32_t dst_height,
+        uint32_t dst_stride) {
+    const int precision_bits = 22;
+    const int rounding = 1 << (precision_bits - 1);
+    ds4_pillow_coefficients horizontal = {0}, vertical = {0};
+    uint8_t *horizontal_pixels = NULL;
+    uint8_t *final_pixels = NULL;
+    int32_t *acc = NULL;
+    int ok = 0;
+    if (!src || !dst || !src_width || !src_height || !dst_width ||
+        !dst_height || dst_stride < dst_width) return 0;
+    const int resize_x = src_width != dst_width;
+    const int resize_y = src_height != dst_height;
+    if (resize_x && !ds4_pillow_bicubic_coefficients(
+            (int)src_width, (int)dst_width, &horizontal)) goto cleanup;
+    if (resize_y && !ds4_pillow_bicubic_coefficients(
+            (int)src_height, (int)dst_height, &vertical)) goto cleanup;
+    const size_t horizontal_count = (size_t)dst_width * src_height * 3u;
+    const size_t final_count = (size_t)dst_width * dst_height * 3u;
+    if (resize_x) {
+        horizontal_pixels = malloc(horizontal_count);
+        if (!horizontal_pixels) goto cleanup;
+        for (uint32_t y = 0; y < src_height; y++) {
+            const uint8_t *src_row = src + (size_t)y * src_width * 3u;
+            uint8_t *dst_row = horizontal_pixels + (size_t)y * dst_width * 3u;
+            for (uint32_t x = 0; x < dst_width; x++) {
+                const int first = horizontal.bounds[2u * x];
+                const int count = horizontal.bounds[2u * x + 1u];
+                const int32_t *weights = horizontal.weights +
+                    (size_t)x * horizontal.kernel_size;
+                int32_t sums[3] = {rounding, rounding, rounding};
+                for (int k = 0; k < count; k++) {
+                    const uint8_t *pixel = src_row + (size_t)(first + k) * 3u;
+                    sums[0] += pixel[0] * weights[k];
+                    sums[1] += pixel[1] * weights[k];
+                    sums[2] += pixel[2] * weights[k];
+                }
+                dst_row[3u * x] = ds4_pillow_clip8(sums[0] >> precision_bits);
+                dst_row[3u * x + 1u] = ds4_pillow_clip8(sums[1] >> precision_bits);
+                dst_row[3u * x + 2u] = ds4_pillow_clip8(sums[2] >> precision_bits);
+            }
+        }
+    }
+    const uint8_t *vertical_input = resize_x ? horizontal_pixels : src;
+    if (resize_y) {
+        final_pixels = malloc(final_count);
+        acc = malloc((size_t)dst_width * 3u * sizeof(int32_t));
+        if (!final_pixels || !acc) goto cleanup;
+        const size_t row_values = (size_t)dst_width * 3u;
+        for (uint32_t y = 0; y < dst_height; y++) {
+            const int first = vertical.bounds[2u * y];
+            const int count = vertical.bounds[2u * y + 1u];
+            const int32_t *weights = vertical.weights +
+                (size_t)y * vertical.kernel_size;
+            for (size_t i = 0; i < row_values; i++) acc[i] = rounding;
+            for (int k = 0; k < count; k++) {
+                const uint8_t *src_row = vertical_input +
+                    (size_t)(first + k) * row_values;
+                for (size_t i = 0; i < row_values; i++) {
+                    acc[i] += src_row[i] * weights[k];
+                }
+            }
+            uint8_t *dst_row = final_pixels + (size_t)y * row_values;
+            for (size_t i = 0; i < row_values; i++) {
+                dst_row[i] = ds4_pillow_clip8(acc[i] >> precision_bits);
+            }
+        }
+    }
+    const uint8_t *pixels = resize_y ? final_pixels : vertical_input;
+    for (uint32_t y = 0; y < dst_height; y++) {
+        for (uint32_t x = 0; x < dst_width; x++) {
+            const uint8_t *input = pixels + ((size_t)y * dst_width + x) * 3u;
+            float *output = dst + ((size_t)y * dst_stride + x) * 3u;
+            output[0] = input[0];
+            output[1] = input[1];
+            output[2] = input[2];
+        }
+    }
+    ok = 1;
+cleanup:
+    ds4_pillow_coefficients_free(&horizontal);
+    ds4_pillow_coefficients_free(&vertical);
+    free(horizontal_pixels);
+    free(final_pixels);
+    free(acc);
+    return ok;
+}
+
 int ds4_image_preprocess_glm53(
         ds4_image_patches *out,
         const ds4_image *image,
@@ -628,17 +796,47 @@ int ds4_image_preprocess_qwen3vl(
         return 0;
     }
     const size_t canvas_values = (size_t)target_height * target_width * 3u;
-    float *canvas = malloc(canvas_values * sizeof(float));
+    float *canvas = calloc(canvas_values, sizeof(float));
     if (!canvas) {
         ds4_image_error(error, error_cap, "unable to allocate resized Qwen3-VL image");
         return 0;
     }
-    if (target_width == image->width && target_height == image->height) {
-        for (size_t i = 0; i < canvas_values; i++) canvas[i] = image->rgb[i];
-    } else {
-        ds4_resize_rgb_bicubic(image->rgb, image->width, image->height,
-                               canvas, target_width, target_height, target_width);
+    const float scale_w = (float)target_width / image->width;
+    const float scale_h = (float)target_height / image->height;
+    const float scale = fminf(scale_w, scale_h);
+    uint32_t content_width = (uint32_t)ceilf(image->width * scale);
+    uint32_t content_height = (uint32_t)ceilf(image->height * scale);
+    if (content_width > target_width) content_width = target_width;
+    if (content_height > target_height) content_height = target_height;
+    const uint32_t offset_x = (target_width - content_width) / 2u;
+    const uint32_t offset_y = (target_height - content_height) / 2u;
+    float *resized = malloc((size_t)content_width * content_height * 3u *
+                            sizeof(float));
+    if (!resized) {
+        free(canvas);
+        ds4_image_error(error, error_cap,
+                        "unable to allocate resized Qwen3-VL image");
+        return 0;
     }
+    if (content_width == image->width && content_height == image->height) {
+        for (size_t i = 0; i < (size_t)content_width * content_height * 3u; i++) {
+            resized[i] = image->rgb[i];
+        }
+    } else if (!ds4_resize_rgb_bicubic_pillow(
+            image->rgb, image->width, image->height,
+            resized, content_width, content_height, content_width)) {
+        free(resized);
+        free(canvas);
+        ds4_image_error(error, error_cap,
+                        "unable to resize Qwen3-VL image");
+        return 0;
+    }
+    for (uint32_t y = 0; y < content_height; y++) {
+        memcpy(canvas + ((size_t)(offset_y + y) * target_width + offset_x) * 3u,
+               resized + (size_t)y * content_width * 3u,
+               (size_t)content_width * 3u * sizeof(float));
+    }
+    free(resized);
     for (size_t i = 0; i < canvas_values; i++) {
         canvas[i] = canvas[i] * (2.0f / 255.0f) - 1.0f;
     }

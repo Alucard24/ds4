@@ -82,8 +82,9 @@ int ds4_image_preprocess_glm53(
         char              *error,
         size_t             error_cap);
 
-/* Qwen3-VL dynamic-resolution preprocessing. Patches are normalized RGB
- * 16x16 rows in 2x2 merge-tile order, matching the qwen3vl merger GGUF. */
+/* Qwen3-VL dynamic-resolution preprocessing. The image is aspect-preserved
+ * on a centered black canvas; normalized RGB 16x16 patches use 2x2
+ * merge-tile order, matching the qwen3vl merger GGUF. */
 int ds4_image_preprocess_qwen3vl(
         ds4_image_patches *out,
         const ds4_image   *image,

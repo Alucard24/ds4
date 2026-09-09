@@ -96,11 +96,13 @@ logit delta rather than claiming bit identity across batch shapes.
 The Qwen3-VL path loads the llama.cpp-compatible
 `mmproj-Qwen3.8-27B-BF16.gguf` sidecar without linking llama.cpp. It validates
 the fixed `qwen3vl_merger` shape (27 layers, width 1152, 16 heads, FFN 4304,
-2x2 spatial merge, no deepstack), performs bicubic dynamic-resolution
-preprocessing, and executes patch projection, resized learned position
-embeddings, bidirectional MRoPE attention, GELU FFNs, post norm, and the
-5120-wide merger on CUDA. The BF16 matrices remain packed in the auxiliary
-model mapping; FP32 biases, norms and activations preserve the GGUF graph.
+2x2 spatial merge, no deepstack), performs aspect-preserving dynamic-resolution
+preprocessing with Pillow-compatible bicubic filtering and centered black
+padding, and executes patch projection, resized learned position embeddings,
+bidirectional MRoPE attention, GELU FFNs, post norm, and the 5120-wide merger
+on CUDA. The F32 patch matrices use the graph's FP16 im2col/GEMM boundary;
+BF16 transformer matrices remain packed in the auxiliary model mapping, while
+FP32 biases, norms and activations preserve the GGUF graph.
 Language-model prefill replaces `<|image_pad|>` rows with the projected vectors
 and uses Qwen's compressed 2D MRoPE positions while retaining raw token indices
 for the causal KV cache.
@@ -133,14 +135,31 @@ tests pass through `/v1/chat/completions`, `/v1/responses`, and Anthropic
 (75 cached tokens in the checked 224x224 case). Server parser/rendering unit
 tests are included in `./ds4_test --server`.
 
-Against llama.cpp's `llama-mtmd-debug`, a synthetic 224x224 white image yields
-49 vectors. llama.cpp reports sum `110.311356` and first values
-`0.5204, -0.1312, -0.6193`; ds4 reports `106.937073` and
-`0.517695, -0.130709, -0.619747`. At 256x256, llama.cpp reports sum
-`78.989944` and ds4 `71.992472`; first-row values remain within about 0.008.
-The remaining aggregate difference has not been isolated; full embedding parity
-is therefore not claimed and the sum is not used as an exact-bit gate. End-to-end greedy smoke tests identify a blank white image
-and describe the 512x507 Earth fixture as Earth with Africa and Madagascar.
+The parity investigation found two concrete front-end differences. llama.cpp's
+patch convolution emits FP16 im2col/GEMM results even though the two sidecar
+weights are stored as F32, and its Qwen preprocessor preserves aspect ratio with
+`PAD_CEIL` black bars instead of stretching to the aligned canvas. ds4 now
+matches those rules, including Pillow's separable 22-bit fixed-point bicubic
+resize, learned-position interpolation operation order, vision RoPE frequency
+construction, and CUDA layer-norm reduction. For both a 224x224 white fixture
+and a 512x507 Earth PNG, the complete patch-plus-position tensor is bit-exact
+against llama.cpp; the white fixture also remains bit-exact through the first
+layer's QKV projection.
+
+The remaining difference starts in attention. ds4 uses bounded FP32 online
+softmax, while normal llama.cpp MTMD enables lower-precision FlashAttention.
+With FlashAttention disabled, the 224x224 white embedding has mean absolute
+error `0.001429` and relative L2 error `0.00531` (ds4 sum `108.206112`,
+llama.cpp sum `108.482502`). Normal llama.cpp reports sum `110.311216`; its own
+FlashAttention-versus-non-Flash result differs by mean absolute error `0.003031`
+and relative L2 error `0.01215`. On the padded 512x507 Earth PNG, ds4 versus
+non-Flash llama.cpp has mean absolute error `0.001789` and relative L2 error
+`0.00488`. Nonlinear BF16 boundaries amplify the small attention difference
+through later layers, so full embedding parity is still not claimed and raw
+sums are not exact-bit gates. Use lossless PNG fixtures for numerical checks:
+ds4's Iris JPEG decoder and llama.cpp's image decoder need not produce identical
+source pixels. End-to-end greedy smoke tests identify a blank white image and
+describe the Earth fixture as Earth with Africa and Madagascar.
 
 Dynamic preprocessing uses llama.cpp's normal 8..4096 merged-token limits.
 The current vision attention kernel is bounded in memory but intentionally
