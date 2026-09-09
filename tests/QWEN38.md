@@ -1,8 +1,9 @@
 # Qwen3.8 CPU reference checks (Linux)
 
-This is a text-only reference path, not the requested CUDA + vision MVP.
-CUDA Qwen inference, vision, full chat/tool template parity and recurrent disk
-cache serialization are not implemented yet. Unsupported cache operations fail
+This documents the text reference and initial CUDA quant-kernel checks, not the
+requested CUDA + vision MVP. End-to-end CUDA Qwen inference, vision, full
+chat/tool template parity and recurrent disk cache serialization are not
+implemented yet. Unsupported cache operations fail
 explicitly; they must not save a DeepSeek-shaped payload.
 
 ## No-model kernel tests
@@ -37,6 +38,24 @@ The external-library sanitizer run has reported 104 bytes leaked during
 library/loader initialization after `dlclose`; standalone kernel and engine
 session sanitizer runs without that library are clean. Do not report the
 external-library run as sanitizer-clean.
+
+## CUDA mixed-IQ MMVQ
+
+The explicit CUDA target checks all nine packed formats used by the language
+GGUF at K=5120. Constant activations give a near-exact format/layout oracle;
+varied activations include expected Q8_1 activation-quantization error. IQ2_S
+also checks the exact get-row path needed by the token embedding.
+
+```sh
+make clean
+make tests/test_qwen38_cuda CUDA_ARCH=sm_120
+make test-qwen38-cuda CUDA_ARCH=sm_120 \
+  DS4_TEST_GGML_CPU="$L/build/bin/libggml-cpu.so"
+```
+
+The external ggml CPU library supplies only independent host dequantization.
+Weights and activations are copied to the RTX GPU; ds4's vendored MIT MMVQ runs
+the matvec. This does not validate the not-yet-integrated Qwen CUDA graph.
 
 ## Real-model session and continuation checks
 

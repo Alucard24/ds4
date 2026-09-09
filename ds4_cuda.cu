@@ -18591,7 +18591,7 @@ extern "C" int ds4_gpu_attention_visual_mixed_batch_heads_tensor(
     if (!cuda_ok(cudaGetLastError(), "visual attention KV pack launch"))
         return 0;
 
-    const float alpha = rsqrtf((float)head_dim);
+    const float alpha = ds4_cuda_rsqrtf((float)head_dim);
     const float beta = 0.0f;
     cublasStatus_t status = cublasSgemmStridedBatched(
             cuda_cublas_for_tier(logical_tier), CUBLAS_OP_T, CUBLAS_OP_N,
@@ -26973,12 +26973,13 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
         token >= n_vocab) {
         return 0;
     }
-    if (weight_type != 8u) {   /* DS4_TENSOR_Q8_0 */
+    if (weight_type != 8u && weight_type != 22u) { /* Q8_0 or IQ2_S */
         fprintf(stderr, "ds4: embed_token_quant: unsupported type %u\n",
                 weight_type);
         return 0;
     }
-    const uint64_t row_bytes = ((uint64_t)n_embd / 32u) * 34u;
+    const uint64_t row_bytes = weight_type == 8u ?
+        ((uint64_t)n_embd / 32u) * 34u : ((uint64_t)n_embd / 256u) * 82u;
     if (weight_offset > model_size ||
         (uint64_t)n_vocab * row_bytes > model_size - weight_offset ||
         out->bytes < (uint64_t)n_embd * sizeof(float)) {
@@ -26989,6 +26990,10 @@ extern "C" int ds4_gpu_embed_token_quant_tensor(
             model_map, weight_offset, (uint64_t)n_vocab * row_bytes,
             logical_tier, "glm_token_embd");
     if (!w) return 0;
+    if (weight_type == 22u) {
+        return ds4_mmq_iq2_s_get_row(w, (float *)out->ptr, token, n_embd,
+                                      cuda_decode_stream()) == 0;
+    }
     glm_embed_token_q8_0_kernel<<<(n_embd + 255) / 256, 256>>>(
             (float *)out->ptr, w, token, n_embd);
     return cuda_ok(cudaGetLastError(), "glm embed token launch");
@@ -27320,8 +27325,8 @@ __global__ static void glm53_kda_decode_kernel(
     float k_total = lane < 4u ? reduce_k[lane] : 0.0f;
     q_total = __shfl_sync(0xffffffffu, warp_sum_f32(q_total), 0);
     k_total = __shfl_sync(0xffffffffu, warp_sum_f32(k_total), 0);
-    sq[tid] *= rsqrtf(q_total + 1.0e-6f) * 0.08838834764831845f;
-    sk[tid] *= rsqrtf(k_total + 1.0e-6f);
+    sq[tid] *= ds4_cuda_rsqrtf(q_total + 1.0e-6f) * 0.08838834764831845f;
+    sk[tid] *= ds4_cuda_rsqrtf(k_total + 1.0e-6f);
     __syncthreads();
 
     const uint32_t k0 = lane * 4u;
@@ -27360,7 +27365,7 @@ __global__ static void glm53_kda_decode_kernel(
     float o_total = lane < 4u ? reduce_o[lane] : 0.0f;
     o_total = __shfl_sync(0xffffffffu, warp_sum_f32(o_total), 0);
     const float o_scale =
-        rsqrtf(o_total / (float)GLM53_CUDA_KDA_DIM + norm_eps);
+        ds4_cuda_rsqrtf(o_total / (float)GLM53_CUDA_KDA_DIM + norm_eps);
     const float out_gate = glm53_cuda_sigmoid(output_gate[input_base + tid]);
     out[input_base + tid] =
         so[tid] * o_scale * output_norm[tid] * out_gate;
@@ -27443,9 +27448,9 @@ __global__ static void glm53_kda_prefill_prepare_kernel(
         k_total = lane < 4u ? reduce_k[lane] : 0.0f;
         q_total = __shfl_sync(0xffffffffu, warp_sum_f32(q_total), 0);
         k_total = __shfl_sync(0xffffffffu, warp_sum_f32(k_total), 0);
-        q[index] = sq[tid] * rsqrtf(q_total + 1.0e-6f) *
+        q[index] = sq[tid] * ds4_cuda_rsqrtf(q_total + 1.0e-6f) *
                    0.08838834764831845f;
-        k[index] = sk[tid] * rsqrtf(k_total + 1.0e-6f);
+        k[index] = sk[tid] * ds4_cuda_rsqrtf(k_total + 1.0e-6f);
         __syncthreads();
     }
 }
@@ -27541,9 +27546,9 @@ __global__ static void glm53_kda_prefill_prepare_parallel_kernel(
     k_total = lane < 4u ? reduce_k[lane] : 0.0f;
     q_total = __shfl_sync(0xffffffffu, warp_sum_f32(q_total), 0);
     k_total = __shfl_sync(0xffffffffu, warp_sum_f32(k_total), 0);
-    q[index] = sq[tid] * rsqrtf(q_total + 1.0e-6f) *
+    q[index] = sq[tid] * ds4_cuda_rsqrtf(q_total + 1.0e-6f) *
                0.08838834764831845f;
-    k[index] = sk[tid] * rsqrtf(k_total + 1.0e-6f);
+    k[index] = sk[tid] * ds4_cuda_rsqrtf(k_total + 1.0e-6f);
 }
 
 __global__ static void glm53_kda_prefill_update_conv_state_kernel(
@@ -27643,7 +27648,7 @@ __global__ static void glm53_kda_prefill_output_kernel(
     total = lane < 4u ? partial[lane] : 0.0f;
     total = __shfl_sync(0xffffffffu, warp_sum_f32(total), 0);
     const float scale =
-        rsqrtf(total / (float)GLM53_CUDA_KDA_DIM + norm_eps);
+        ds4_cuda_rsqrtf(total / (float)GLM53_CUDA_KDA_DIM + norm_eps);
     out[index] = raw * scale * output_norm[tid] *
         glm53_cuda_sigmoid(output_gate[index]);
 }
@@ -27913,7 +27918,7 @@ __global__ static void glm_attention_full_reference_kernel(
     const float *qh = q +
         ((uint64_t)token * n_head + head) * qk_dim;
     const uint32_t visible = min(cache_len, pos0 + token + 1u);
-    const float scale = rsqrtf((float)qk_dim);
+    const float scale = ds4_cuda_rsqrtf((float)qk_dim);
     float max_score = -FLT_MAX;
     float sum_weight = 0.0f;
     float output = 0.0f;
@@ -29373,7 +29378,7 @@ __global__ static void glm53_indexer_pool_update_kernel(
             ss = fmaf(delta, delta, ss);
         }
         mean[r] = m;
-        inv[r] = rsqrtf(ss / (float)head_dim + eps);
+        inv[r] = ds4_cuda_rsqrtf(ss / (float)head_dim + eps);
     }
     __syncthreads();
 
@@ -32380,6 +32385,12 @@ static int cuda_matmul_mmq_dense_quant(
     case 10u: block_elems = 256u; block_bytes = 84u; label = "Q2_K"; break;
     case 12u: block_elems = 256u; block_bytes = 144u; label = "Q4_K"; break;
     case 16u: block_elems = 256u; block_bytes = 66u; label = "IQ2_XXS"; break;
+    case 17u: block_elems = 256u; block_bytes = 74u; label = "IQ2_XS"; break;
+    case 18u: block_elems = 256u; block_bytes = 98u; label = "IQ3_XXS"; break;
+    case 21u: block_elems = 256u; block_bytes = 110u; label = "IQ3_S"; break;
+    case 22u: block_elems = 256u; block_bytes = 82u; label = "IQ2_S"; break;
+    case 23u: block_elems = 256u; block_bytes = 136u; label = "IQ4_XS"; break;
+    case 29u: block_elems = 256u; block_bytes = 56u; label = "IQ1_M"; break;
     case 39u: block_elems = 32u; block_bytes = 17u; label = "MXFP4"; break;
     default: return 0;
     }
@@ -32409,6 +32420,23 @@ static int cuda_matmul_mmq_dense_quant(
         model_map, weight_offset, weight_bytes, tier, label);
     if (!weights) return 0;
     int rc = -1;
+    if (weight_type == 17u || weight_type == 18u || weight_type == 21u ||
+        weight_type == 22u || weight_type == 23u || weight_type == 29u) {
+        if (n_tok > 8u) {
+            fprintf(stderr,
+                    "ds4: CUDA dense %s currently supports at most 8 rows\n",
+                    label);
+            return 0;
+        }
+        rc = ds4_mmq_quant_dense_vec(weights, weight_type,
+            (const float *)x->ptr, (float *)out->ptr,
+            (int)out_dim, (int)n_tok, (int)in_dim, cuda_decode_stream());
+        if (rc != 0) {
+            fprintf(stderr, "ds4: CUDA dense %s MMVQ failed (%d)\n", label, rc);
+            return 0;
+        }
+        return 1;
+    }
     switch (weight_type) {
     case 10u:
         rc = ds4_mmq_q2_K_dense(weights, (const float *)x->ptr,
@@ -32460,6 +32488,12 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
     case 10u:  /* Q2_K */
     case 12u:  /* Q4_K */
     case 16u:  /* IQ2_XXS */
+    case 17u:  /* IQ2_XS */
+    case 18u:  /* IQ3_XXS */
+    case 21u:  /* IQ3_S */
+    case 22u:  /* IQ2_S */
+    case 23u:  /* IQ4_XS */
+    case 29u:  /* IQ1_M */
     case 39u:  /* MXFP4 */
         return cuda_matmul_mmq_dense_quant(
             out, model_map, model_size, weight_offset, weight_type,

@@ -159,6 +159,25 @@ int ds4_mmq_q4_K_dense(
     int           K,
     cudaStream_t  stream);
 
+// Generic MMVQ entry for a small batch. Supports all GGML quant types used by
+// the Qwen3.8 mixed-IQ GGUF (type ids retain their canonical GGML values).
+int ds4_mmq_quant_dense_vec(
+    const void  * W,
+    uint32_t      weight_type,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
+int ds4_mmq_iq2_s_get_row(
+    const void  * W_iq2_s,
+    float       * out_f32,
+    uint32_t      row,
+    uint32_t      row_width,
+    cudaStream_t  stream);
+
 int ds4_mmq_mxfp4_dense(
     const void  * W_mxfp4,
     const float * X_f32,

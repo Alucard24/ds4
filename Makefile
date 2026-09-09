@@ -318,6 +318,18 @@ tests/test_mxfp4_cuda: tests/test_mxfp4_cuda.cu $(MMQ_OBJS)
 
 test-mxfp4-cuda: tests/test_mxfp4_cuda
 	./tests/test_mxfp4_cuda
+
+tests/test_qwen38_cuda: tests/test_qwen38_cuda.cu cuda/mmq/ds4_ggml_stubs.o \
+	cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/quantize.o \
+	cuda/mmq/mmid.o cuda/mmq/mmvq.o
+	$(NVCC) $(NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -o $@ $^ $(CUDA_LDLIBS) -ldl
+
+.PHONY: test-qwen38-cuda
+test-qwen38-cuda: tests/test_qwen38_cuda
+	@if [ ! -f "$(DS4_TEST_GGML_CPU)" ]; then \
+		echo "error: set DS4_TEST_GGML_CPU=/path/to/libggml-cpu.so"; exit 2; \
+	fi
+	./tests/test_qwen38_cuda "$(DS4_TEST_GGML_CPU)"
 endif
 
 ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_linux_memory.h

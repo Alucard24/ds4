@@ -4925,6 +4925,64 @@ extern "C" int ds4_mmq_q4_K_moe_pair_raw_vec(
         M, K, n_tokens, n_experts, n_expert_used, stream);
 }
 
+__global__ static void ds4_mmq_iq2_s_get_row_kernel(
+        const block_iq2_s *weights, float *out,
+        uint32_t row, uint32_t row_width) {
+    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= row_width) return;
+    const block_iq2_s *b = weights + (uint64_t)row * (row_width / QK_K) + d / QK_K;
+    const uint32_t q = d & (QK_K - 1);
+    const uint32_t group = q >> 5;
+    const uint32_t lane8 = (q >> 3) & 3u;
+    const uint32_t j = q & 7u;
+    const uint32_t grid_index = b->qs[4u * group + lane8] |
+        (((uint32_t)b->qh[group] << (8u - 2u * lane8)) & 0x300u);
+    const uint64_t grid = iq2s_grid[grid_index];
+    const uint8_t signs = b->qs[QK_K / 8 + 4u * group + lane8];
+    const uint8_t packed_scale = b->scales[group];
+    const uint32_t scale4 = lane8 < 2u ? packed_scale & 15u : packed_scale >> 4;
+    const float scale = __half2float(b->d) * (0.5f + (float)scale4) * 0.25f;
+    const float value = (float)((grid >> (8u * j)) & 0xffu);
+    out[d] = (signs & (1u << j) ? -scale : scale) * value;
+}
+
+extern "C" int ds4_mmq_iq2_s_get_row(
+        const void *W, float *out, uint32_t row, uint32_t row_width,
+        cudaStream_t stream) {
+    if (!W || !out || row_width == 0u || row_width % QK_K != 0u) return -1;
+    ds4_mmq_iq2_s_get_row_kernel<<<(row_width + 255u) / 256u, 256u, 0, stream>>>(
+        (const block_iq2_s *)W, out, row, row_width);
+    const cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4_mmq_iq2_s_get_row: launch failed: %s\n",
+                cudaGetErrorString(err));
+        return -2;
+    }
+    return 0;
+}
+
+extern "C" int ds4_mmq_quant_dense_vec(
+        const void *W, uint32_t weight_type, const float *X, float *out,
+        int M, int N, int K, cudaStream_t stream) {
+#define DS4_MMQ_VEC_CASE(type, name) \
+    case type: return ds4_mmq_dense_vec_impl<type>(name, W, X, out, M, N, K, stream)
+    switch ((ggml_type)weight_type) {
+        DS4_MMQ_VEC_CASE(GGML_TYPE_Q2_K,    "ds4_mmq_q2_K_dense_vec");
+        DS4_MMQ_VEC_CASE(GGML_TYPE_Q4_K,    "ds4_mmq_q4_K_dense_vec");
+        DS4_MMQ_VEC_CASE(GGML_TYPE_IQ2_XXS, "ds4_mmq_iq2_xxs_dense_vec");
+        DS4_MMQ_VEC_CASE(GGML_TYPE_IQ2_XS,  "ds4_mmq_iq2_xs_dense_vec");
+        DS4_MMQ_VEC_CASE(GGML_TYPE_IQ2_S,   "ds4_mmq_iq2_s_dense_vec");
+        DS4_MMQ_VEC_CASE(GGML_TYPE_IQ3_XXS, "ds4_mmq_iq3_xxs_dense_vec");
+        DS4_MMQ_VEC_CASE(GGML_TYPE_IQ3_S,   "ds4_mmq_iq3_s_dense_vec");
+        DS4_MMQ_VEC_CASE(GGML_TYPE_IQ4_XS,  "ds4_mmq_iq4_xs_dense_vec");
+        DS4_MMQ_VEC_CASE(GGML_TYPE_IQ1_M,   "ds4_mmq_iq1_m_dense_vec");
+        default:
+            fprintf(stderr, "ds4_mmq_quant_dense_vec: unsupported type %u\n", weight_type);
+            return -1;
+    }
+#undef DS4_MMQ_VEC_CASE
+}
+
 extern "C" int ds4_mmq_q8_0_dense_vec(
         const void * W, const float * X, float * out,
         int M, int N, int K, cudaStream_t stream) {
