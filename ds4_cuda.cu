@@ -27337,7 +27337,8 @@ __global__ static void qwen38_gdn_decode_kernel(
 }
 
 __global__ static void qwen38_ga_q_prepare_kernel(
-        float *q_full, const float *norm, uint32_t start_pos) {
+        float *q_full, const float *norm, const uint32_t *rope_positions,
+        uint32_t start_pos) {
     const uint32_t head = blockIdx.x;
     const uint32_t token = blockIdx.y;
     const uint32_t tid = threadIdx.x;
@@ -27355,8 +27356,11 @@ __global__ static void qwen38_ga_q_prepare_kernel(
         part[0] / QWEN38_CUDA_GA_HEAD_DIM + 1.0e-6f) * norm[tid];
     __syncthreads();
     if (tid < 32u) {
+        const uint32_t section = tid < 11u ? 0u : tid < 22u ? 1u : 2u;
+        const uint32_t rope_pos = rope_positions ?
+            rope_positions[token * 3u + section] : start_pos + token;
         const float inv = powf(1.0e7f, -(float)(2u * tid) / 64.0f);
-        const float angle = (float)(start_pos + token) * inv;
+        const float angle = (float)rope_pos * inv;
         const float c = cosf(angle), s = sinf(angle);
         const float a0 = q[tid], a1 = q[tid + 32u];
         q[tid] = a0 * c - a1 * s;
@@ -27366,7 +27370,8 @@ __global__ static void qwen38_ga_q_prepare_kernel(
 
 __global__ static void qwen38_ga_kv_prepare_kernel(
         float *k, const float *v, __half *k_cache, __half *v_cache,
-        const float *norm, uint32_t start_pos, uint32_t ctx_size) {
+        const float *norm, const uint32_t *rope_positions,
+        uint32_t start_pos, uint32_t ctx_size) {
     const uint32_t head = blockIdx.x;
     const uint32_t token = blockIdx.y;
     const uint32_t tid = threadIdx.x;
@@ -27386,8 +27391,11 @@ __global__ static void qwen38_ga_kv_prepare_kernel(
         part[0] / QWEN38_CUDA_GA_HEAD_DIM + 1.0e-6f) * norm[tid];
     __syncthreads();
     if (tid < 32u) {
+        const uint32_t section = tid < 11u ? 0u : tid < 22u ? 1u : 2u;
+        const uint32_t rope_pos = rope_positions ?
+            rope_positions[token * 3u + section] : pos;
         const float inv = powf(1.0e7f, -(float)(2u * tid) / 64.0f);
-        const float angle = (float)pos * inv;
+        const float angle = (float)rope_pos * inv;
         const float c = cosf(angle), s = sinf(angle);
         const float a0 = kh[tid], a1 = kh[tid + 32u];
         kh[tid] = a0 * c - a1 * s;
@@ -27507,13 +27515,15 @@ extern "C" int ds4_gpu_qwen38_ga_prepare_chunk(
         ds4_gpu_tensor *q_full, ds4_gpu_tensor *k_cache,
         ds4_gpu_tensor *v_cache, ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
         const void *model_map, uint64_t model_size, uint64_t q_norm_offset,
-        uint64_t k_norm_offset, uint32_t start_pos, uint32_t n_tokens,
-        uint32_t ctx_size) {
+        uint64_t k_norm_offset, const ds4_gpu_tensor *rope_positions,
+        uint32_t start_pos, uint32_t n_tokens, uint32_t ctx_size) {
     if (!q_full || !k_cache || !v_cache || !k || !v || n_tokens == 0u ||
         n_tokens > 128u || start_pos >= ctx_size || n_tokens > ctx_size-start_pos ||
         q_full->bytes < (uint64_t)n_tokens*12288*4 ||
         k->bytes < (uint64_t)n_tokens*1024*4 ||
         v->bytes < (uint64_t)n_tokens*1024*4 ||
+        (rope_positions && rope_positions->bytes <
+            (uint64_t)n_tokens * 3u * sizeof(uint32_t)) ||
         k_cache->bytes < (uint64_t)ctx_size*1024*2 ||
         v_cache->bytes < (uint64_t)ctx_size*1024*2) return 0;
     const int tier = ds4_tensor_device_idx(q_full);
@@ -27524,12 +27534,14 @@ extern "C" int ds4_gpu_qwen38_ga_prepare_chunk(
     if (!qn || !kn) return 0;
     const dim3 q_grid(24u, n_tokens, 1u);
     const dim3 kv_grid(4u, n_tokens, 1u);
+    const uint32_t *positions = rope_positions ?
+        (const uint32_t *)rope_positions->ptr : NULL;
     qwen38_ga_q_prepare_kernel<<<q_grid,256,0,cuda_decode_stream()>>>(
-        (float *)q_full->ptr, qn, start_pos);
+        (float *)q_full->ptr, qn, positions, start_pos);
     qwen38_ga_kv_prepare_kernel<<<kv_grid,256,0,cuda_decode_stream()>>>(
         (float *)k->ptr, (const float *)v->ptr,
         (__half *)k_cache->ptr, (__half *)v_cache->ptr,
-        kn, start_pos, ctx_size);
+        kn, positions, start_pos, ctx_size);
     return cuda_ok(cudaGetLastError(), "Qwen GA prepare chunk launch");
 }
 
@@ -27539,7 +27551,8 @@ extern "C" int ds4_gpu_qwen38_ga_prepare(
         const void *model_map, uint64_t model_size, uint64_t q_norm_offset,
         uint64_t k_norm_offset, uint32_t pos, uint32_t ctx_size) {
     return ds4_gpu_qwen38_ga_prepare_chunk(q_full, k_cache, v_cache, k, v,
-        model_map, model_size, q_norm_offset, k_norm_offset, pos, 1u, ctx_size);
+        model_map, model_size, q_norm_offset, k_norm_offset, NULL,
+        pos, 1u, ctx_size);
 }
 
 extern "C" int ds4_gpu_qwen38_ga_chunk(
@@ -33593,5 +33606,7 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
 #pragma GCC diagnostic pop
 
 #define DS4_GLM53_VISION_STREAM cuda_decode_stream()
+#define DS4_QWEN3VL_VISION_STREAM cuda_decode_stream()
 #include "ds4_glm53_vision_gpu.cuh"
 #include "ds4_deepseek4_vision_gpu.cuh"
+#include "ds4_qwen3vl_vision_gpu.cuh"

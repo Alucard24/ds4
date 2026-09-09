@@ -351,6 +351,34 @@ tests/test_qwen38_cuda_perf.o: tests/test_qwen38_cuda_perf.c ds4.h
 
 tests/test_qwen38_cuda_perf: tests/test_qwen38_cuda_perf.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+tests/test_qwen3vl_vision.o: tests/test_qwen3vl_vision.c ds4.h ds4_image.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
+
+tests/test_qwen3vl_vision: tests/test_qwen3vl_vision.o $(CORE_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+.PHONY: test-qwen3vl-vision
+test-qwen3vl-vision: tests/test_qwen3vl_vision
+	@if [ ! -f "$(DS4_TEST_QWEN38_MODEL)" ] || [ ! -f "$(DS4_TEST_QWEN38_MMPROJ)" ] || [ ! -f "$(DS4_TEST_QWEN38_IMAGE)" ]; then \
+		echo "error: set DS4_TEST_QWEN38_MODEL, DS4_TEST_QWEN38_MMPROJ, and DS4_TEST_QWEN38_IMAGE"; exit 2; \
+	fi
+	./tests/test_qwen3vl_vision "$(DS4_TEST_QWEN38_MODEL)" \
+		"$(DS4_TEST_QWEN38_MMPROJ)" "$(DS4_TEST_QWEN38_IMAGE)"
+
+tests/test_qwen3vl_session.o: tests/test_qwen3vl_session.c ds4.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
+
+tests/test_qwen3vl_session: tests/test_qwen3vl_session.o $(CORE_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+.PHONY: test-qwen3vl-session
+test-qwen3vl-session: tests/test_qwen3vl_session
+	@if [ ! -f "$(DS4_TEST_QWEN38_MODEL)" ] || [ ! -f "$(DS4_TEST_QWEN38_MMPROJ)" ] || [ ! -f "$(DS4_TEST_QWEN38_IMAGE)" ]; then \
+		echo "error: set DS4_TEST_QWEN38_MODEL, DS4_TEST_QWEN38_MMPROJ, and DS4_TEST_QWEN38_IMAGE"; exit 2; \
+	fi
+	./tests/test_qwen3vl_session "$(DS4_TEST_QWEN38_MODEL)" \
+		"$(DS4_TEST_QWEN38_MMPROJ)" "$(DS4_TEST_QWEN38_IMAGE)"
 endif
 
 ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_linux_memory.h
@@ -468,6 +496,12 @@ tests/test_deepseek4_vision_image.o: tests/test_deepseek4_vision_image.c ds4_ima
 
 tests/test_deepseek4_vision_image: tests/test_deepseek4_vision_image.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ -lm
+
+tests/test_qwen3vl_image.o: tests/test_qwen3vl_image.c ds4_image.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
+
+tests/test_qwen3vl_image: tests/test_qwen3vl_image.o ds4_image.o
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ -lm
 
 ifeq ($(UNAME_S),Darwin)
 $(GLM53_KDA_TEST): tests/test_glm53_kda.o ds4_metal.o ds4_image.o
@@ -747,7 +781,7 @@ test-frontends: ds4_test ds4_agent_test
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-qwen38-cpu test-session-state test-linux-memory \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
-	tests/test_deepseek4_vision_image tests/test_prompt_prefix $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
+	tests/test_deepseek4_vision_image tests/test_qwen3vl_image tests/test_prompt_prefix $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --validate-cases
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
@@ -759,6 +793,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-qwen38-c
 	./tests/test_prompt_prefix
 	./tests/test_sampling
 	./tests/test_deepseek4_vision_image
+	./tests/test_qwen3vl_image
 
 dspark-acceptance: ds4
 	DS4_DSPARK_MODEL="$(DS4_DSPARK_MODEL)" \
@@ -819,11 +854,11 @@ clean:
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_cuda_q8_scratch
 	rm -f tests/test_cuda_dspark_moe
-	rm -f tests/test_qwen38_cuda tests/test_qwen38_session_cuda tests/test_qwen38_cuda_perf
+	rm -f tests/test_qwen38_cuda tests/test_qwen38_session_cuda tests/test_qwen38_cuda_perf tests/test_qwen3vl_vision tests/test_qwen3vl_session
 	rm -f tests/test_quality_api
 	rm -f tests/test_linux_memory tests/test_rocm_memory
 	rm -f tests/test_glm_attention tests/test_glm_attention_rocm
 	rm -f tests/test_ssd_cache
 	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands
 	rm -f tests/test_metal_tp_spec
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_qwen3vl_image tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

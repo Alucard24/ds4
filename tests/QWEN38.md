@@ -1,10 +1,10 @@
-# Qwen3.8 CPU reference checks (Linux)
+# Qwen3.8-27B native text and vision checks (Linux)
 
-This documents the text reference and the first end-to-end CUDA text path, not
-the requested CUDA + vision MVP. Vision, competitive CUDA performance, full
-chat/tool template parity and recurrent disk cache serialization are not
-implemented yet. Unsupported cache operations fail
-explicitly; they must not save a DeepSeek-shaped payload.
+This documents the CPU text reference and native CUDA text plus Qwen3-VL
+image path. Competitive CUDA performance, video, full chat/tool template
+parity, Metal execution and recurrent disk-cache serialization are not complete.
+Unsupported cache operations fail explicitly; they must not save a
+DeepSeek-shaped payload.
 
 ## No-model kernel tests
 
@@ -91,7 +91,69 @@ alternate release modes. MMQ and MMVQ change floating-point reduction order;
 the rebuild test therefore requires stable argmax and a bounded 0.5 maximum
 logit delta rather than claiming bit identity across batch shapes.
 
-A warm-process benchmark can be built and run with:
+## CUDA Qwen3-VL vision
+
+The Qwen3-VL path loads the llama.cpp-compatible
+`mmproj-Qwen3.8-27B-BF16.gguf` sidecar without linking llama.cpp. It validates
+the fixed `qwen3vl_merger` shape (27 layers, width 1152, 16 heads, FFN 4304,
+2x2 spatial merge, no deepstack), performs bicubic dynamic-resolution
+preprocessing, and executes patch projection, resized learned position
+embeddings, bidirectional MRoPE attention, GELU FFNs, post norm, and the
+5120-wide merger on CUDA. The BF16 matrices remain packed in the auxiliary
+model mapping; FP32 biases, norms and activations preserve the GGUF graph.
+Language-model prefill replaces `<|image_pad|>` rows with the projected vectors
+and uses Qwen's compressed 2D MRoPE positions while retaining raw token indices
+for the causal KV cache.
+
+```sh
+make tests/test_qwen3vl_image
+./tests/test_qwen3vl_image
+
+make test-qwen3vl-vision CUDA_ARCH=sm_120 \
+  DS4_TEST_QWEN38_MODEL="$Q/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf" \
+  DS4_TEST_QWEN38_MMPROJ="$Q/mmproj-Qwen3.8-27B-BF16.gguf" \
+  DS4_TEST_QWEN38_IMAGE=/path/to/image.png
+
+make test-qwen3vl-session CUDA_ARCH=sm_120 \
+  DS4_TEST_QWEN38_MODEL="$Q/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf" \
+  DS4_TEST_QWEN38_MMPROJ="$Q/mmproj-Qwen3.8-27B-BF16.gguf" \
+  DS4_TEST_QWEN38_IMAGE=/path/to/white224.png
+```
+
+The public-session test transfers image ownership into the multimodal prompt,
+checks exact no-op sync reuse, continues autoregressive decoding through the
+same recurrent/GA state, requires the greedy result to identify the white
+fixture, and exercises a two-image prompt with separate MRoPE spans.
+
+`ds4-server` selects Qwen's `<|im_start|>` chat rendering and native
+`<tool_call><function=...>` syntax for model id 4. Its model aliases are
+`qwen3.8-27b`, `qwen3.8-27b-chat`, and `qwen3.8-27b-reasoner`. CUDA image smoke
+tests pass through `/v1/chat/completions`, `/v1/responses`, and Anthropic
+`/v1/messages`; a second image-bearing turn reuses the live multimodal prefix
+(75 cached tokens in the checked 224x224 case). Server parser/rendering unit
+tests are included in `./ds4_test --server`.
+
+Against llama.cpp's `llama-mtmd-debug`, a synthetic 224x224 white image yields
+49 vectors. llama.cpp reports sum `110.311356` and first values
+`0.5204, -0.1312, -0.6193`; ds4 reports `106.937073` and
+`0.517695, -0.130709, -0.619747`. At 256x256, llama.cpp reports sum
+`78.989944` and ds4 `71.992472`; first-row values remain within about 0.008.
+The remaining aggregate difference has not been isolated; full embedding parity
+is therefore not claimed and the sum is not used as an exact-bit gate. End-to-end greedy smoke tests identify a blank white image
+and describe the 512x507 Earth fixture as Earth with Africa and Madagascar.
+
+Dynamic preprocessing uses llama.cpp's normal 8..4096 merged-token limits.
+The current vision attention kernel is bounded in memory but intentionally
+simple and scales quadratically; large high-resolution images still need a
+tiled/flash-attention optimization. One-process timings on the RTX 5070 Ti were
+0.716 s for the complete 224x224 encoder test (49 output tokens), 1.315 s for
+the 512x507 Earth fixture resized to 512x512 (256 tokens), and 3.565 s for a
+768x768 image (576 tokens), including process startup and sidecar mapping. The
+public 192-context session test peaked at 13026 MiB. On a 16GB GPU, reduce
+language context when loading the additional approximately 0.87 GiB sidecar if
+allocation pressure is high.
+
+A warm-process text benchmark can be built and run with:
 
 ```sh
 make tests/test_qwen38_cuda_perf CUDA_ARCH=sm_120

@@ -1,0 +1,511 @@
+/* Qwen3-VL vision encoder for the Qwen3.8 CUDA path.
+ *
+ * The graph mirrors llama.cpp's MIT-licensed qwen3vl mtmd graph, while using
+ * ds4's own tensor and BF16 GEMM primitives. Activations remain FP32 and the
+ * sidecar's BF16 weights stay in the auxiliary CUDA model mapping.
+ */
+
+#ifndef DS4_QWEN3VL_VISION_STREAM
+#define DS4_QWEN3VL_VISION_STREAM 0
+#endif
+
+#ifndef DS4_QWEN3VL_VISION_TYPES_DEFINED
+#define DS4_QWEN3VL_VISION_TYPES_DEFINED
+#define DS4_QWEN3VL_VISION_LAYERS 27u
+typedef struct {
+    uint64_t norm1_weight, norm1_bias;
+    uint64_t qkv_weight, qkv_bias;
+    uint64_t attn_out_weight, attn_out_bias;
+    uint64_t norm2_weight, norm2_bias;
+    uint64_t ffn_up_weight, ffn_up_bias;
+    uint64_t ffn_down_weight, ffn_down_bias;
+} ds4_qwen3vl_vision_layer_weights;
+typedef struct {
+    uint64_t patch_weight_0, patch_weight_1, patch_bias;
+    uint64_t position_embedding;
+    uint64_t post_norm_weight, post_norm_bias;
+    uint64_t merger_up_weight, merger_up_bias;
+    uint64_t merger_down_weight, merger_down_bias;
+    ds4_qwen3vl_vision_layer_weights layer[DS4_QWEN3VL_VISION_LAYERS];
+} ds4_qwen3vl_vision_weights;
+#endif
+
+enum {
+    QWEN3VL_PATCH_DIM = 768,
+    QWEN3VL_WIDTH = 1152,
+    QWEN3VL_QKV = 3456,
+    QWEN3VL_FFN = 4304,
+    QWEN3VL_HEADS = 16,
+    QWEN3VL_HEAD_DIM = 72,
+    QWEN3VL_MERGED = 4608,
+    QWEN3VL_OUTPUT = 5120,
+};
+
+__device__ __forceinline__ static float qwen3vl_f32(const float *p) {
+    return *p;
+}
+
+__global__ static void qwen3vl_patch_pos_kernel(
+        float          *out,
+        const float    *patch_1,
+        const float    *bias,
+        const float    *position,
+        uint32_t        rows,
+        uint32_t        grid_h,
+        uint32_t        grid_w) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t count = (uint64_t)rows * QWEN3VL_WIDTH;
+    if (i >= count) return;
+    const uint32_t row = (uint32_t)(i / QWEN3VL_WIDTH);
+    const uint32_t d = (uint32_t)(i % QWEN3VL_WIDTH);
+    const uint32_t merge_w = grid_w / 2u;
+    const uint32_t group = row / 4u;
+    const uint32_t within = row & 3u;
+    const uint32_t y = (group / merge_w) * 2u + within / 2u;
+    const uint32_t x = (group % merge_w) * 2u + within % 2u;
+
+    const float fy = grid_h > 1u ? (float)y * 47.0f / (float)(grid_h - 1u) : 0.0f;
+    const float fx = grid_w > 1u ? (float)x * 47.0f / (float)(grid_w - 1u) : 0.0f;
+    const uint32_t y0 = (uint32_t)floorf(fy);
+    const uint32_t x0 = (uint32_t)floorf(fx);
+    const uint32_t y1 = y0 < 47u ? y0 + 1u : y0;
+    const uint32_t x1 = x0 < 47u ? x0 + 1u : x0;
+    const float wy = fy - (float)y0;
+    const float wx = fx - (float)x0;
+    const float p00 = qwen3vl_f32(position + ((uint64_t)y0 * 48u + x0) * QWEN3VL_WIDTH + d);
+    const float p01 = qwen3vl_f32(position + ((uint64_t)y0 * 48u + x1) * QWEN3VL_WIDTH + d);
+    const float p10 = qwen3vl_f32(position + ((uint64_t)y1 * 48u + x0) * QWEN3VL_WIDTH + d);
+    const float p11 = qwen3vl_f32(position + ((uint64_t)y1 * 48u + x1) * QWEN3VL_WIDTH + d);
+    const float top = fmaf(wx, p01 - p00, p00);
+    const float bottom = fmaf(wx, p11 - p10, p10);
+    const float pos = fmaf(wy, bottom - top, top);
+    out[i] += patch_1[i] + qwen3vl_f32(bias + d) + pos;
+}
+
+__global__ static void qwen3vl_layernorm_kernel(
+        float          *out,
+        const float    *x,
+        const float    *weight,
+        const float    *bias,
+        uint32_t        rows,
+        uint32_t        width,
+        float           eps) {
+    __shared__ float partial[256];
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (row >= rows) return;
+    const float *xr = x + (uint64_t)row * width;
+    float *yr = out + (uint64_t)row * width;
+    float sum = 0.0f;
+    for (uint32_t d = tid; d < width; d += blockDim.x) sum += xr[d];
+    partial[tid] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2u; stride != 0u; stride >>= 1u) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float mean = partial[0] / (float)width;
+    float variance = 0.0f;
+    for (uint32_t d = tid; d < width; d += blockDim.x) {
+        const float centered = xr[d] - mean;
+        variance = fmaf(centered, centered, variance);
+    }
+    partial[tid] = variance;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x / 2u; stride != 0u; stride >>= 1u) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float inv = ds4_cuda_rsqrtf(partial[0] / (float)width + eps);
+    for (uint32_t d = tid; d < width; d += blockDim.x) {
+        yr[d] = (xr[d] - mean) * inv * qwen3vl_f32(weight + d) +
+                qwen3vl_f32(bias + d);
+    }
+}
+
+__global__ static void qwen3vl_bias_rope_kernel(
+        float          *qkv,
+        const float    *bias,
+        uint32_t        rows,
+        uint32_t        grid_w) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    const uint32_t lane = threadIdx.x;
+    if (row >= rows || head >= QWEN3VL_HEADS || lane >= QWEN3VL_HEAD_DIM) return;
+    const uint64_t base = (uint64_t)row * QWEN3VL_QKV +
+                          (uint64_t)head * QWEN3VL_HEAD_DIM;
+    qkv[base + lane] += qwen3vl_f32(
+            bias + (uint64_t)head * QWEN3VL_HEAD_DIM + lane);
+    qkv[base + QWEN3VL_WIDTH + lane] += qwen3vl_f32(
+            bias + QWEN3VL_WIDTH +
+            (uint64_t)head * QWEN3VL_HEAD_DIM + lane);
+    qkv[base + 2u * QWEN3VL_WIDTH + lane] += qwen3vl_f32(
+            bias + 2u * QWEN3VL_WIDTH +
+            (uint64_t)head * QWEN3VL_HEAD_DIM + lane);
+    __syncthreads();
+    if (lane >= 36u) return;
+
+    const uint32_t merge_w = grid_w / 2u;
+    const uint32_t group = row / 4u;
+    const uint32_t within = row & 3u;
+    const uint32_t py = (group / merge_w) * 2u + within / 2u;
+    const uint32_t px = (group % merge_w) * 2u + within % 2u;
+    const uint32_t freq = lane < 18u ? lane : lane - 18u;
+    const uint32_t pos = lane < 18u ? py : px;
+    const float inv_freq = powf(10000.0f, -(float)freq / 18.0f);
+    const float angle = (float)pos * inv_freq;
+    const float cs = cosf(angle);
+    const float sn = sinf(angle);
+
+    float q0 = qkv[base + lane];
+    float q1 = qkv[base + lane + 36u];
+    float k0 = qkv[base + QWEN3VL_WIDTH + lane];
+    float k1 = qkv[base + QWEN3VL_WIDTH + lane + 36u];
+    qkv[base + lane] = q0 * cs - q1 * sn;
+    qkv[base + lane + 36u] = q0 * sn + q1 * cs;
+    qkv[base + QWEN3VL_WIDTH + lane] = k0 * cs - k1 * sn;
+    qkv[base + QWEN3VL_WIDTH + lane + 36u] = k0 * sn + k1 * cs;
+}
+
+__global__ static void qwen3vl_attention_kernel(
+        float       *out,
+        const float *qkv,
+        uint32_t     rows) {
+    __shared__ float dot[128];
+    const uint32_t row = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    const uint32_t lane = threadIdx.x;
+    if (row >= rows || head >= QWEN3VL_HEADS) return;
+    const uint64_t qbase = (uint64_t)row * QWEN3VL_QKV +
+                           (uint64_t)head * QWEN3VL_HEAD_DIM;
+    float acc = 0.0f;
+    float max_score = -INFINITY;
+    float denom = 0.0f;
+    for (uint32_t key_row = 0; key_row < rows; key_row++) {
+        const uint64_t kbase = (uint64_t)key_row * QWEN3VL_QKV +
+                               QWEN3VL_WIDTH +
+                               (uint64_t)head * QWEN3VL_HEAD_DIM;
+        dot[lane] = lane < QWEN3VL_HEAD_DIM ?
+                    qkv[qbase + lane] * qkv[kbase + lane] : 0.0f;
+        __syncthreads();
+        for (uint32_t stride = 64u; stride != 0u; stride >>= 1u) {
+            if (lane < stride) dot[lane] += dot[lane + stride];
+            __syncthreads();
+        }
+        const float score = dot[0] * 0.11785113019775793f;
+        const float next_max = fmaxf(max_score, score);
+        const float old_scale = key_row == 0u ? 0.0f : expf(max_score - next_max);
+        const float new_scale = expf(score - next_max);
+        denom = denom * old_scale + new_scale;
+        if (lane < QWEN3VL_HEAD_DIM) {
+            const uint64_t vbase = (uint64_t)key_row * QWEN3VL_QKV +
+                                   2u * QWEN3VL_WIDTH +
+                                   (uint64_t)head * QWEN3VL_HEAD_DIM;
+            acc = acc * old_scale + new_scale * qkv[vbase + lane];
+        }
+        max_score = next_max;
+        __syncthreads();
+    }
+    if (lane < QWEN3VL_HEAD_DIM) {
+        out[(uint64_t)row * QWEN3VL_WIDTH +
+            (uint64_t)head * QWEN3VL_HEAD_DIM + lane] = acc / denom;
+    }
+}
+
+__global__ static void qwen3vl_bias_residual_kernel(
+        float          *x,
+        const float    *bias,
+        const float    *residual,
+        uint64_t        count,
+        uint32_t        width) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    x[i] += qwen3vl_f32(bias + i % width) + residual[i];
+}
+
+__global__ static void qwen3vl_gelu_bias_kernel(
+        float          *x,
+        const float    *bias,
+        uint64_t        count,
+        uint32_t        width) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float v = x[i] + qwen3vl_f32(bias + i % width);
+    const float c = 0.7978845608028654f;
+    x[i] = 0.5f * v * (1.0f + tanhf(c * v * (1.0f + 0.044715f * v * v)));
+}
+
+__global__ static void qwen3vl_bias_kernel(
+        float          *x,
+        const float    *bias,
+        uint64_t        count,
+        uint32_t        width) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) x[i] += qwen3vl_f32(bias + i % width);
+}
+
+static const float *qwen3vl_weight(
+        const void *model_map,
+        uint64_t    model_size,
+        uint64_t    offset,
+        uint64_t    elements,
+        const char *label) {
+    if (!model_map || elements > UINT64_MAX / sizeof(float) ||
+        offset > model_size) return NULL;
+    const uint64_t bytes = elements * sizeof(float);
+    if (bytes > model_size - offset) return NULL;
+    return (const float *)cuda_resolve_weight_ptr(
+            model_map, offset, bytes, 0, label);
+}
+
+static int qwen3vl_launch_ok(const char *label) {
+    return cuda_ok(cudaGetLastError(), label);
+}
+
+extern "C" int ds4_gpu_qwen3vl_vision_encode(
+        float                            *out,
+        const float                      *patches,
+        uint32_t                          grid_h,
+        uint32_t                          grid_w,
+        const void                       *model_map,
+        uint64_t                          model_size,
+        const ds4_qwen3vl_vision_weights *weights) {
+    if (!out || !patches || !model_map || !weights || grid_h == 0u ||
+        grid_w == 0u || (grid_h & 1u) != 0u || (grid_w & 1u) != 0u ||
+        grid_h > UINT32_MAX / grid_w) return 0;
+    const uint32_t rows = grid_h * grid_w;
+    const uint32_t merged_rows = rows / 4u;
+    const uint64_t row768 = (uint64_t)rows * QWEN3VL_PATCH_DIM;
+    const uint64_t row1152 = (uint64_t)rows * QWEN3VL_WIDTH;
+    const uint64_t row3456 = (uint64_t)rows * QWEN3VL_QKV;
+    const uint64_t row4304 = (uint64_t)rows * QWEN3VL_FFN;
+    const uint64_t merged4608 = (uint64_t)merged_rows * QWEN3VL_MERGED;
+    const uint64_t merged5120 = (uint64_t)merged_rows * QWEN3VL_OUTPUT;
+    if (row4304 > SIZE_MAX / sizeof(float) ||
+        merged5120 > SIZE_MAX / sizeof(float)) return 0;
+
+    ds4_gpu_tensor *patch = NULL, *a = NULL, *b = NULL, *qkv = NULL;
+    ds4_gpu_tensor *attn = NULL, *ffn = NULL, *merged = NULL, *output = NULL;
+    ds4_gpu_tensor *cur = NULL, *tmp = NULL;
+    const float    *bias = NULL, *position = NULL;
+    const float *merger_bias = NULL, *output_bias = NULL;
+    int ok = 0;
+#define QWEN3VL_ALLOC(name_, count_) do { \
+        name_ = ds4_gpu_tensor_alloc((count_) * sizeof(float)); \
+        if (!(name_)) goto cleanup; \
+    } while (0)
+    QWEN3VL_ALLOC(patch, row768);
+    QWEN3VL_ALLOC(a, row1152);
+    QWEN3VL_ALLOC(b, row1152);
+    QWEN3VL_ALLOC(qkv, row3456);
+    QWEN3VL_ALLOC(attn, row1152);
+    QWEN3VL_ALLOC(ffn, row4304);
+    QWEN3VL_ALLOC(merged, merged4608);
+    QWEN3VL_ALLOC(output, merged5120);
+#undef QWEN3VL_ALLOC
+
+    if (!ds4_gpu_tensor_write(patch, 0, patches, row768 * sizeof(float)) ||
+        !ds4_gpu_begin_commands()) goto cleanup;
+    ok = ds4_gpu_matmul_f32_tensor(
+            a, model_map, model_size, weights->patch_weight_0,
+            QWEN3VL_PATCH_DIM, QWEN3VL_WIDTH, patch, rows);
+    if (ok) ok = ds4_gpu_matmul_f32_tensor(
+            b, model_map, model_size, weights->patch_weight_1,
+            QWEN3VL_PATCH_DIM, QWEN3VL_WIDTH, patch, rows);
+    if (ok) {
+        bias = qwen3vl_weight(model_map, model_size, weights->patch_bias,
+                              QWEN3VL_WIDTH, "Qwen3-VL patch bias");
+        position = qwen3vl_weight(model_map, model_size,
+                                  weights->position_embedding,
+                                  48u * 48u * QWEN3VL_WIDTH,
+                                  "Qwen3-VL position embedding");
+        if (!bias || !position) ok = 0;
+    }
+    if (ok) {
+        qwen3vl_patch_pos_kernel<<<
+            (unsigned)((row1152 + 255u) / 256u), 256u, 0,
+            DS4_QWEN3VL_VISION_STREAM>>>(
+                (float *)a->ptr, (const float *)b->ptr, bias, position,
+                rows, grid_h, grid_w);
+        ok = qwen3vl_launch_ok("Qwen3-VL patch and position embedding");
+    }
+
+    cur = a;
+    tmp = b;
+    for (uint32_t il = 0; ok && il < DS4_QWEN3VL_VISION_LAYERS; il++) {
+        const ds4_qwen3vl_vision_layer_weights *w = &weights->layer[il];
+        const float *norm_w = qwen3vl_weight(
+                model_map, model_size, w->norm1_weight, QWEN3VL_WIDTH,
+                "Qwen3-VL norm1 weight");
+        const float *norm_b = qwen3vl_weight(
+                model_map, model_size, w->norm1_bias, QWEN3VL_WIDTH,
+                "Qwen3-VL norm1 bias");
+        if (!norm_w || !norm_b) { ok = 0; break; }
+        qwen3vl_layernorm_kernel<<<rows, 256u, 0,
+            DS4_QWEN3VL_VISION_STREAM>>>(
+                (float *)tmp->ptr, (const float *)cur->ptr,
+                norm_w, norm_b, rows, QWEN3VL_WIDTH, 1.0e-6f);
+        ok = qwen3vl_launch_ok("Qwen3-VL norm1");
+        if (ok) ok = ds4_gpu_glm53_matmul_bf16(
+                qkv, model_map, model_size, w->qkv_weight,
+                QWEN3VL_WIDTH, QWEN3VL_QKV, tmp, rows);
+        const float *qkv_bias = NULL;
+        if (ok) {
+            qkv_bias = qwen3vl_weight(
+                    model_map, model_size, w->qkv_bias, QWEN3VL_QKV,
+                    "Qwen3-VL QKV bias");
+            if (!qkv_bias) ok = 0;
+        }
+        if (ok) {
+            qwen3vl_bias_rope_kernel<<<dim3(rows, QWEN3VL_HEADS, 1u),
+                QWEN3VL_HEAD_DIM, 0, DS4_QWEN3VL_VISION_STREAM>>>(
+                    (float *)qkv->ptr, qkv_bias, rows, grid_w);
+            ok = qwen3vl_launch_ok("Qwen3-VL QKV RoPE");
+        }
+        if (ok) {
+            qwen3vl_attention_kernel<<<dim3(rows, QWEN3VL_HEADS, 1u),
+                128u, 0, DS4_QWEN3VL_VISION_STREAM>>>(
+                    (float *)attn->ptr, (const float *)qkv->ptr, rows);
+            ok = qwen3vl_launch_ok("Qwen3-VL attention");
+        }
+        if (ok) ok = ds4_gpu_glm53_matmul_bf16(
+                tmp, model_map, model_size, w->attn_out_weight,
+                QWEN3VL_WIDTH, QWEN3VL_WIDTH, attn, rows);
+        const float *attn_bias = NULL;
+        if (ok) {
+            attn_bias = qwen3vl_weight(
+                    model_map, model_size, w->attn_out_bias, QWEN3VL_WIDTH,
+                    "Qwen3-VL attention bias");
+            if (!attn_bias) ok = 0;
+        }
+        if (ok) {
+            qwen3vl_bias_residual_kernel<<<
+                (unsigned)((row1152 + 255u) / 256u), 256u, 0,
+                DS4_QWEN3VL_VISION_STREAM>>>(
+                    (float *)tmp->ptr, attn_bias, (const float *)cur->ptr,
+                    row1152, QWEN3VL_WIDTH);
+            ok = qwen3vl_launch_ok("Qwen3-VL attention residual");
+        }
+        ds4_gpu_tensor *swap = cur; cur = tmp; tmp = swap;
+
+        if (ok) {
+            norm_w = qwen3vl_weight(
+                    model_map, model_size, w->norm2_weight, QWEN3VL_WIDTH,
+                    "Qwen3-VL norm2 weight");
+            norm_b = qwen3vl_weight(
+                    model_map, model_size, w->norm2_bias, QWEN3VL_WIDTH,
+                    "Qwen3-VL norm2 bias");
+            if (!norm_w || !norm_b) ok = 0;
+        }
+        if (ok) {
+            qwen3vl_layernorm_kernel<<<rows, 256u, 0,
+                DS4_QWEN3VL_VISION_STREAM>>>(
+                    (float *)tmp->ptr, (const float *)cur->ptr,
+                    norm_w, norm_b, rows, QWEN3VL_WIDTH, 1.0e-6f);
+            ok = qwen3vl_launch_ok("Qwen3-VL norm2");
+        }
+        if (ok) ok = ds4_gpu_glm53_matmul_bf16(
+                ffn, model_map, model_size, w->ffn_up_weight,
+                QWEN3VL_WIDTH, QWEN3VL_FFN, tmp, rows);
+        const float *up_bias = NULL;
+        if (ok) {
+            up_bias = qwen3vl_weight(
+                    model_map, model_size, w->ffn_up_bias, QWEN3VL_FFN,
+                    "Qwen3-VL FFN up bias");
+            if (!up_bias) ok = 0;
+        }
+        if (ok) {
+            qwen3vl_gelu_bias_kernel<<<
+                (unsigned)((row4304 + 255u) / 256u), 256u, 0,
+                DS4_QWEN3VL_VISION_STREAM>>>(
+                    (float *)ffn->ptr, up_bias, row4304, QWEN3VL_FFN);
+            ok = qwen3vl_launch_ok("Qwen3-VL FFN GELU");
+        }
+        if (ok) ok = ds4_gpu_glm53_matmul_bf16(
+                tmp, model_map, model_size, w->ffn_down_weight,
+                QWEN3VL_FFN, QWEN3VL_WIDTH, ffn, rows);
+        const float *down_bias = NULL;
+        if (ok) {
+            down_bias = qwen3vl_weight(
+                    model_map, model_size, w->ffn_down_bias, QWEN3VL_WIDTH,
+                    "Qwen3-VL FFN down bias");
+            if (!down_bias) ok = 0;
+        }
+        if (ok) {
+            qwen3vl_bias_residual_kernel<<<
+                (unsigned)((row1152 + 255u) / 256u), 256u, 0,
+                DS4_QWEN3VL_VISION_STREAM>>>(
+                    (float *)tmp->ptr, down_bias, (const float *)cur->ptr,
+                    row1152, QWEN3VL_WIDTH);
+            ok = qwen3vl_launch_ok("Qwen3-VL FFN residual");
+        }
+        swap = cur; cur = tmp; tmp = swap;
+    }
+
+    if (ok) {
+        const float *norm_w = qwen3vl_weight(
+                model_map, model_size, weights->post_norm_weight,
+                QWEN3VL_WIDTH, "Qwen3-VL post norm weight");
+        const float *norm_b = qwen3vl_weight(
+                model_map, model_size, weights->post_norm_bias,
+                QWEN3VL_WIDTH, "Qwen3-VL post norm bias");
+        if (!norm_w || !norm_b) ok = 0;
+        else {
+            qwen3vl_layernorm_kernel<<<rows, 256u, 0,
+                DS4_QWEN3VL_VISION_STREAM>>>(
+                    (float *)tmp->ptr, (const float *)cur->ptr,
+                    norm_w, norm_b, rows, QWEN3VL_WIDTH, 1.0e-6f);
+            ok = qwen3vl_launch_ok("Qwen3-VL post norm");
+        }
+    }
+    if (ok) ok = ds4_gpu_glm53_matmul_bf16(
+            merged, model_map, model_size, weights->merger_up_weight,
+            QWEN3VL_MERGED, QWEN3VL_MERGED, tmp, merged_rows);
+    if (ok) {
+        merger_bias = qwen3vl_weight(
+                model_map, model_size, weights->merger_up_bias,
+                QWEN3VL_MERGED, "Qwen3-VL merger up bias");
+        if (!merger_bias) ok = 0;
+    }
+    if (ok) {
+        qwen3vl_gelu_bias_kernel<<<
+            (unsigned)((merged4608 + 255u) / 256u), 256u, 0,
+            DS4_QWEN3VL_VISION_STREAM>>>(
+                (float *)merged->ptr, merger_bias,
+                merged4608, QWEN3VL_MERGED);
+        ok = qwen3vl_launch_ok("Qwen3-VL merger GELU");
+    }
+    if (ok) ok = ds4_gpu_glm53_matmul_bf16(
+            output, model_map, model_size, weights->merger_down_weight,
+            QWEN3VL_MERGED, QWEN3VL_OUTPUT, merged, merged_rows);
+    if (ok) {
+        output_bias = qwen3vl_weight(
+                model_map, model_size, weights->merger_down_bias,
+                QWEN3VL_OUTPUT, "Qwen3-VL merger down bias");
+        if (!output_bias) ok = 0;
+    }
+    if (ok) {
+        qwen3vl_bias_kernel<<<
+            (unsigned)((merged5120 + 255u) / 256u), 256u, 0,
+            DS4_QWEN3VL_VISION_STREAM>>>(
+                (float *)output->ptr, output_bias,
+                merged5120, QWEN3VL_OUTPUT);
+        ok = qwen3vl_launch_ok("Qwen3-VL merger down bias");
+    }
+    if (ds4_gpu_end_commands() == 0) ok = 0;
+    if (ok) ok = ds4_gpu_tensor_read(
+            output, 0, out, merged5120 * sizeof(float));
+
+cleanup:
+    ds4_gpu_tensor_free(output);
+    ds4_gpu_tensor_free(merged);
+    ds4_gpu_tensor_free(ffn);
+    ds4_gpu_tensor_free(attn);
+    ds4_gpu_tensor_free(qkv);
+    ds4_gpu_tensor_free(b);
+    ds4_gpu_tensor_free(a);
+    ds4_gpu_tensor_free(patch);
+    return ok;
+}
+
+#undef DS4_QWEN3VL_VISION_STREAM

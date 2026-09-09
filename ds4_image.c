@@ -564,6 +564,137 @@ int ds4_image_preprocess_glm53(
     return 1;
 }
 
+static uint32_t ds4_qwen3vl_round_factor(double value, uint32_t factor) {
+    uint64_t units = (uint64_t)floor(value / (double)factor + 0.5);
+    if (units < 1u) units = 1u;
+    if (units > UINT32_MAX / factor) return 0;
+    return (uint32_t)units * factor;
+}
+
+static int ds4_qwen3vl_smart_resize(
+        uint32_t height,
+        uint32_t width,
+        uint32_t min_tokens,
+        uint32_t max_tokens,
+        uint32_t *target_height,
+        uint32_t *target_width) {
+    const uint32_t factor = 32u;
+    const uint64_t patch_area = (uint64_t)factor * factor;
+    const uint64_t min_pixels = (uint64_t)min_tokens * patch_area;
+    const uint64_t max_pixels = (uint64_t)max_tokens * patch_area;
+    uint32_t h = ds4_qwen3vl_round_factor((double)height, factor);
+    uint32_t w = ds4_qwen3vl_round_factor((double)width, factor);
+    if (!h || !w) return 0;
+    uint64_t pixels = (uint64_t)h * w;
+    if (pixels > max_pixels) {
+        const double beta = sqrt((double)height * width / (double)max_pixels);
+        h = (uint32_t)floor((double)height / beta / factor) * factor;
+        w = (uint32_t)floor((double)width / beta / factor) * factor;
+        if (h < factor) h = factor;
+        if (w < factor) w = factor;
+    } else if (pixels < min_pixels) {
+        const double beta = sqrt((double)min_pixels / ((double)height * width));
+        h = ds4_align_u32((uint32_t)ceil(height * beta), factor);
+        w = ds4_align_u32((uint32_t)ceil(width * beta), factor);
+    }
+    if ((uint64_t)h * w > max_pixels || (uint64_t)h * w < min_pixels) return 0;
+    *target_height = h;
+    *target_width = w;
+    return 1;
+}
+
+int ds4_image_preprocess_qwen3vl(
+        ds4_image_patches *out,
+        const ds4_image *image,
+        uint32_t min_image_tokens,
+        uint32_t max_image_tokens,
+        char *error,
+        size_t error_cap) {
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    if (!image || !image->rgb || image->width == 0u || image->height == 0u ||
+        min_image_tokens == 0u || max_image_tokens < min_image_tokens ||
+        max_image_tokens > 4096u) {
+        ds4_image_error(error, error_cap,
+                        "invalid Qwen3-VL image preprocessing parameters");
+        return 0;
+    }
+
+    uint32_t target_height = 0, target_width = 0;
+    if (!ds4_qwen3vl_smart_resize(image->height, image->width,
+                                  min_image_tokens, max_image_tokens,
+                                  &target_height, &target_width)) {
+        ds4_image_error(error, error_cap, "Qwen3-VL image token budget is invalid");
+        return 0;
+    }
+    const size_t canvas_values = (size_t)target_height * target_width * 3u;
+    float *canvas = malloc(canvas_values * sizeof(float));
+    if (!canvas) {
+        ds4_image_error(error, error_cap, "unable to allocate resized Qwen3-VL image");
+        return 0;
+    }
+    if (target_width == image->width && target_height == image->height) {
+        for (size_t i = 0; i < canvas_values; i++) canvas[i] = image->rgb[i];
+    } else {
+        ds4_resize_rgb_bicubic(image->rgb, image->width, image->height,
+                               canvas, target_width, target_height, target_width);
+    }
+    for (size_t i = 0; i < canvas_values; i++) {
+        canvas[i] = canvas[i] * (2.0f / 255.0f) - 1.0f;
+    }
+
+    const uint32_t grid_height = target_height / 16u;
+    const uint32_t grid_width = target_width / 16u;
+    const uint32_t patch_count = grid_height * grid_width;
+    const size_t patch_values = (size_t)patch_count * 3u * 16u * 16u;
+    float *patches = malloc(patch_values * sizeof(float));
+    if (!patches) {
+        free(canvas);
+        ds4_image_error(error, error_cap, "unable to allocate Qwen3-VL patches");
+        return 0;
+    }
+
+    size_t index = 0;
+    for (uint32_t block_y = 0; block_y < grid_height / 2u; block_y++) {
+        for (uint32_t block_x = 0; block_x < grid_width / 2u; block_x++) {
+            for (uint32_t merge_y = 0; merge_y < 2u; merge_y++) {
+                for (uint32_t merge_x = 0; merge_x < 2u; merge_x++) {
+                    const uint32_t patch_y = block_y * 2u + merge_y;
+                    const uint32_t patch_x = block_x * 2u + merge_x;
+                    for (uint32_t channel = 0; channel < 3u; channel++) {
+                        for (uint32_t y = 0; y < 16u; y++) {
+                            for (uint32_t x = 0; x < 16u; x++) {
+                                const float *pixel = canvas +
+                                    ((size_t)(patch_y * 16u + y) * target_width +
+                                     patch_x * 16u + x) * 3u;
+                                patches[index++] = pixel[channel];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    free(canvas);
+    if (index != patch_values) {
+        free(patches);
+        ds4_image_error(error, error_cap,
+                        "internal Qwen3-VL patch layout mismatch");
+        return 0;
+    }
+
+    out->content_width = target_width;
+    out->content_height = target_height;
+    out->padded_width = target_width;
+    out->padded_height = target_height;
+    out->grid_width = grid_width;
+    out->grid_height = grid_height;
+    out->patch_count = patch_count;
+    out->image_token_count = patch_count / 4u;
+    out->patches = patches;
+    return 1;
+}
+
 void ds4_image_patches_free(ds4_image_patches *patches) {
     if (!patches) return;
     free(patches->patches);

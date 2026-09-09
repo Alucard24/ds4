@@ -6703,6 +6703,167 @@ static void vision_weights_bind(
     }
 }
 
+static uint64_t qwen3vl_vision_required_offset(
+        const ds4_model *m,
+        const char      *name,
+        uint32_t         type,
+        uint32_t         ndim,
+        const uint64_t  *dims) {
+    ds4_tensor *t = required_tensor(m, name);
+    if (t->type != type || t->ndim != ndim) {
+        fprintf(stderr,
+                "ds4: Qwen3-VL tensor %s has type %s/rank %u, "
+                "expected %s/rank %u\n",
+                name, tensor_type_name(t->type), t->ndim,
+                tensor_type_name(type), ndim);
+        exit(1);
+    }
+    for (uint32_t d = 0; d < ndim; d++) {
+        if (t->dim[d] == dims[d]) continue;
+        fprintf(stderr,
+                "ds4: Qwen3-VL tensor %s has dim[%u]=%" PRIu64
+                ", expected %" PRIu64 "\n",
+                name, d, t->dim[d], dims[d]);
+        exit(1);
+    }
+    return t->abs_offset;
+}
+
+static void qwen3vl_vision_weights_bind(
+        ds4_qwen3vl_vision_weights *w,
+        const ds4_model             *m) {
+    ds4_str arch = {0}, projector = {0};
+    if (!model_get_string(m, "general.architecture", &arch) ||
+        !ds4_streq(arch, "clip") ||
+        !model_get_string(m, "clip.projector_type", &projector) ||
+        !ds4_streq(projector, "qwen3vl_merger")) {
+        ds4_die("--vision file is not a Qwen3-VL merger GGUF");
+    }
+    if (m->n_tensors != 334u) {
+        fprintf(stderr,
+                "ds4: Qwen3-VL GGUF has %" PRIu64
+                " tensors, expected 334\n", m->n_tensors);
+        exit(1);
+    }
+    if (!required_bool(m, "clip.has_vision_encoder") ||
+        !required_bool(m, "clip.use_gelu")) {
+        ds4_die("Qwen3-VL vision metadata is incompatible");
+    }
+    config_expect_u32("Qwen3-VL projection_dim",
+                      required_u32(m, "clip.vision.projection_dim"), 5120u);
+    config_expect_u32("Qwen3-VL image_size",
+                      required_u32(m, "clip.vision.image_size"), 768u);
+    config_expect_u32("Qwen3-VL patch_size",
+                      required_u32(m, "clip.vision.patch_size"), 16u);
+    config_expect_u32("Qwen3-VL embedding_length",
+                      required_u32(m, "clip.vision.embedding_length"), 1152u);
+    config_expect_u32("Qwen3-VL feed_forward_length",
+                      required_u32(m, "clip.vision.feed_forward_length"), 4304u);
+    config_expect_u32("Qwen3-VL block_count",
+                      required_u32(m, "clip.vision.block_count"), 27u);
+    config_expect_u32("Qwen3-VL head_count",
+                      required_u32(m, "clip.vision.attention.head_count"), 16u);
+    config_expect_u32("Qwen3-VL spatial_merge_size",
+                      required_u32(m, "clip.vision.spatial_merge_size"), 2u);
+    config_expect_f32("Qwen3-VL layer_norm_epsilon",
+                      required_f32(m, "clip.vision.attention.layer_norm_epsilon"),
+                      1.0e-6f);
+    const char *normalization_keys[2] = {
+        "clip.vision.image_mean", "clip.vision.image_std"
+    };
+    for (uint32_t a = 0; a < 2u; a++) {
+        ds4_array_ref arr;
+        if (!model_get_array(m, normalization_keys[a], &arr) ||
+            arr.type != GGUF_VALUE_FLOAT32 || arr.len != 3u) {
+            ds4_die("Qwen3-VL image normalization metadata is invalid");
+        }
+        ds4_cursor c = cursor_at(m, arr.data_pos);
+        for (uint32_t i = 0; i < 3u; i++) {
+            float value = 0.0f;
+            if (!cursor_read(&c, &value, sizeof(value))) ds4_die(c.error);
+            config_expect_f32(normalization_keys[a], value, 0.5f);
+        }
+    }
+    ds4_array_ref deepstack;
+    if (!model_get_array(m, "clip.vision.is_deepstack_layers", &deepstack) ||
+        deepstack.type != GGUF_VALUE_BOOL ||
+        deepstack.len != DS4_QWEN3VL_VISION_LAYERS) {
+        ds4_die("Qwen3-VL deepstack metadata is invalid");
+    }
+    ds4_cursor dc = cursor_at(m, deepstack.data_pos);
+    for (uint32_t il = 0; il < DS4_QWEN3VL_VISION_LAYERS; il++) {
+        uint8_t enabled = 0;
+        if (!cursor_read(&dc, &enabled, sizeof(enabled))) ds4_die(dc.error);
+        if (enabled) ds4_die("Qwen3-VL deepstack sidecars are not supported");
+    }
+
+    static const uint64_t d1152[] = {1152u};
+    static const uint64_t d3456[] = {3456u};
+    static const uint64_t d4304[] = {4304u};
+    static const uint64_t d4608[] = {4608u};
+    static const uint64_t d5120[] = {5120u};
+    static const uint64_t d1152_1152[] = {1152u, 1152u};
+    static const uint64_t d1152_2304[] = {1152u, 2304u};
+    static const uint64_t d1152_3456[] = {1152u, 3456u};
+    static const uint64_t d1152_4304[] = {1152u, 4304u};
+    static const uint64_t d4304_1152[] = {4304u, 1152u};
+    static const uint64_t d4608_4608[] = {4608u, 4608u};
+    static const uint64_t d4608_5120[] = {4608u, 5120u};
+    static const uint64_t patch_dims[] = {16u, 16u, 3u, 1152u};
+
+    memset(w, 0, sizeof(*w));
+    w->patch_weight_0 = qwen3vl_vision_required_offset(
+            m, "v.patch_embd.weight", DS4_TENSOR_F32, 4, patch_dims);
+    w->patch_weight_1 = qwen3vl_vision_required_offset(
+            m, "v.patch_embd.weight.1", DS4_TENSOR_F32, 4, patch_dims);
+    w->patch_bias = qwen3vl_vision_required_offset(
+            m, "v.patch_embd.bias", DS4_TENSOR_F32, 1, d1152);
+    w->position_embedding = qwen3vl_vision_required_offset(
+            m, "v.position_embd.weight", DS4_TENSOR_F32, 2, d1152_2304);
+    w->post_norm_weight = qwen3vl_vision_required_offset(
+            m, "v.post_ln.weight", DS4_TENSOR_F32, 1, d1152);
+    w->post_norm_bias = qwen3vl_vision_required_offset(
+            m, "v.post_ln.bias", DS4_TENSOR_F32, 1, d1152);
+    w->merger_up_weight = qwen3vl_vision_required_offset(
+            m, "mm.0.weight", DS4_TENSOR_BF16, 2, d4608_4608);
+    w->merger_up_bias = qwen3vl_vision_required_offset(
+            m, "mm.0.bias", DS4_TENSOR_F32, 1, d4608);
+    w->merger_down_weight = qwen3vl_vision_required_offset(
+            m, "mm.2.weight", DS4_TENSOR_BF16, 2, d4608_5120);
+    w->merger_down_bias = qwen3vl_vision_required_offset(
+            m, "mm.2.bias", DS4_TENSOR_F32, 1, d5120);
+
+    for (uint32_t il = 0; il < DS4_QWEN3VL_VISION_LAYERS; il++) {
+        char name[96];
+#define QWEN3VL_LAYER_OFFSET(field_, suffix_, type_, rank_, dims_) do { \
+            int n = snprintf(name, sizeof(name), "v.blk.%u.%s", il, suffix_); \
+            if (n < 0 || (size_t)n >= sizeof(name)) \
+                ds4_die("Qwen3-VL tensor name overflow"); \
+            w->layer[il].field_ = qwen3vl_vision_required_offset( \
+                    m, name, type_, rank_, dims_); \
+        } while (0)
+#define QWEN3VL_LAYER_F32(field_, suffix_, rank_, dims_) \
+        QWEN3VL_LAYER_OFFSET(field_, suffix_, DS4_TENSOR_F32, rank_, dims_)
+#define QWEN3VL_LAYER_BF16(field_, suffix_, rank_, dims_) \
+        QWEN3VL_LAYER_OFFSET(field_, suffix_, DS4_TENSOR_BF16, rank_, dims_)
+        QWEN3VL_LAYER_F32(norm1_weight, "ln1.weight", 1, d1152);
+        QWEN3VL_LAYER_F32(norm1_bias, "ln1.bias", 1, d1152);
+        QWEN3VL_LAYER_BF16(qkv_weight, "attn_qkv.weight", 2, d1152_3456);
+        QWEN3VL_LAYER_F32(qkv_bias, "attn_qkv.bias", 1, d3456);
+        QWEN3VL_LAYER_BF16(attn_out_weight, "attn_out.weight", 2, d1152_1152);
+        QWEN3VL_LAYER_F32(attn_out_bias, "attn_out.bias", 1, d1152);
+        QWEN3VL_LAYER_F32(norm2_weight, "ln2.weight", 1, d1152);
+        QWEN3VL_LAYER_F32(norm2_bias, "ln2.bias", 1, d1152);
+        QWEN3VL_LAYER_BF16(ffn_up_weight, "ffn_up.weight", 2, d1152_4304);
+        QWEN3VL_LAYER_F32(ffn_up_bias, "ffn_up.bias", 1, d4304);
+        QWEN3VL_LAYER_BF16(ffn_down_weight, "ffn_down.weight", 2, d4304_1152);
+        QWEN3VL_LAYER_F32(ffn_down_bias, "ffn_down.bias", 1, d1152);
+#undef QWEN3VL_LAYER_F32
+#undef QWEN3VL_LAYER_BF16
+#undef QWEN3VL_LAYER_OFFSET
+    }
+}
+
 static ds4_tensor *deepseek4_vision_required_tensor(
         const ds4_model *m,
         const char *name,
@@ -7349,6 +7510,7 @@ typedef struct {
     ds4_gpu_tensor *ffn_u;
     ds4_gpu_tensor *ffn_m;
     ds4_gpu_tensor *logits;
+    ds4_gpu_tensor *rope_positions;
     ds4_gpu_tensor *hidden_row[QWEN38_CUDA_PREFILL_CHUNK];
     ds4_gpu_tensor *xnorm_row[QWEN38_CUDA_PREFILL_CHUNK];
     uint32_t ctx_size;
@@ -7390,7 +7552,7 @@ static void qwen38_gpu_state_free(ds4_qwen38_gpu_state *st) {
     QWEN38_GPU_FREE(o); QWEN38_GPU_FREE(attn); QWEN38_GPU_FREE(proj);
     QWEN38_GPU_FREE(q_full); QWEN38_GPU_FREE(k); QWEN38_GPU_FREE(v);
     QWEN38_GPU_FREE(ffn_g); QWEN38_GPU_FREE(ffn_u); QWEN38_GPU_FREE(ffn_m);
-    QWEN38_GPU_FREE(logits);
+    QWEN38_GPU_FREE(logits); QWEN38_GPU_FREE(rope_positions);
 #undef QWEN38_GPU_FREE
     memset(st, 0, sizeof(*st));
 }
@@ -7425,6 +7587,9 @@ static int qwen38_gpu_state_init(ds4_qwen38_gpu_state *st, uint32_t ctx_size) {
     QWEN38_GPU_ALLOC(ffn_u, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_N_FF);
     QWEN38_GPU_ALLOC(ffn_m, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_N_FF);
     QWEN38_GPU_ALLOC(logits, DS4_N_VOCAB);
+    if (!qwen38_gpu_alloc_bytes(&st->rope_positions,
+            QWEN38_CUDA_PREFILL_CHUNK * 3u * sizeof(uint32_t),
+            "rope_positions")) goto fail;
 #undef QWEN38_GPU_ALLOC
     for (uint32_t i = 0; i < QWEN38_CUDA_PREFILL_CHUNK; i++) {
         st->hidden_row[i] = ds4_gpu_tensor_view(st->hidden,
@@ -8108,19 +8273,69 @@ static int qwen38_gpu_forward_chunk(ds4_qwen38_gpu_state *st,
                                     const ds4_model *m,
                                     const ds4_qwen38_weights *w,
                                     const int *tokens, uint32_t n_tokens,
-                                    uint32_t start_pos, float *logits) {
+                                    uint32_t start_pos,
+                                    const ds4_vision_span *images,
+                                    size_t image_count,
+                                    uint32_t *logical_pos,
+                                    float *logits) {
 #define QWEN38_CHUNK_CHECK(expr, label) \
     do { if (!(expr)) { fprintf(stderr, "ds4: Qwen CUDA chunk %s failed\n", label); return 0; } } while (0)
-    if (!tokens || n_tokens == 0 || n_tokens > QWEN38_CUDA_PREFILL_CHUNK ||
+    if (!tokens || !logical_pos || n_tokens == 0 ||
+        n_tokens > QWEN38_CUDA_PREFILL_CHUNK ||
         start_pos >= st->ctx_size || n_tokens > st->ctx_size - start_pos ||
+        (image_count != 0 && !images) ||
         w->token_embd->type != DS4_TENSOR_IQ2_S) return 0;
+    uint32_t rope_positions[QWEN38_CUDA_PREFILL_CHUNK * 3u];
+    uint32_t next_logical = *logical_pos;
     for (uint32_t i = 0; i < n_tokens; i++) {
         if (tokens[i] < 0 || (uint32_t)tokens[i] >= DS4_N_VOCAB) return 0;
-        QWEN38_CHUNK_CHECK(ds4_gpu_embed_token_quant_tensor(
-            st->hidden_row[i], m->map, m->size, w->token_embd->abs_offset,
-            w->token_embd->type, DS4_N_VOCAB, (uint32_t)tokens[i],
-            QWEN38_N_EMBD), "token embedding");
+        const uint32_t raw_pos = start_pos + i;
+        const ds4_vision_span *image = NULL;
+        uint32_t image_row = 0;
+        for (size_t si = 0; si < image_count; si++) {
+            const uint64_t begin = images[si].token_start;
+            const uint64_t end = begin + images[si].embedding.token_count;
+            if (raw_pos >= begin && raw_pos < end) {
+                image = &images[si];
+                image_row = raw_pos - images[si].token_start;
+                break;
+            }
+        }
+        if (image) {
+            const ds4_vision_embedding *emb = &image->embedding;
+            if (!emb->data || emb->grid_width == 0u || emb->grid_height == 0u ||
+                (uint64_t)emb->grid_width * emb->grid_height != emb->token_count ||
+                image_row >= emb->token_count) return 0;
+            QWEN38_CHUNK_CHECK(ds4_gpu_tensor_write(
+                st->hidden_row[i], 0,
+                emb->data + (uint64_t)image_row * QWEN38_N_EMBD,
+                QWEN38_N_EMBD * sizeof(float)), "image embedding");
+            rope_positions[i * 3u] = next_logical;
+            rope_positions[i * 3u + 1u] =
+                next_logical + image_row / emb->grid_width;
+            rope_positions[i * 3u + 2u] =
+                next_logical + image_row % emb->grid_width;
+            if (image_row + 1u == emb->token_count) {
+                const uint32_t span = emb->grid_width > emb->grid_height ?
+                    emb->grid_width : emb->grid_height;
+                if (next_logical > UINT32_MAX - span) return 0;
+                next_logical += span;
+            }
+        } else {
+            QWEN38_CHUNK_CHECK(ds4_gpu_embed_token_quant_tensor(
+                st->hidden_row[i], m->map, m->size, w->token_embd->abs_offset,
+                w->token_embd->type, DS4_N_VOCAB, (uint32_t)tokens[i],
+                QWEN38_N_EMBD), "token embedding");
+            rope_positions[i * 3u] = next_logical;
+            rope_positions[i * 3u + 1u] = next_logical;
+            rope_positions[i * 3u + 2u] = next_logical;
+            if (next_logical == UINT32_MAX) return 0;
+            next_logical++;
+        }
     }
+    QWEN38_CHUNK_CHECK(ds4_gpu_tensor_write(
+        st->rope_positions, 0, rope_positions,
+        (uint64_t)n_tokens * 3u * sizeof(uint32_t)), "MRoPE positions");
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_qwen38_layer_weights *l = &w->layer[il];
@@ -8158,7 +8373,8 @@ static int qwen38_gpu_forward_chunk(ds4_qwen38_gpu_state *st,
                 st->q_full, st->attn_k_layer[ga], st->attn_v_layer[ga],
                 st->k, st->v, m->map, m->size,
                 l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
-                start_pos, n_tokens, st->ctx_size), "GA prepare");
+                st->rope_positions, start_pos, n_tokens, st->ctx_size),
+                "GA prepare");
             QWEN38_CHUNK_CHECK(ds4_gpu_qwen38_ga_chunk(
                 st->attn, st->q_full, st->attn_k_layer[ga],
                 st->attn_v_layer[ga], start_pos, n_tokens, st->ctx_size),
@@ -8196,6 +8412,7 @@ static int qwen38_gpu_forward_chunk(ds4_qwen38_gpu_state *st,
     QWEN38_CHUNK_CHECK(ds4_gpu_tensor_read(
         st->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)),
         "logit read");
+    *logical_pos = next_logical;
 #undef QWEN38_CHUNK_CHECK
     return 1;
 }
@@ -40305,6 +40522,7 @@ typedef enum {
     DS4_VISION_NONE = 0,
     DS4_VISION_GLM53,
     DS4_VISION_DEEPSEEK4,
+    DS4_VISION_QWEN3VL,
 } ds4_vision_kind;
 
 struct ds4_engine {
@@ -40319,6 +40537,7 @@ struct ds4_engine {
 #ifndef DS4_NO_GPU
     ds4_glm53_vision_weights vision_weights;
     ds4_deepseek4_vision_weights deepseek4_vision_weights;
+    ds4_qwen3vl_vision_weights qwen3vl_vision_weights;
 #endif
     ds4_vision_kind vision_kind;
     int vision_image_token;
@@ -41466,6 +41685,7 @@ static void vocab_free(ds4_vocab *vocab) {
  * marker, and either <think> or </think> depending on the requested mode.  Max
  * thinking is only a prompt prefix: the model still enters through <think>. */
 static void chat_push_bos_sequence(const ds4_vocab *vocab, token_vec *out) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN38) return;
     token_vec_push(out, vocab->bos_id);
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && vocab->sop_id >= 0)
         token_vec_push(out, vocab->sop_id);
@@ -41523,6 +41743,11 @@ static void encode_chat_prompt(
         if (ds4_think_mode_enabled(think_mode) && vocab->think_start_id >= 0) {
             token_vec_push(out, vocab->think_start_id);
             bpe_tokenize_text(vocab, "\n", out);
+        } else if (vocab->think_start_id >= 0 && vocab->think_end_id >= 0) {
+            token_vec_push(out, vocab->think_start_id);
+            bpe_tokenize_text(vocab, "\n\n", out);
+            token_vec_push(out, vocab->think_end_id);
+            bpe_tokenize_text(vocab, "\n\n", out);
         }
         return;
     }
@@ -41573,6 +41798,8 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
         {"[gMASK]",                vocab->bos_id},
         {"<sop>",                  vocab->sop_id},
         {"<|system|>",             vocab->system_id},
+        {"<|im_start|>",           vocab->system_id},
+        {"<|im_end|>",             vocab->im_end_id},
         {"<｜User｜>",              vocab->user_id},
         {"<｜Assistant｜>",         vocab->assistant_id},
         {"<|user|>",               vocab->user_id},
@@ -41691,6 +41918,24 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     if (!role) role = "user";
     if (!content) content = "";
 
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN38) {
+        const bool tool = !strcmp(role, "tool") || !strcmp(role, "function");
+        token_vec_push(tokens, vocab->system_id);
+        if (tool) {
+            bpe_tokenize_text(vocab, "user\n<tool_response>\n", tokens);
+            bpe_tokenize_tool_response_text(vocab, content, tokens);
+            bpe_tokenize_text(vocab, "\n</tool_response>", tokens);
+        } else {
+            const char *qwen_role = !strcmp(role, "developer") ? "system" : role;
+            bpe_tokenize_text(vocab, qwen_role, tokens);
+            bpe_tokenize_text(vocab, "\n", tokens);
+            tokenize_rendered_chat_vocab(vocab, content, tokens);
+        }
+        token_vec_push(tokens, vocab->im_end_id);
+        bpe_tokenize_text(vocab, "\n", tokens);
+        return;
+    }
+
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (!strcmp(role, "system") || !strcmp(role, "developer")) {
             if (vocab->system_id >= 0) token_vec_push(tokens, vocab->system_id);
@@ -41737,6 +41982,19 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
     token_vec_push(tokens, e->vocab.assistant_id);
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN38) {
+        bpe_tokenize_text(&e->vocab, "assistant\n", tokens);
+        if (ds4_think_mode_enabled(think_mode)) {
+            token_vec_push(tokens, e->vocab.think_start_id);
+            bpe_tokenize_text(&e->vocab, "\n", tokens);
+        } else {
+            token_vec_push(tokens, e->vocab.think_start_id);
+            bpe_tokenize_text(&e->vocab, "\n\n", tokens);
+            token_vec_push(tokens, e->vocab.think_end_id);
+            bpe_tokenize_text(&e->vocab, "\n\n", tokens);
+        }
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
         !ds4_think_mode_enabled(think_mode)) {
         token_vec_push(tokens, e->vocab.think_start_id);
@@ -56198,6 +56456,7 @@ struct ds4_session {
     size_t checkpoint_image_count;
     const ds4_vision_span *sync_images;
     size_t sync_image_count;
+    uint32_t qwen38_rope_pos;
     token_vec greedy_splitkv_segment;
     float *logits;
     float *sample_probs;
@@ -64901,7 +65160,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (opt->backend != DS4_BACKEND_METAL &&
             opt->backend != DS4_BACKEND_CUDA) {
             fprintf(stderr,
-                    "ds4: GLM-5.3 vision requires --metal, --cuda, or --rocm\n");
+                    "ds4: vision inference requires --metal or --cuda\n");
             free(e);
             *out = NULL;
             return 1;
@@ -65007,9 +65266,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (opt->warm_weights) model_warm_weights(&e->model);
     config_validate_model(&e->model);
     if (opt->vision_path && opt->vision_path[0]) {
-        if (!ds4_model_is_glm53() && !g_ds4_flash_vision_exp) {
+        if (!ds4_model_is_glm53() && !g_ds4_flash_vision_exp &&
+            DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_QWEN38) {
             fprintf(stderr,
-                    "ds4: --vision requires GLM-5.3 or the pinned "
+                    "ds4: --vision requires GLM-5.3, Qwen3.8, or the pinned "
                     "DeepSeek V4 Flash Vision-Exp model\n");
             ds4_engine_close(e);
             *out = NULL;
@@ -65036,6 +65296,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 ds4_die("unexpected GLM-5.3 vision token IDs");
             }
             e->vision_kind = DS4_VISION_GLM53;
+        } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN38) {
+            qwen3vl_vision_weights_bind(
+                    &e->qwen3vl_vision_weights, &e->vision_model);
+            e->vision_kind = DS4_VISION_QWEN3VL;
         } else {
             deepseek4_vision_weights_bind(
                     &e->deepseek4_vision_weights, &e->vision_model);
@@ -65267,6 +65531,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
         vocab_load(&e->vocab, &e->model);
+        if (e->vision_kind == DS4_VISION_QWEN3VL) {
+            e->vision_start_token = vocab_lookup(
+                    &e->vocab, "<|vision_start|>");
+            e->vision_image_token = vocab_lookup(
+                    &e->vocab, "<|image_pad|>");
+            e->vision_end_token = vocab_lookup(
+                    &e->vocab, "<|vision_end|>");
+        }
 #ifndef DS4_NO_GPU
         if (e->backend == DS4_BACKEND_CUDA) {
             e->metal_ready = ds4_gpu_init() != 0;
@@ -66421,7 +66693,8 @@ int ds4_chat_append_multimodal_message(
         return 1;
     }
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA &&
-        e->vision_kind != DS4_VISION_DEEPSEEK4) {
+        e->vision_kind != DS4_VISION_DEEPSEEK4 &&
+        e->vision_kind != DS4_VISION_QWEN3VL) {
         if (error && error_cap)
             snprintf(error, error_cap, "model does not support image messages");
         return 0;
@@ -66435,7 +66708,12 @@ int ds4_chat_append_multimodal_message(
 
     const int old_len = tokens->len;
     ds4_vocab *vocab = &e->vocab;
-    if (tool) {
+    const bool qwen = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN38;
+    if (qwen) {
+        token_vec_push(tokens, vocab->user_id);
+        bpe_tokenize_text(vocab, tool ? "user\n<tool_response>\n" : "user\n",
+                          tokens);
+    } else if (tool) {
         if (vocab->observation_id >= 0) token_vec_push(tokens, vocab->observation_id);
         tokenize_rendered_chat_vocab(vocab, "<tool_response>", tokens);
     } else {
@@ -66461,8 +66739,13 @@ int ds4_chat_append_multimodal_message(
         }
         moved++;
     }
-    if (tool)
+    if (qwen) {
+        if (tool) bpe_tokenize_text(vocab, "\n</tool_response>", tokens);
+        token_vec_push(tokens, vocab->im_end_id);
+        bpe_tokenize_text(vocab, "\n", tokens);
+    } else if (tool) {
         tokenize_rendered_chat_vocab(vocab, "</tool_response>", tokens);
+    }
     return 1;
 }
 
@@ -66534,18 +66817,36 @@ static int ds4_engine_vision_encode_image(
         ds4_deepseek4_image_patches_free(&patches);
     } else {
         ds4_image_patches patches = {0};
-        if (!ds4_image_preprocess_glm53(&patches, image, 16u, 8000u,
-                                        error, error_cap)) return 0;
-        token_count = patches.image_token_count;
-        embedding = malloc((size_t)token_count * 4096u * sizeof(float));
-        if (embedding) {
+        if (e->vision_kind == DS4_VISION_QWEN3VL) {
+            if (!ds4_image_preprocess_qwen3vl(
+                    &patches, image, 8u, 4096u, error, error_cap)) return 0;
+            token_count = patches.image_token_count;
+            embedding = malloc((size_t)token_count * 5120u * sizeof(float));
+            if (embedding) {
 #ifndef DS4_NO_GPU
-            ok = ds4_gpu_glm53_vision_encode(
-                    embedding, patches.patches,
-                    patches.grid_height, patches.grid_width,
-                    e->vision_model.map, e->vision_model.size,
-                    &e->vision_weights);
+                ok = ds4_gpu_qwen3vl_vision_encode(
+                        embedding, patches.patches,
+                        patches.grid_height, patches.grid_width,
+                        e->vision_model.map, e->vision_model.size,
+                        &e->qwen3vl_vision_weights);
 #endif
+            }
+            grid_width = patches.grid_width / 2u;
+            grid_height = patches.grid_height / 2u;
+        } else {
+            if (!ds4_image_preprocess_glm53(&patches, image, 16u, 8000u,
+                                            error, error_cap)) return 0;
+            token_count = patches.image_token_count;
+            embedding = malloc((size_t)token_count * 4096u * sizeof(float));
+            if (embedding) {
+#ifndef DS4_NO_GPU
+                ok = ds4_gpu_glm53_vision_encode(
+                        embedding, patches.patches,
+                        patches.grid_height, patches.grid_width,
+                        e->vision_model.map, e->vision_model.size,
+                        &e->vision_weights);
+#endif
+            }
         }
         content_width = patches.content_width;
         content_height = patches.content_height;
@@ -66560,9 +66861,21 @@ static int ds4_engine_vision_encode_image(
         free(embedding);
         if (error && error_cap)
             snprintf(error, error_cap, "%s vision inference failed",
-                     e->vision_kind == DS4_VISION_DEEPSEEK4
-                         ? "DeepSeek V4" : "GLM-5.3");
+                     e->vision_kind == DS4_VISION_DEEPSEEK4 ? "DeepSeek V4" :
+                     e->vision_kind == DS4_VISION_QWEN3VL ? "Qwen3-VL" :
+                     "GLM-5.3");
         return 0;
+    }
+    if (getenv("DS4_VISION_EMBD_DUMP")) {
+        const uint32_t width = e->vision_kind == DS4_VISION_QWEN3VL ? 5120u : 4096u;
+        double sum = 0.0;
+        for (uint64_t i = 0; i < (uint64_t)token_count * width; i++)
+            sum += embedding[i];
+        fprintf(stderr, "VISION_EMBD tokens=%u width=%u sum=%.9f\n",
+                token_count, width, sum);
+        const uint32_t dump = width < 16u ? width : 16u;
+        for (uint32_t i = 0; i < dump; i++)
+            fprintf(stderr, "VE%u %.9f\n", i, embedding[i]);
     }
     out->data = embedding;
     out->token_count = token_count;
@@ -68971,6 +69284,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 return 1;
             }
             s->checkpoint.len = 0;
+            s->qwen38_rope_pos = 0u;
         }
         const bool nll_dump = getenv("DS4_NLL_DUMP") != NULL;
         const bool sequential = nll_dump || getenv("DS4_EMBD_DUMP") ||
@@ -69007,12 +69321,16 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 const uint32_t left = (uint32_t)(prompt->len - i);
                 chunk = left < chunk_cap ? left : chunk_cap;
             }
-            const int ok = sequential ?
+            const bool token_path = sequential && s->sync_image_count == 0u &&
+                s->qwen38_rope_pos == (uint32_t)i;
+            const int ok = token_path ?
                 qwen38_gpu_forward_token(&s->qwen38_gpu_state, &e->model,
                     &e->qwen38_weights, prompt->v[i], (uint32_t)i, s->logits) :
                 qwen38_gpu_forward_chunk(&s->qwen38_gpu_state, &e->model,
-                    &e->qwen38_weights, prompt->v + i, chunk,
-                    (uint32_t)i, s->logits);
+                    &e->qwen38_weights, prompt->v + i, chunk, (uint32_t)i,
+                    s->sync_images, s->sync_image_count,
+                    &s->qwen38_rope_pos, s->logits);
+            if (ok && token_path) s->qwen38_rope_pos++;
             if (!ok) {
                 snprintf(err, errlen, "Qwen CUDA forward failed at token %d", i);
                 s->checkpoint_valid = false;
@@ -70879,9 +71197,20 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             s->checkpoint_valid = false;
             return 1;
         }
-        if (!qwen38_gpu_forward_token(&s->qwen38_gpu_state, &e->model,
-                                      &e->qwen38_weights, token,
-                                      (uint32_t)s->checkpoint.len, s->logits)) {
+        const uint32_t raw_pos = (uint32_t)s->checkpoint.len;
+        int ok = 0;
+        if (s->qwen38_rope_pos == raw_pos) {
+            ok = qwen38_gpu_forward_token(&s->qwen38_gpu_state, &e->model,
+                                          &e->qwen38_weights, token,
+                                          raw_pos, s->logits);
+            if (ok) s->qwen38_rope_pos++;
+        } else {
+            ok = qwen38_gpu_forward_chunk(&s->qwen38_gpu_state, &e->model,
+                                          &e->qwen38_weights, &token, 1u,
+                                          raw_pos, NULL, 0u,
+                                          &s->qwen38_rope_pos, s->logits);
+        }
+        if (!ok) {
             if (errlen) snprintf(err, errlen, "Qwen3.8 CUDA decode failed");
             s->checkpoint_valid = false;
             return 1;

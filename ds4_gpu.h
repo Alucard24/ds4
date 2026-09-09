@@ -3152,6 +3152,7 @@ int ds4_gpu_qwen38_ga_prepare_chunk(
         uint64_t              model_size,
         uint64_t              q_norm_offset,
         uint64_t              k_norm_offset,
+        const ds4_gpu_tensor *rope_positions,
         uint32_t              start_pos,
         uint32_t              n_tokens,
         uint32_t              ctx_size);
@@ -3170,6 +3171,50 @@ int ds4_gpu_qwen38_ga_chunk(
         uint32_t              start_pos,
         uint32_t              n_tokens,
         uint32_t              ctx_size);
+
+#ifndef DS4_QWEN3VL_VISION_TYPES_DEFINED
+#define DS4_QWEN3VL_VISION_TYPES_DEFINED
+#define DS4_QWEN3VL_VISION_LAYERS 27u
+
+typedef struct {
+    uint64_t norm1_weight;
+    uint64_t norm1_bias;
+    uint64_t qkv_weight;
+    uint64_t qkv_bias;
+    uint64_t attn_out_weight;
+    uint64_t attn_out_bias;
+    uint64_t norm2_weight;
+    uint64_t norm2_bias;
+    uint64_t ffn_up_weight;
+    uint64_t ffn_up_bias;
+    uint64_t ffn_down_weight;
+    uint64_t ffn_down_bias;
+} ds4_qwen3vl_vision_layer_weights;
+
+typedef struct {
+    uint64_t patch_weight_0;
+    uint64_t patch_weight_1;
+    uint64_t patch_bias;
+    uint64_t position_embedding;
+    uint64_t post_norm_weight;
+    uint64_t post_norm_bias;
+    uint64_t merger_up_weight;
+    uint64_t merger_up_bias;
+    uint64_t merger_down_weight;
+    uint64_t merger_down_bias;
+    ds4_qwen3vl_vision_layer_weights layer[DS4_QWEN3VL_VISION_LAYERS];
+} ds4_qwen3vl_vision_weights;
+#endif
+
+/* Encode normalized RGB 16x16 patches in 2x2 merge-tile order. */
+int ds4_gpu_qwen3vl_vision_encode(
+        float                           *out,
+        const float                     *patches,
+        uint32_t                         grid_h,
+        uint32_t                         grid_w,
+        const void                      *model_map,
+        uint64_t                         model_size,
+        const ds4_qwen3vl_vision_weights *weights);
 
 #ifndef DS4_GLM53_VISION_TYPES_DEFINED
 #define DS4_GLM53_VISION_TYPES_DEFINED
