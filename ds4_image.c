@@ -275,6 +275,15 @@ int ds4_image_decode_memory(
         return ok;
     }
 
+    const char *container = ds4_image_container_kind(encoded, encoded_len);
+    if (container) {
+        char message[160];
+        snprintf(message, sizeof(message),
+                 "%s is a video/animation container; pass an ordered frame "
+                 "list of PNG/JPEG stills instead", container);
+        ds4_image_error(error, error_cap, message);
+        return 0;
+    }
     ds4_image_error(error, error_cap, "image must be JPEG or PNG");
     return 0;
 }
@@ -313,14 +322,46 @@ int ds4_image_decode_file(
         goto io_error;
     }
     fclose(fp);
-    int ok = ds4_image_decode_memory(out, data, len, error, error_cap);
+    char detail[192] = {0};
+    int ok = ds4_image_decode_memory(out, data, len, detail, sizeof(detail));
     free(data);
+    if (!ok && error && error_cap) {
+        /* Name the file: a frame list is easy to get wrong, and the decoder
+         * message alone does not say which entry failed. */
+        snprintf(error, error_cap, "%s: %s", path,
+                 detail[0] ? detail : "unsupported image");
+    }
     return ok;
 
 io_error:
     if (error && error_cap) snprintf(error, error_cap, "%s: %s", path, strerror(errno));
     fclose(fp);
     return 0;
+}
+
+/* Video and animation containers ds4 recognizes by magic bytes. They are all
+ * decoded upstream by an external tool: the engine takes an ordered frame list.
+ * Recognizing them here turns a container path into an explicit refusal
+ * instead of a decoder error or, on the text paths, binary read as prompt. */
+const char *ds4_image_container_kind(const uint8_t *encoded,
+                                     size_t encoded_len) {
+    if (!encoded || encoded_len < 12u) return NULL;
+    /* ISO base media file format: the `ftyp` box sits at offset 4 (MP4, MOV,
+     * M4V, 3GP). */
+    if (memcmp(encoded + 4, "ftyp", 4) == 0) return "MP4/MOV";
+    if (memcmp(encoded, "\x1a\x45\xdf\xa3", 4) == 0) return "Matroska/WebM";
+    if (memcmp(encoded, "RIFF", 4) == 0 && encoded_len >= 12u) {
+        if (memcmp(encoded + 8, "AVI ", 4) == 0) return "AVI";
+        if (memcmp(encoded + 8, "WEBP", 4) == 0) return "animated WebP";
+    }
+    if (memcmp(encoded, "GIF87a", 6) == 0 ||
+        memcmp(encoded, "GIF89a", 6) == 0) return "GIF";
+    if (memcmp(encoded, "OggS", 4) == 0) return "Ogg";
+    if (memcmp(encoded, "FLV", 3) == 0) return "FLV";
+    if (encoded[0] == 0x00 && encoded[1] == 0x00 &&
+        encoded[2] == 0x01 && (encoded[3] == 0xba || encoded[3] == 0xb3))
+        return "MPEG transport/program stream";
+    return NULL;
 }
 
 void ds4_image_free(ds4_image *image) {

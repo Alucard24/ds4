@@ -77,6 +77,11 @@ void ds4_image_fingerprint_sequence(uint8_t out[32],
                                     const ds4_image *images,
                                     size_t image_count);
 
+/* Name the video/animation container a buffer starts with, or NULL when it is
+ * not one. ds4 decodes still JPEG/PNG only: a container must be reported as
+ * such instead of being offered to the decoder or, worse, read as text. */
+const char *ds4_image_container_kind(const uint8_t *encoded, size_t encoded_len);
+
 int ds4_image_preprocess_glm53(
         ds4_image_patches *out,
         const ds4_image   *image,

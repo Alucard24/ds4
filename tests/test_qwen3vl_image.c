@@ -102,7 +102,54 @@ static void check_white(uint32_t width, uint32_t height,
     ds4_image_free(&image);
 }
 
+/* Video containers must be refused by name, never handed to the still decoder
+ * and never accepted as a decode of something else. */
+static void check_container_rejected(const uint8_t *bytes, size_t len,
+                                     const char *expect) {
+    const char *kind = ds4_image_container_kind(bytes, len);
+    require(kind != NULL, "container not recognized");
+    require(strstr(kind, expect) != NULL, "container misnamed");
+    ds4_image image = {0};
+    char error[160] = {0};
+    require(!ds4_image_decode_memory(&image, bytes, len, error, sizeof(error)),
+            "container was accepted as a still image");
+    require(strstr(error, kind) != NULL && strstr(error, "frame list") != NULL,
+            error[0] ? error : "container rejection message missing");
+    require(image.rgb == NULL, "rejected container produced pixels");
+}
+
+static void check_containers(void) {
+    static const uint8_t mp4[32] = {
+        0x00, 0x00, 0x00, 0x20, 'f','t','y','p', 'i','s','o','m'
+    };
+    static const uint8_t mkv[16] = { 0x1a, 0x45, 0xdf, 0xa3, 0x01, 0x00 };
+    static const uint8_t webm[16] = {
+        0x1a, 0x45, 0xdf, 0xa3, 0x9f, 0x42, 0x86, 0x81
+    };
+    static const uint8_t avi[16] = {
+        'R','I','F','F', 0x10, 0x00, 0x00, 0x00, 'A','V','I',' ','L','I','S','T'
+    };
+    static const uint8_t webp[16] = {
+        'R','I','F','F', 0x10, 0x00, 0x00, 0x00, 'W','E','B','P','V','P','8','X'
+    };
+    static const uint8_t gif87[16] = { 'G','I','F','8','7','a', 0x01, 0x00 };
+    static const uint8_t gif89[16] = { 'G','I','F','8','9','a', 0x01, 0x00 };
+    static const uint8_t ogg[16] = { 'O','g','g','S', 0x00, 0x02 };
+    check_container_rejected(mp4, sizeof(mp4), "MP4");
+    check_container_rejected(mkv, sizeof(mkv), "Matroska");
+    check_container_rejected(webm, sizeof(webm), "WebM");
+    check_container_rejected(avi, sizeof(avi), "AVI");
+    check_container_rejected(webp, sizeof(webp), "WebP");
+    check_container_rejected(gif87, sizeof(gif87), "GIF");
+    check_container_rejected(gif89, sizeof(gif89), "GIF");
+    check_container_rejected(ogg, sizeof(ogg), "Ogg");
+    /* A short buffer is not a container, and neither is an ordinary header. */
+    require(ds4_image_container_kind(mp4, 4u) == NULL,
+            "short buffer reported as a container");
+}
+
 int main(void) {
+    check_containers();
     check_white(224u, 224u, 224u, 224u, 49u, 0u);
     check_white(512u, 507u, 512u, 512u, 256u, 5u);
     check_white(1u, 1u, 96u, 96u, 9u, 0u);

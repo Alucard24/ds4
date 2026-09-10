@@ -4,6 +4,7 @@
 #include "ds4_tp.h"
 #include "ds4_help.h"
 #include "ds4_prompt_prefix.h"
+#include "ds4_image.h"
 #include "linenoise.h"
 
 /* ds4 CLI.
@@ -1716,6 +1717,17 @@ static bool cli_file_has_image_magic(const char *path) {
            (n >= 2 && magic[0] == 0xff && magic[1] == 0xd8);
 }
 
+/* A container is neither an image to decode nor text to prompt with, so
+ * /read has to name it instead of ingesting the bytes as a prompt. */
+static const char *cli_file_container_kind(const char *path) {
+    unsigned char magic[16] = {0};
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
+    size_t n = fread(magic, 1, sizeof(magic), fp);
+    fclose(fp);
+    return n ? ds4_image_container_kind(magic, n) : NULL;
+}
+
 static int run_repl(ds4_engine *engine, cli_config *cfg) {
     repl_chat chat;
     if (repl_chat_init(engine, &chat, cfg) != 0) return 1;
@@ -1858,6 +1870,11 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
             char *path = trim_inplace(cmd + 5);
             if (!path[0]) {
                 fprintf(stderr, "ds4: /read needs a file path\n");
+            } else if (cli_file_container_kind(path)) {
+                fprintf(stderr,
+                        "ds4: %s is a %s video/animation container; export an "
+                        "ordered frame list of PNG/JPEG stills and use /video\n",
+                        path, cli_file_container_kind(path));
             } else if (cli_file_has_image_magic(path)) {
                 char image_error[256] = {0};
                 ds4_vision_embedding image = {0};
