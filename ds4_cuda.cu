@@ -27409,45 +27409,59 @@ __global__ static void qwen38_ga_kv_prepare_kernel(
         (uint64_t)head * QWEN38_CUDA_GA_HEAD_DIM + tid]);
 }
 
+/* Every warp reproduces the same 256-element FP32 score reduction while each
+ * thread retains one value accumulator. Recomputing the small dot product per
+ * warp keeps the block barrier-free; K/Q reads are shared through L1. The
+ * reduction grouping remains identical and no N^2 score buffer is allocated. */
 __global__ static void qwen38_ga_decode_kernel(
         float *out, const float *q_full, const __half *k_cache,
         const __half *v_cache, uint32_t start_pos) {
+    constexpr uint32_t queries_per_kv =
+        QWEN38_CUDA_GA_HEADS / QWEN38_CUDA_GA_HEADS_KV;
     const uint32_t head = blockIdx.x;
     const uint32_t row = blockIdx.y;
     const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
     if (head >= QWEN38_CUDA_GA_HEADS || tid >= QWEN38_CUDA_GA_HEAD_DIM) return;
+    const uint32_t kv_head = head / queries_per_kv;
     const uint32_t pos = start_pos + row;
-    const uint32_t kv_head = head /
-        (QWEN38_CUDA_GA_HEADS / QWEN38_CUDA_GA_HEADS_KV);
     const float *q = q_full + (uint64_t)row * 12288u +
         (uint64_t)head * 2u * QWEN38_CUDA_GA_HEAD_DIM;
     const float gate = q[QWEN38_CUDA_GA_HEAD_DIM + tid];
-    __shared__ float partial[QWEN38_CUDA_GA_HEAD_DIM];
-    __shared__ float old_scale, probability, denominator, maximum;
-    if (tid == 0u) { denominator = 0.0f; maximum = -INFINITY; }
-    __syncthreads();
     float acc = 0.0f;
+    float denominator = 0.0f;
+    float maximum = -INFINITY;
     for (uint32_t token = 0; token <= pos; token++) {
-        const uint64_t base = (uint64_t)token * 1024u +
+        const uint64_t base = (uint64_t)token *
+                QWEN38_CUDA_GA_HEADS_KV * QWEN38_CUDA_GA_HEAD_DIM +
             (uint64_t)kv_head * QWEN38_CUDA_GA_HEAD_DIM;
-        partial[tid] = q[tid] * __half2float(k_cache[base + tid]);
-        __syncthreads();
-        for (uint32_t stride = 128u; stride; stride >>= 1u) {
-            if (tid < stride) partial[tid] += partial[tid + stride];
-            __syncthreads();
-        }
-        if (tid == 0u) {
-            const float score = partial[0] * 0.0625f;
+        float p0 = q[lane] * __half2float(k_cache[base + lane]);
+        p0 += q[lane + 128u] * __half2float(k_cache[base + lane + 128u]);
+        float p1 = q[lane + 64u] * __half2float(k_cache[base + lane + 64u]);
+        p1 += q[lane + 192u] * __half2float(k_cache[base + lane + 192u]);
+        p0 += p1;
+        float p2 = q[lane + 32u] * __half2float(k_cache[base + lane + 32u]);
+        p2 += q[lane + 160u] * __half2float(k_cache[base + lane + 160u]);
+        float p3 = q[lane + 96u] * __half2float(k_cache[base + lane + 96u]);
+        p3 += q[lane + 224u] * __half2float(k_cache[base + lane + 224u]);
+        p2 += p3;
+        p0 += p2;
+        const float dot = warp_sum_f32(p0);
+        float old_scale = 0.0f;
+        float probability = 0.0f;
+        if (lane == 0u) {
+            const float score = dot * 0.0625f;
             const float next_max = fmaxf(maximum, score);
             old_scale = isfinite(maximum) ? expf(maximum - next_max) : 0.0f;
             probability = expf(score - next_max);
             denominator = denominator * old_scale + probability;
             maximum = next_max;
         }
-        __syncthreads();
+        old_scale = __shfl_sync(0xffffffffu, old_scale, 0);
+        probability = __shfl_sync(0xffffffffu, probability, 0);
         acc = acc * old_scale + probability * __half2float(v_cache[base + tid]);
-        __syncthreads();
     }
+    denominator = __shfl_sync(0xffffffffu, denominator, 0);
     out[(uint64_t)row * QWEN38_CUDA_VALUE_DIM +
         (uint64_t)head * QWEN38_CUDA_GA_HEAD_DIM + tid] =
         acc / denominator * (1.0f / (1.0f + expf(-gate)));
@@ -27470,7 +27484,7 @@ extern "C" int ds4_gpu_qwen38_gdn_chunk(
         uint64_t norm_offset, uint32_t n_tokens) {
     const uint64_t state_count = 48ull * 128 * 128;
     if (!out || !conv_state || !recurrent_state || !qkv || !z || !alpha || !beta ||
-        n_tokens == 0u || n_tokens > 128u ||
+        n_tokens == 0u || n_tokens > 256u ||
         out->bytes < (uint64_t)n_tokens*6144*4 ||
         conv_state->bytes < 3ull*10240*4 ||
         recurrent_state->bytes < state_count*4 ||
@@ -27518,7 +27532,7 @@ extern "C" int ds4_gpu_qwen38_ga_prepare_chunk(
         uint64_t k_norm_offset, const ds4_gpu_tensor *rope_positions,
         uint32_t start_pos, uint32_t n_tokens, uint32_t ctx_size) {
     if (!q_full || !k_cache || !v_cache || !k || !v || n_tokens == 0u ||
-        n_tokens > 128u || start_pos >= ctx_size || n_tokens > ctx_size-start_pos ||
+        n_tokens > 256u || start_pos >= ctx_size || n_tokens > ctx_size-start_pos ||
         q_full->bytes < (uint64_t)n_tokens*12288*4 ||
         k->bytes < (uint64_t)n_tokens*1024*4 ||
         v->bytes < (uint64_t)n_tokens*1024*4 ||
@@ -27560,12 +27574,12 @@ extern "C" int ds4_gpu_qwen38_ga_chunk(
         const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
         uint32_t start_pos, uint32_t n_tokens, uint32_t ctx_size) {
     if (!out || !q_full || !k_cache || !v_cache || n_tokens == 0u ||
-        n_tokens > 128u || start_pos >= ctx_size || n_tokens > ctx_size-start_pos ||
+        n_tokens > 256u || start_pos >= ctx_size || n_tokens > ctx_size-start_pos ||
         out->bytes < (uint64_t)n_tokens*6144*4 ||
         q_full->bytes < (uint64_t)n_tokens*12288*4 ||
         k_cache->bytes < (uint64_t)ctx_size*1024*2 ||
         v_cache->bytes < (uint64_t)ctx_size*1024*2) return 0;
-    const dim3 grid(24u, n_tokens, 1u);
+    const dim3 grid(QWEN38_CUDA_GA_HEADS, n_tokens, 1u);
     qwen38_ga_decode_kernel<<<grid,256,0,cuda_decode_stream()>>>(
         (float *)out->ptr, (const float *)q_full->ptr,
         (const __half *)k_cache->ptr, (const __half *)v_cache->ptr, start_pos);

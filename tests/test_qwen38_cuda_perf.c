@@ -55,6 +55,12 @@ int main(int argc, char **argv) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, 4096) != 0) fail("session create");
     char err[256] = {0};
+    double c0 = now_seconds();
+    if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0) fail(err);
+    double c1 = now_seconds();
+    /* First sync includes lazy CUDA library/scratch initialization. Rebuild the
+     * same prompt in the same session for a steady-state prefill measurement. */
+    ds4_session_invalidate(session);
     double p0 = now_seconds();
     if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0) fail(err);
     double p1 = now_seconds();
@@ -67,6 +73,8 @@ int main(int argc, char **argv) {
     }
     double d1 = now_seconds();
     printf("LOAD_SECONDS %.6f\n", t1 - t0);
+    printf("COLD_PREFILL_TOKENS %d SECONDS %.6f TPS %.3f\n",
+           prompt.len, c1 - c0, prompt.len / (c1 - c0));
     printf("PREFILL_TOKENS %d SECONDS %.6f TPS %.3f\n",
            prompt.len, p1 - p0, prompt.len / (p1 - p0));
     printf("DECODE_TOKENS %d SECONDS %.6f TPS %.3f\n",

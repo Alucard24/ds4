@@ -7225,7 +7225,7 @@ static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_
 #define QWEN38_VALUE_DIM   (QWEN38_N_V_HEAD * QWEN38_SSM_DIM)       /* 6144 */
 #define QWEN38_CONV_DIM    (2 * QWEN38_KEY_DIM + QWEN38_VALUE_DIM)  /* 10240 */
 #define QWEN38_GA_KV_DIM   (QWEN38_N_HEAD_KV * QWEN38_HEAD_DIM)     /* 1024 */
-#define QWEN38_CUDA_PREFILL_CHUNK 128u
+#define QWEN38_CUDA_PREFILL_CHUNK 256u
 
 typedef struct {
     const ds4_tensor *attn_norm;
