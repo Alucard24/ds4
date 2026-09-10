@@ -180,6 +180,7 @@ typedef struct {
     uint32_t layout;
     uint32_t grid_width;
     uint32_t grid_height;
+    uint32_t grid_time; /* 1 for images; ceil(frame_count/2) for Qwen video. */
     uint32_t width;
     uint32_t height;
     uint32_t content_width;
@@ -269,6 +270,21 @@ int ds4_engine_vision_encode_memory(ds4_engine *e,
                                     ds4_vision_embedding *out,
                                     char *error,
                                     size_t error_cap);
+/* Qwen3-VL temporal merge consumes adjacent frame pairs. Frames must have
+ * equal source dimensions; an odd final frame is paired with itself. */
+int ds4_engine_vision_encode_frame_files(ds4_engine *e,
+                                         const char *const *paths,
+                                         size_t frame_count,
+                                         ds4_vision_embedding *out,
+                                         char *error,
+                                         size_t error_cap);
+int ds4_engine_vision_encode_frame_memory(ds4_engine *e,
+                                          const uint8_t *const *encoded,
+                                          const size_t *encoded_len,
+                                          size_t frame_count,
+                                          ds4_vision_embedding *out,
+                                          char *error,
+                                          size_t error_cap);
 void ds4_vision_embedding_free(ds4_vision_embedding *embedding);
 int ds4_prompt_append_vision(ds4_engine *e,
                              ds4_tokens *tokens,
@@ -552,6 +568,12 @@ int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
+/* Qwen3.8 MTP draft head (sidecar GGUF, CUDA only).  The proposal is the
+ * draft block's argmax for the position after the last committed token, which
+ * is the same quantity the trunk head predicts; it is only a proposal and is
+ * never committed without verification. */
+bool ds4_engine_has_qwen38_mtp(ds4_engine *e);
+bool ds4_session_qwen38_mtp_proposal(const ds4_session *s, int *out_token);
 bool ds4_engine_mtp_exact_sampling(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 

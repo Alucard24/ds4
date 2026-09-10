@@ -3206,7 +3206,18 @@ typedef struct {
 } ds4_qwen3vl_vision_weights;
 #endif
 
-/* Encode normalized RGB 16x16 patches in 2x2 merge-tile order. */
+/* Encode normalized RGB 16x16 patches in 2x2 merge-tile order. Still images
+ * feed the same patch rows to both temporal convolution slices; video feeds
+ * two adjacent frame rows to the pair entry point. */
+int ds4_gpu_qwen3vl_vision_encode_pair(
+        float                           *out,
+        const float                     *patches_0,
+        const float                     *patches_1,
+        uint32_t                         grid_h,
+        uint32_t                         grid_w,
+        const void                      *model_map,
+        uint64_t                         model_size,
+        const ds4_qwen3vl_vision_weights *weights);
 int ds4_gpu_qwen3vl_vision_encode(
         float                           *out,
         const float                     *patches,

@@ -20,6 +20,11 @@ METAL_SRCS := $(wildcard metal/*.metal)
 ROCM_SRCS := $(wildcard rocm/*.cuh)
 DS4_TEST_MODEL ?= ds4flash.gguf
 DS4_TEST_MTP ?= gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
+DS4_TEST_QWEN38_MODEL ?= /home/diegom/AI-Projects/llama.cpp/build/bin/models/Qwen3.8-27B/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf
+DS4_TEST_QWEN38_MMPROJ ?= /home/diegom/AI-Projects/llama.cpp/build/bin/models/Qwen3.8-27B/mmproj-Qwen3.8-27B-BF16.gguf
+DS4_TEST_QWEN38_IMAGE ?= /tmp/white224.png
+DS4_TEST_QWEN38_MTP ?= /home/diegom/AI-Projects/llama.cpp/build/bin/models/Qwen3.8-27B/Qwen3.8-27B-NVFP4-MTP-HIGHEST.gguf
+DS4_TEST_QWEN38_PROMPT ?= The capital of France is Paris. The largest ocean on Earth is the Pacific Ocean.
 DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
 DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
 
@@ -368,6 +373,20 @@ test-qwen3vl-vision: tests/test_qwen3vl_vision
 
 tests/test_qwen3vl_session.o: tests/test_qwen3vl_session.c ds4.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
+
+tests/test_qwen38_mtp.o: tests/test_qwen38_mtp.c ds4.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
+
+tests/test_qwen38_mtp: tests/test_qwen38_mtp.o $(CORE_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+.PHONY: test-qwen38-mtp
+test-qwen38-mtp: tests/test_qwen38_mtp
+	@if [ ! -f "$(DS4_TEST_QWEN38_MODEL)" ] || [ ! -f "$(DS4_TEST_QWEN38_MTP)" ]; then \
+		echo "error: set DS4_TEST_QWEN38_MODEL and DS4_TEST_QWEN38_MTP"; exit 2; \
+	fi
+	./tests/test_qwen38_mtp "$(DS4_TEST_QWEN38_MODEL)" \
+		"$(DS4_TEST_QWEN38_MTP)" "$(DS4_TEST_QWEN38_PROMPT)"
 
 tests/test_qwen3vl_session: tests/test_qwen3vl_session.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)

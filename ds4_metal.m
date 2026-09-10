@@ -46798,6 +46798,17 @@ static int deepseek4_vision_debug_dump(
     return ok;
 }
 
+int ds4_gpu_qwen3vl_vision_encode_pair(
+        float *out, const float *patches_0, const float *patches_1,
+        uint32_t grid_h, uint32_t grid_w, const void *model_map,
+        uint64_t model_size, const ds4_qwen3vl_vision_weights *weights) {
+    (void)out; (void)patches_0; (void)patches_1;
+    (void)grid_h; (void)grid_w; (void)model_map; (void)model_size;
+    (void)weights;
+    fprintf(stderr, "ds4: Qwen3-VL vision is currently CUDA-only\n");
+    return 0;
+}
+
 int ds4_gpu_qwen3vl_vision_encode(
         float                            *out,
         const float                      *patches,

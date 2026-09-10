@@ -183,6 +183,77 @@ int main(int argc, char **argv) {
     ds4_tokens_free(&multi_prompt);
     ds4_vision_embedding_free(&multi_spans[0].embedding);
     ds4_vision_embedding_free(&multi_spans[1].embedding);
+
+    const char *video_paths[] = {argv[3], argv[3], argv[3]};
+    ds4_vision_embedding video = {0};
+    require(ds4_engine_vision_encode_frame_files(
+                engine, video_paths, 3u, &video, error, sizeof(error)),
+            error[0] ? error : "three-frame video encode");
+    require(video.grid_time == 2u && video.token_count == 98u,
+            "video temporal grid");
+    ds4_tokens video_prompt = {0};
+    ds4_chat_begin(engine, &video_prompt);
+    ds4_vision_span video_span = {0};
+    const char *video_parts[] = {"", ""};
+    require(ds4_chat_append_multimodal_message(
+                engine, &video_prompt, "user", video_parts, &video, 1u,
+                &video_span, error, sizeof(error)),
+            error[0] ? error : "video prompt");
+    ds4_chat_append_assistant_prefix(engine, &video_prompt, DS4_THINK_NONE);
+    require(ds4_session_create(&session, engine, 192) == 0,
+            "video session create");
+    require(ds4_session_sync_multimodal(session, &video_prompt, &video_span, 1u,
+                                        error, sizeof(error)) == 0,
+            error[0] ? error : "video sync");
+    require(ds4_session_sync_multimodal(session, &video_prompt, &video_span, 1u,
+                                        error, sizeof(error)) == 0,
+            error[0] ? error : "video no-op sync");
+
+    /* The temporal merge must survive the on-disk payload: the identity keeps
+     * the frame-sequence fingerprint and the MRoPE frontier beyond the token
+     * count, so a restore has to reproduce the exact next-token logits. */
+    float *video_before = malloc((size_t)n_vocab * sizeof(float));
+    float *video_after = malloc((size_t)n_vocab * sizeof(float));
+    require(video_before && video_after, "video logit buffers");
+    require(ds4_session_vision_state_matches(session, &video_span, 1u),
+            "video identity mismatch");
+    ds4_vision_span video_wrong = video_span;
+    video_wrong.embedding.fingerprint[0] ^= 1u;
+    require(!ds4_session_vision_state_matches(session, &video_wrong, 1u),
+            "video fingerprint mismatch accepted");
+    FILE *video_cache = tmpfile();
+    require(video_cache != NULL, "video payload file");
+    const uint64_t video_bytes = ds4_session_payload_bytes(session);
+    require(ds4_session_save_payload(session, video_cache, error,
+                                     sizeof(error)) == 0,
+            error[0] ? error : "video payload save");
+    require((uint64_t)ftello(video_cache) == video_bytes,
+            "video payload byte count");
+    const int video_probe = video_prompt.v[0];
+    require(ds4_session_eval(session, video_probe, error, sizeof(error)) == 0,
+            error[0] ? error : "video payload probe");
+    require(ds4_session_copy_logits(session, video_after, n_vocab) == n_vocab,
+            "video probe logits");
+    require(fseeko(video_cache, 0, SEEK_SET) == 0, "video payload rewind");
+    require(ds4_session_load_payload(session, video_cache, video_bytes,
+                                     error, sizeof(error)) == 0,
+            error[0] ? error : "video payload load");
+    require(ds4_session_pos(session) == video_prompt.len,
+            "video payload restored position");
+    require(ds4_session_vision_state_matches(session, &video_span, 1u),
+            "restored video identity mismatch");
+    require(ds4_session_eval(session, video_probe, error, sizeof(error)) == 0,
+            error[0] ? error : "restored video payload probe");
+    require(ds4_session_copy_logits(session, video_before, n_vocab) == n_vocab,
+            "restored video probe logits");
+    require(memcmp(video_before, video_after, (size_t)n_vocab * sizeof(float)) == 0,
+            "video payload changed continuation logits");
+    fclose(video_cache);
+    free(video_after);
+    free(video_before);
+    ds4_session_free(session);
+    ds4_tokens_free(&video_prompt);
+    ds4_vision_embedding_free(&video_span.embedding);
     ds4_engine_close(engine);
     puts("Qwen3-VL CUDA session PASS");
     return 0;

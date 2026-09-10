@@ -395,15 +395,17 @@ static int qwen3vl_patch_matmul_f16(
     return qwen3vl_launch_ok("Qwen3-VL patch F16 output conversion");
 }
 
-extern "C" int ds4_gpu_qwen3vl_vision_encode(
+extern "C" int ds4_gpu_qwen3vl_vision_encode_pair(
         float                            *out,
-        const float                      *patches,
+        const float                      *patches_0,
+        const float                      *patches_1,
         uint32_t                          grid_h,
         uint32_t                          grid_w,
         const void                       *model_map,
         uint64_t                          model_size,
         const ds4_qwen3vl_vision_weights *weights) {
-    if (!out || !patches || !model_map || !weights || grid_h == 0u ||
+    if (!out || !patches_0 || !patches_1 || !model_map || !weights ||
+        grid_h == 0u ||
         grid_w == 0u || (grid_h & 1u) != 0u || (grid_w & 1u) != 0u ||
         grid_h > UINT32_MAX / grid_w) return 0;
     const uint32_t rows = grid_h * grid_w;
@@ -417,7 +419,8 @@ extern "C" int ds4_gpu_qwen3vl_vision_encode(
     if (row4304 > SIZE_MAX / sizeof(float) ||
         merged5120 > SIZE_MAX / sizeof(float)) return 0;
 
-    ds4_gpu_tensor *patch = NULL, *a = NULL, *b = NULL, *qkv = NULL;
+    ds4_gpu_tensor *patch_0 = NULL, *patch_1 = NULL;
+    ds4_gpu_tensor *a = NULL, *b = NULL, *qkv = NULL;
     ds4_gpu_tensor *attn = NULL, *ffn = NULL, *merged = NULL, *output = NULL;
     ds4_gpu_tensor *cur = NULL, *tmp = NULL;
     const float    *bias = NULL, *position = NULL;
@@ -427,7 +430,8 @@ extern "C" int ds4_gpu_qwen3vl_vision_encode(
         name_ = ds4_gpu_tensor_alloc((count_) * sizeof(float)); \
         if (!(name_)) goto cleanup; \
     } while (0)
-    QWEN3VL_ALLOC(patch, row768);
+    QWEN3VL_ALLOC(patch_0, row768);
+    QWEN3VL_ALLOC(patch_1, row768);
     QWEN3VL_ALLOC(a, row1152);
     QWEN3VL_ALLOC(b, row1152);
     QWEN3VL_ALLOC(qkv, row3456);
@@ -437,12 +441,15 @@ extern "C" int ds4_gpu_qwen3vl_vision_encode(
     QWEN3VL_ALLOC(output, merged5120);
 #undef QWEN3VL_ALLOC
 
-    if (!ds4_gpu_tensor_write(patch, 0, patches, row768 * sizeof(float)) ||
+    if (!ds4_gpu_tensor_write(patch_0, 0, patches_0,
+                              row768 * sizeof(float)) ||
+        !ds4_gpu_tensor_write(patch_1, 0, patches_1,
+                              row768 * sizeof(float)) ||
         !ds4_gpu_begin_commands()) goto cleanup;
     ok = qwen3vl_patch_matmul_f16(
-            a, model_map, model_size, weights->patch_weight_0, patch, rows);
+            a, model_map, model_size, weights->patch_weight_0, patch_0, rows);
     if (ok) ok = qwen3vl_patch_matmul_f16(
-            b, model_map, model_size, weights->patch_weight_1, patch, rows);
+            b, model_map, model_size, weights->patch_weight_1, patch_1, rows);
     if (ok) {
         bias = qwen3vl_weight(model_map, model_size, weights->patch_bias,
                               QWEN3VL_WIDTH, "Qwen3-VL patch bias");
@@ -640,8 +647,22 @@ cleanup:
     ds4_gpu_tensor_free(qkv);
     ds4_gpu_tensor_free(b);
     ds4_gpu_tensor_free(a);
-    ds4_gpu_tensor_free(patch);
+    ds4_gpu_tensor_free(patch_1);
+    ds4_gpu_tensor_free(patch_0);
     return ok;
+}
+
+extern "C" int ds4_gpu_qwen3vl_vision_encode(
+        float                            *out,
+        const float                      *patches,
+        uint32_t                          grid_h,
+        uint32_t                          grid_w,
+        const void                       *model_map,
+        uint64_t                          model_size,
+        const ds4_qwen3vl_vision_weights *weights) {
+    return ds4_gpu_qwen3vl_vision_encode_pair(
+        out, patches, patches, grid_h, grid_w,
+        model_map, model_size, weights);
 }
 
 #undef DS4_QWEN3VL_VISION_STREAM

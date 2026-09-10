@@ -1298,6 +1298,7 @@ static void print_repl_help(void) {
     puts("  /power N       Set GPU duty cycle percentage, 1..100.");
     puts("  /steer F       Set FFN steering for subsequent tokens; no value shows it.");
     puts("  /read FILE     Submit a text file, PNG, or JPEG.");
+    puts("  /video F...    Submit 2..128 ordered PNG/JPEG video frames (Qwen3-VL).");
     puts("  /quit, /exit   Leave the prompt.");
     puts("  Ctrl+C         Stop generation and return to the prompt.");
 }
@@ -1825,6 +1826,34 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
         } else if (!strcmp(cmd, "/quit") || !strcmp(cmd, "/exit")) {
             linenoiseFree(line);
             break;
+        } else if (!strncmp(cmd, "/video", 6) &&
+                   (cmd[6] == '\0' || isspace((unsigned char)cmd[6]))) {
+            const char *paths[128];
+            size_t frame_count = 0u;
+            char *save = NULL;
+            for (char *path = strtok_r(trim_inplace(cmd + 6), " \t", &save);
+                 path && frame_count < 128u;
+                 path = strtok_r(NULL, " \t", &save)) {
+                paths[frame_count++] = path;
+            }
+            if (frame_count < 2u) {
+                fprintf(stderr, "ds4: /video needs at least two frame files\n");
+            } else {
+                char video_error[256] = {0};
+                ds4_vision_embedding video = {0};
+                if (!ds4_engine_vision_encode_frame_files(
+                        engine, paths, frame_count, &video,
+                        video_error, sizeof(video_error))) {
+                    fprintf(stderr, "ds4: /video failed: %s\n",
+                            video_error[0] ? video_error : "video encoding failed");
+                } else {
+                    fprintf(stderr,
+                            "ds4: video %zu frames, temporal grid %u, %u tokens\n",
+                            frame_count, video.grid_time, video.token_count);
+                    rc = run_chat_turn(engine, cfg, &chat, "", &video);
+                    ds4_vision_embedding_free(&video);
+                }
+            }
         } else if (!strncmp(cmd, "/read", 5) && (cmd[5] == '\0' || isspace((unsigned char)cmd[5]))) {
             char *path = trim_inplace(cmd + 5);
             if (!path[0]) {

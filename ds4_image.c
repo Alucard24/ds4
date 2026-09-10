@@ -329,6 +329,23 @@ void ds4_image_free(ds4_image *image) {
     memset(image, 0, sizeof(*image));
 }
 
+void ds4_image_fingerprint_sequence(uint8_t out[32],
+                                    const ds4_image *images,
+                                    size_t image_count) {
+    ds4_sha256 sha;
+    ds4_sha256_init(&sha);
+    static const char domain[] = "ds4-qwen3vl-frame-sequence-v1";
+    ds4_sha256_update(&sha, domain, sizeof(domain));
+    ds4_sha256_update(&sha, &image_count, sizeof(image_count));
+    for (size_t i = 0; i < image_count; i++) {
+        ds4_sha256_update(&sha, &images[i].width, sizeof(images[i].width));
+        ds4_sha256_update(&sha, &images[i].height, sizeof(images[i].height));
+        ds4_sha256_update(&sha, images[i].fingerprint,
+                          sizeof(images[i].fingerprint));
+    }
+    ds4_sha256_final(&sha, out);
+}
+
 static uint32_t ds4_align_u32(uint32_t value, uint32_t factor) {
     return (value + factor - 1) / factor * factor;
 }

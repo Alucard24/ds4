@@ -73,6 +73,9 @@ int ds4_image_decode_file(
         size_t error_cap);
 
 void ds4_image_free(ds4_image *image);
+void ds4_image_fingerprint_sequence(uint8_t out[32],
+                                    const ds4_image *images,
+                                    size_t image_count);
 
 int ds4_image_preprocess_glm53(
         ds4_image_patches *out,

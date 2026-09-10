@@ -68,6 +68,37 @@ int main(int argc, char **argv) {
            embedding.content_width, embedding.content_height,
            embedding.grid_width, embedding.grid_height,
            embedding.token_count, sum);
+
+    const char *pair_paths[] = {argv[3], argv[3]};
+    ds4_vision_embedding pair = {0};
+    if (!ds4_engine_vision_encode_frame_files(
+            engine, pair_paths, 2u, &pair, error, sizeof(error)) ||
+        pair.grid_time != 1u || pair.token_count != embedding.token_count ||
+        memcmp(pair.data, embedding.data, count * sizeof(float)) != 0) {
+        fprintf(stderr, "Qwen3-VL identical frame-pair mismatch: %s\n", error);
+        ds4_vision_embedding_free(&pair);
+        ds4_vision_embedding_free(&embedding);
+        ds4_engine_close(engine);
+        return 1;
+    }
+    ds4_vision_embedding_free(&pair);
+
+    const char *odd_paths[] = {argv[3], argv[3], argv[3]};
+    ds4_vision_embedding odd = {0};
+    if (!ds4_engine_vision_encode_frame_files(
+            engine, odd_paths, 3u, &odd, error, sizeof(error)) ||
+        odd.grid_time != 2u ||
+        odd.token_count != 2u * embedding.token_count ||
+        memcmp(odd.data, embedding.data, count * sizeof(float)) != 0 ||
+        memcmp(odd.data + count, embedding.data, count * sizeof(float)) != 0) {
+        fprintf(stderr, "Qwen3-VL odd frame-sequence mismatch: %s\n", error);
+        ds4_vision_embedding_free(&odd);
+        ds4_vision_embedding_free(&embedding);
+        ds4_engine_close(engine);
+        return 1;
+    }
+    ds4_vision_embedding_free(&odd);
+    puts("Qwen3-VL temporal frame merge PASS");
     ds4_vision_embedding_free(&embedding);
     ds4_engine_close(engine);
     return 0;
