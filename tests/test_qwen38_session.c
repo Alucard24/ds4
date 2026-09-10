@@ -16,6 +16,22 @@ static void require(int ok, const char *message) {
 
 static double rebuild_logit_tolerance;
 
+static void check_qwen_tokenizer(ds4_engine *e) {
+    static const int expected[] = {
+        9419, 11, 50203, 1892, 220, 99986, 171405, 59720, 102, 9008,
+        237, 121, 373, 235, 88995, 119, 198, 248045, 74455, 198,
+    };
+    ds4_tokens got = {0};
+    ds4_tokenize_rendered_chat(e,
+        "Hello, café — 中文 العربية 👩🏽‍💻\n<|im_start|>assistant\n",
+        &got);
+    require(got.len == (int)(sizeof(expected) / sizeof(expected[0])),
+            "multilingual tokenizer length mismatch");
+    require(memcmp(got.v, expected, sizeof(expected)) == 0,
+            "multilingual/special tokenizer IDs differ from llama.cpp");
+    ds4_tokens_free(&got);
+}
+
 static void same_logits(ds4_session *s, const float *want, int n,
                         double tolerance) {
     float *got = malloc(n*sizeof(float));
@@ -47,6 +63,7 @@ int main(int argc, char **argv) {
     ds4_engine *e = NULL;
     require(ds4_engine_open(&e, &opt) == 0, "engine open");
     require(ds4_engine_model_id(e) == 4, "requires Qwen3.8 model");
+    check_qwen_tokenizer(e);
     ds4_tokens tokens = {0};
     ds4_tokenize_text(e, argv[2], &tokens);
     require(tokens.len > 1 && tokens.len < 127, "text must encode to 2..126 tokens");

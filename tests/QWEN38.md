@@ -136,12 +136,21 @@ round-trips a multimodal disk payload and verifies exact continuation plus
 restoration of the compressed MRoPE frontier and image fingerprint identity.
 
 `ds4-server` selects Qwen's `<|im_start|>` chat rendering and native
-`<tool_call><function=...>` syntax for model id 4. Its model aliases are
-`qwen3.8-27b`, `qwen3.8-27b-chat`, and `qwen3.8-27b-reasoner`. CUDA image smoke
-tests pass through `/v1/chat/completions`, `/v1/responses`, and Anthropic
-`/v1/messages`; a second image-bearing turn reuses the live multimodal prefix
-(75 cached tokens in the checked 224x224 case). Server parser/rendering unit
-tests are included in `./ds4_test --server`.
+`<tool_call><function=...>` syntax for model id 4. Its system tool instructions,
+normalized OpenAI function-schema objects, whitespace trimming, historical
+thinking wrappers, grouped `<tool_response>` turns, and assistant generation
+prefix match the GGUF `tokenizer.chat_template`. OpenAI and Anthropic SSE project Qwen
+tool calls incrementally without exposing the sampled XML; parameter values are
+buffered until `</parameter>` because Qwen does not declare whether a value is a
+JSON literal or a string in its opening tag. Multiple calls and tool tags split
+across stream updates are covered by `./ds4_test --server`.
+
+The model aliases are `qwen3.8-27b`, `qwen3.8-27b-chat`, and
+`qwen3.8-27b-reasoner`. CUDA image smoke tests pass through
+`/v1/chat/completions`, `/v1/responses`, and Anthropic `/v1/messages`; a second
+image-bearing turn reuses the live multimodal prefix (75 cached tokens in the
+checked 224x224 case). The CUDA session gate also compares multilingual UTF-8
+and `<|im_start|>` token IDs with llama.cpp.
 
 The parity investigation found two concrete front-end differences. llama.cpp's
 patch convolution emits FP16 im2col/GEMM results even though the two sidecar
@@ -202,7 +211,13 @@ make tests/test_qwen38_cuda_perf CUDA_ARCH=sm_120
 
 The benchmark reports both the first (`COLD_PREFILL`) sync and a same-session
 rebuild (`PREFILL`), because the first sync also populates ds4's lazy CUDA model
-cache. On the RTX 5070 Ti, three runs of a 538-token local prompt had median
+cache. Qwen takes its dedicated engine-open branch after registering the model
+map, before the generic eager tensor-span preparation used by the other model
+families; the missing generic preload log is therefore expected rather than a
+stale-binary symptom. An experimental 256 MiB-span eager preload increased load
+time, while the default 1792 MiB span could not fit alongside the 16GB working
+set, so neither behavior was retained. On the RTX 5070 Ti, three runs of a
+538-token local prompt had median
 load 0.214 s, cold prefill 248.3 tok/s, steady-state prefill 799.2 tok/s, and
 128-token decode 39.95 tok/s. Before this pass, the same prompt measured cold
 prefill 220.9 tok/s, steady-state prefill 689.8 tok/s, and decode 32.57 tok/s.
