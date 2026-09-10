@@ -7298,6 +7298,14 @@ typedef struct {
     const ds4_tensor *ffn_gate;
     const ds4_tensor *ffn_up;
     const ds4_tensor *ffn_down;
+    /* GDN layers store ssm_alpha and ssm_beta as two contiguous BF16 tensors.
+     * Their 96 output rows are then one contiguous weight block, so a single
+     * matvec can produce both and save a kernel launch per layer in decode --
+     * the op count, not the math, is what is being reduced.  Kept only when the
+     * file layout actually allows it. */
+    ds4_tensor alpha_beta;
+    bool alpha_beta_fused;
+    bool alpha_beta_beta_first;
 } ds4_qwen38_layer_weights;
 
 typedef struct {
@@ -7316,6 +7324,11 @@ typedef struct {
  * optimum: every extra draft re-reads the draft block and the full LM head, so
  * five and six cost more than they recover on the 16GB CUDA target. */
 #define QWEN38_MTP_DRAFT_MAX 4u
+/* One distribution per draft row, plus the target buffer the residual reuses.
+ * Sizing this at three was the bug the distribution gate caught: the fourth
+ * draft wrote past the allocation and the target build then overwrote a draft
+ * distribution, which silently corrupted the acceptance ratios. */
+#define QWEN38_MTP_SPEC_PROP_BUFFERS (QWEN38_MTP_DRAFT_MAX + 1u)
 
 typedef struct {
     const ds4_tensor *eh_proj;          /* (2*n_embd, n_embd) */
@@ -7391,6 +7404,23 @@ static void weights_bind_qwen38_layer(ds4_qwen38_layer_weights *l,
         l->ssm_a = required_tensorf(m, "blk.%u.ssm_a", il);
         l->ssm_beta = required_tensorf(m, "blk.%u.ssm_beta.weight", il);
         l->ssm_alpha = required_tensorf(m, "blk.%u.ssm_alpha.weight", il);
+        if (l->ssm_beta->type == l->ssm_alpha->type &&
+            l->ssm_beta->ndim == 2 && l->ssm_alpha->ndim == 2 &&
+            l->ssm_beta->dim[0] == l->ssm_alpha->dim[0] &&
+            l->ssm_beta->dim[1] == l->ssm_alpha->dim[1]) {
+            const bool alpha_first = l->ssm_alpha->abs_offset +
+                                         l->ssm_alpha->bytes ==
+                                     l->ssm_beta->abs_offset;
+            const bool beta_first = l->ssm_beta->abs_offset +
+                                        l->ssm_beta->bytes ==
+                                    l->ssm_alpha->abs_offset;
+            if (alpha_first || beta_first) {
+                l->alpha_beta = *(beta_first ? l->ssm_beta : l->ssm_alpha);
+                l->alpha_beta.dim[1] *= 2u;
+                l->alpha_beta_fused = true;
+                l->alpha_beta_beta_first = beta_first;
+            }
+        }
         l->ssm_norm = required_tensorf(m, "blk.%u.ssm_norm.weight", il);
         l->ssm_out = required_tensorf(m, "blk.%u.ssm_out.weight", il);
         qwen38_check_tensor(l->attn_qkv, "attn_qkv", 2, QWEN38_N_EMBD, QWEN38_CONV_DIM, true);
@@ -7691,6 +7721,10 @@ typedef struct {
     ds4_gpu_tensor *z;
     ds4_gpu_tensor *alpha;
     ds4_gpu_tensor *beta;
+    /* Fused alpha+beta rows with views onto its two halves. */
+    ds4_gpu_tensor *alpha_beta;
+    ds4_gpu_tensor *ab_low;
+    ds4_gpu_tensor *ab_high;
     ds4_gpu_tensor *o;
     ds4_gpu_tensor *attn;
     ds4_gpu_tensor *proj;
@@ -7789,6 +7823,7 @@ static void qwen38_gpu_state_free(ds4_qwen38_gpu_state *st) {
     QWEN38_GPU_FREE(hidden); QWEN38_GPU_FREE(xnorm);
     QWEN38_GPU_FREE(qkv); QWEN38_GPU_FREE(z);
     QWEN38_GPU_FREE(alpha); QWEN38_GPU_FREE(beta);
+    QWEN38_GPU_FREE(ab_low); QWEN38_GPU_FREE(ab_high); QWEN38_GPU_FREE(alpha_beta);
     QWEN38_GPU_FREE(o); QWEN38_GPU_FREE(attn); QWEN38_GPU_FREE(proj);
     QWEN38_GPU_FREE(q_full); QWEN38_GPU_FREE(k); QWEN38_GPU_FREE(v);
     QWEN38_GPU_FREE(ffn_g); QWEN38_GPU_FREE(ffn_u); QWEN38_GPU_FREE(ffn_m);
@@ -7815,6 +7850,7 @@ static int qwen38_gpu_state_init(ds4_qwen38_gpu_state *st, uint32_t ctx_size) {
     QWEN38_GPU_ALLOC(z, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_VALUE_DIM);
     QWEN38_GPU_ALLOC(alpha, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_N_V_HEAD);
     QWEN38_GPU_ALLOC(beta, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_N_V_HEAD);
+    QWEN38_GPU_ALLOC(alpha_beta, 2ull * QWEN38_N_V_HEAD);
     QWEN38_GPU_ALLOC(o, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_VALUE_DIM);
     QWEN38_GPU_ALLOC(attn, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_VALUE_DIM);
     QWEN38_GPU_ALLOC(proj, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_N_EMBD);
@@ -7846,6 +7882,12 @@ static int qwen38_gpu_state_init(ds4_qwen38_gpu_state *st, uint32_t ctx_size) {
             QWEN38_N_EMBD * sizeof(float));
         if (!st->hidden_row[i] || !st->xnorm_row[i] || !st->out_norm_row[i]) goto fail;
     }
+    st->ab_low = ds4_gpu_tensor_view(st->alpha_beta, 0,
+                                     QWEN38_N_V_HEAD * sizeof(float));
+    st->ab_high = ds4_gpu_tensor_view(st->alpha_beta,
+                                      QWEN38_N_V_HEAD * sizeof(float),
+                                      QWEN38_N_V_HEAD * sizeof(float));
+    if (!st->ab_low || !st->ab_high) goto fail;
     for (uint32_t i = 0; i < 48; i++) {
         st->ssm_layer[i] = ds4_gpu_tensor_view(st->ssm_state,
             i * (48ull * 128 * 128 * sizeof(float)),
@@ -8517,6 +8559,15 @@ static int qwen38_gpu_debug_prefix(const ds4_gpu_tensor *t, uint32_t count,
     return 1;
 }
 
+/* Launch-count A/B switch: the fused call is the release path, and the escape
+ * hatch exists so the two can be measured against each other on one binary. */
+static bool qwen38_gdn_proj_fuse_enabled(void) {
+    static int cached = -1;
+    if (cached < 0)
+        cached = getenv("DS4_GDN_PROJ_FUSE_DISABLE") == NULL ? 1 : 0;
+    return cached != 0;
+}
+
 static int qwen38_gpu_forward_token(ds4_qwen38_gpu_state *st,
                                     const ds4_model *m,
                                     const ds4_qwen38_weights *w,
@@ -8560,11 +8611,24 @@ static int qwen38_gpu_forward_token(ds4_qwen38_gpu_state *st,
             const uint32_t gdn = il - il / 4u;
             QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->qkv, m, l->attn_qkv, st->xnorm), "GDN QKV");
             QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->z, m, l->attn_gate, st->xnorm), "GDN gate");
-            QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->beta, m, l->ssm_beta, st->xnorm), "GDN beta");
-            QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->alpha, m, l->ssm_alpha, st->xnorm), "GDN alpha");
+            /* One launch for both 48-row projections when the file stores
+             * them contiguously; the GDN kernel still reads a 48-row alpha and
+             * a 48-row beta, here as views of the shared buffer. */
+            const ds4_gpu_tensor *alpha_t = st->alpha;
+            const ds4_gpu_tensor *beta_t = st->beta;
+            if (l->alpha_beta_fused && qwen38_gdn_proj_fuse_enabled()) {
+                QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->alpha_beta, m,
+                                                   &l->alpha_beta, st->xnorm),
+                                 "GDN alpha+beta");
+                alpha_t = l->alpha_beta_beta_first ? st->ab_high : st->ab_low;
+                beta_t = l->alpha_beta_beta_first ? st->ab_low : st->ab_high;
+            } else {
+                QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->beta, m, l->ssm_beta, st->xnorm), "GDN beta");
+                QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->alpha, m, l->ssm_alpha, st->xnorm), "GDN alpha");
+            }
             QWEN38_GPU_CHECK(ds4_gpu_qwen38_gdn_decode(
                 st->o, st->conv_layer[gdn], st->ssm_layer[gdn],
-                st->qkv, st->z, st->alpha, st->beta,
+                st->qkv, st->z, alpha_t, beta_t,
                 m->map, m->size, l->ssm_conv1d->abs_offset,
                 l->ssm_a->abs_offset, l->ssm_dt->abs_offset,
                 l->ssm_norm->abs_offset), "GDN recurrence");
@@ -43116,6 +43180,60 @@ static bool sample_fast_top_p(
     return true;
 }
 
+/* Build the sampling distribution used when top_p filtering is disabled.
+ *
+ * This is the one place that turns logits into probabilities for the
+ * temperature/min-p path, so ordinary sampling and speculative verification
+ * cannot drift apart: both read the same buffer produced here.  `probs_out`
+ * holds unnormalized probabilities with -1.0f for tokens removed by min-p, and
+ * `sum_out` the mass that survived. */
+static bool build_probs_top_p_ge_1(const float *logits, uint32_t n_vocab,
+                                   float temperature, float min_p,
+                                   float *probs_out, float *sum_out) {
+    const float min_rel = min_p > 0.0f ? min_p : 0.0f;
+    if (min_rel > 1.0f) return false;
+    float max_logit = DS4_NEG_INF;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        if (logits[i] > max_logit) max_logit = logits[i];
+    }
+    if (!isfinite(max_logit)) return false;
+
+    /* Find a conservative log-space rejection boundary using the same expf
+     * implementation as the probability path. Values below this boundary are
+     * guaranteed to fail min-p, avoiding an expf for the overwhelming majority
+     * of a large vocabulary. Near-boundary values still take the ordinary expf
+     * comparison. */
+    float reject_scaled = DS4_NEG_INF;
+    bool have_reject_scaled = false;
+    if (min_rel > 0.0f && isfinite(min_rel)) {
+        float cutoff = logf(min_rel);
+        for (int i = 0; i < 8 && isfinite(cutoff); i++) {
+            cutoff = nextafterf(cutoff, -FLT_MAX);
+            if (expf(cutoff) < min_rel) {
+                reject_scaled = cutoff;
+                have_reject_scaled = true;
+                break;
+            }
+        }
+    }
+
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        const float v = logits[i];
+        probs_out[i] = -1.0f;
+        if (!isfinite(v)) continue;
+        const float scaled = (v - max_logit) / temperature;
+        if (have_reject_scaled && scaled <= reject_scaled) continue;
+        const float p = expf(scaled);
+        if (p < min_rel) continue;
+        probs_out[i] = p;
+        sum += p;
+    }
+    if (sum <= 0.0f || !isfinite(sum)) return false;
+    *sum_out = sum;
+    return true;
+}
+
 static int sample_full_vocab(
         const float *logits,
         uint32_t     n_vocab,
@@ -43155,40 +43273,10 @@ static int sample_full_vocab(
 
     if (top_p >= 1.0f) {
         float sum = 0.0f;
-        const float min_rel = min_p > 0.0f ? min_p : 0.0f;
-        if (min_rel > 1.0f) return best;
-
-        /* Find a conservative log-space rejection boundary using the same
-         * expf implementation as the probability path. Values below this
-         * boundary are guaranteed to fail min-p, avoiding an expf for the
-         * overwhelming majority of a large vocabulary. Near-boundary values
-         * still take the ordinary expf comparison. */
-        float reject_scaled = DS4_NEG_INF;
-        bool have_reject_scaled = false;
-        if (min_rel > 0.0f && isfinite(min_rel)) {
-            float cutoff = logf(min_rel);
-            for (int i = 0; i < 8 && isfinite(cutoff); i++) {
-                cutoff = nextafterf(cutoff, -FLT_MAX);
-                if (expf(cutoff) < min_rel) {
-                    reject_scaled = cutoff;
-                    have_reject_scaled = true;
-                    break;
-                }
-            }
+        if (!build_probs_top_p_ge_1(logits, n_vocab, temperature, min_p,
+                                    prob_scratch, &sum)) {
+            return best;
         }
-
-        for (uint32_t i = 0; i < n_vocab; i++) {
-            const float v = logits[i];
-            prob_scratch[i] = -1.0f;
-            if (!isfinite(v)) continue;
-            const float scaled = (v - max_logit) / temperature;
-            if (have_reject_scaled && scaled <= reject_scaled) continue;
-            const float p = expf(scaled);
-            if (p < min_rel) continue;
-            prob_scratch[i] = p;
-            sum += p;
-        }
-        if (sum <= 0.0f || !isfinite(sum)) return best;
         float r = sample_rng_f32(rng) * sum;
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float p = prob_scratch[i];
@@ -56929,6 +57017,12 @@ struct ds4_session {
     /* Position whose output_norm is still live in the trunk state; the draft
      * row for position p is only well defined when this is p-1. */
     int64_t qwen38_mtp_h_pos;
+    /* Position the pending proposal belongs to, so a proposal left over from
+     * another prefix can never be used. */
+    int64_t qwen38_mtp_proposal_pos;
+    /* Position frontier the verify chunk advanced to, kept so the committer
+     * does not have to re-derive it from the chunk. */
+    uint32_t qwen38_mtp_verify_logical;
     bool qwen38_mtp_failed;
 #ifndef DS4_NO_GPU
     ds4_gpu_graph graph;
@@ -70489,6 +70583,8 @@ int ds4_session_sync_multimodal(
 static void qwen38_mtp_prefill_rows(ds4_session *s, const int *tokens,
                                     uint32_t first_pos, uint32_t count,
                                     const ds4_qwen38_gpu_state *trunk);
+static void qwen38_mtp_refresh_proposal(ds4_session *s, uint32_t pos,
+                                        uint32_t hidden_row);
 #endif
 
 static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
@@ -70706,11 +70802,17 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 return 1;
             }
             s->qwen38_mtp_h_pos = (int64_t)(i + (int)chunk - 1);
+            for (uint32_t j = 0; j < chunk; j++)
+                token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
             if (!token_path) {
                 qwen38_mtp_prefill_rows(s, prompt->v + i, (uint32_t)i, chunk,
                                         &s->qwen38_gpu_state);
-            }            for (uint32_t j = 0; j < chunk; j++)
-                token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
+                /* The checkpoint now covers the chunk, so the proposal for its
+                 * last position can be produced from the hidden that row left
+                 * in out_norm. */
+                qwen38_mtp_refresh_proposal(s, (uint32_t)i + chunk - 1u,
+                                            chunk - 2u);
+            }
             i += (int)chunk;
             if (s->progress)
                 s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
@@ -72535,6 +72637,7 @@ static void qwen38_mtp_drop_history(ds4_session *s) {
     mst->rows = 0;
     mst->valid = 0;
     s->qwen38_mtp_h_pos = -1;
+    s->qwen38_mtp_proposal_pos = -1;
     s->qwen38_mtp_draft_valid = false;
     s->qwen38_mtp_draft_token = -1;
 }
@@ -72569,7 +72672,8 @@ static void qwen38_mtp_note_row(ds4_session *s, int token, uint32_t pos,
                                 &e->model, &e->qwen38_weights, &token,
                                 position, pos, 1u, true, s->mtp_logits)) goto fail;
     s->qwen38_mtp_draft_token = sample_argmax(s->mtp_logits, DS4_N_VOCAB);
-    s->qwen38_mtp_draft_valid = true;
+    s->qwen38_mtp_draft_valid = s->qwen38_mtp_draft_token >= 0;
+    s->qwen38_mtp_proposal_pos = (int64_t)pos;
     return;
 fail:
     if (!s->qwen38_mtp_failed) {
@@ -72579,6 +72683,39 @@ fail:
     s->qwen38_mtp_failed = true;
     s->qwen38_mtp_draft_valid = false;
 }
+/* Refresh the pending proposal for the last prefilled position.
+ *
+ * A prefill leaves the draft rows filled but no proposal, and a rebuilt prefix
+ * leaves the previous prefix's proposal behind.  Both are the same hazard: the
+ * round would propose from a position that no longer matches the checkpoint.
+ * Running one draft row with logits here makes the proposal correspond to the
+ * current prefix, and the position it records is what the rounds check. */
+static void qwen38_mtp_refresh_proposal(ds4_session *s, uint32_t pos,
+                                        uint32_t hidden_row) {
+    ds4_engine *e = s->engine;
+    if (!s->qwen38_mtp_state_ready || !e->qwen38_mtp_ready ||
+        s->qwen38_mtp_failed || !s->checkpoint_valid) return;
+    ds4_qwen38_mtp_gpu_state *mst = &s->qwen38_mtp_state;
+    if (pos >= mst->ctx_size || (int)s->checkpoint.len < (int)pos + 1) return;
+    const uint64_t row_bytes = QWEN38_N_EMBD * sizeof(float);
+    /* Row pos pairs the hidden of pos-1 with the token at pos. */
+    if (pos != 0 && hidden_row != UINT32_MAX) {
+        if (!ds4_gpu_tensor_copy(mst->h_in, 0, s->qwen38_gpu_state.out_norm,
+                                 (uint64_t)hidden_row * row_bytes,
+                                 row_bytes)) return;
+    } else if (!ds4_gpu_tensor_fill_f32(mst->h_in, 0.0f, QWEN38_N_EMBD)) {
+        return;
+    }
+    const int token = s->checkpoint.v[pos];
+    const uint32_t position[1] = { s->qwen38_rope_pos - 1u };
+    if (!qwen38_mtp_gpu_forward(mst, &e->mtp_model, &e->qwen38_mtp_weights,
+                                &e->model, &e->qwen38_weights, &token,
+                                position, pos, 1u, true, s->mtp_logits)) return;
+    s->qwen38_mtp_draft_token = sample_argmax(s->mtp_logits, DS4_N_VOCAB);
+    s->qwen38_mtp_draft_valid = s->qwen38_mtp_draft_token >= 0;
+    s->qwen38_mtp_proposal_pos = (int64_t)pos;
+}
+
 /* Warm the draft K/V with the prompt rows the trunk just forwarded.  Rows are
  * blocked to QWEN38_MTP_MAX_ROWS because the draft head only keeps that many
  * activation rows.  Row p needs the hidden of p-1, which within a chunk is the
@@ -72836,9 +72973,12 @@ int ds4_session_qwen38_spec_step(ds4_session *s, int token,
     }
     ds4_qwen38_mtp_gpu_state *mst = &s->qwen38_mtp_state;
     const uint32_t base = (uint32_t)s->checkpoint.len;
+    /* The proposal has to belong to the current checkpoint: a rebuilt prefix
+     * would otherwise contribute a draft row from another one. */
     if (s->qwen38_mtp_failed || s->sync_image_count != 0 || cap < 2u ||
         mst->ctx_size <= base + QWEN38_MTP_DRAFT_MAX ||
-        s->qwen38_mtp_h_pos != (int64_t)base - 1) {
+        s->qwen38_mtp_h_pos != (int64_t)base - 1 ||
+        s->qwen38_mtp_proposal_pos != (int64_t)base - 1) {
         if (qwen38_mtp_eval_pending(s, token, err, errlen) != 0) return 1;
         out_tokens[0] = token;
         *out_count = 1u;
@@ -72891,6 +73031,7 @@ int ds4_session_qwen38_spec_step(ds4_session *s, int token,
     *out_count = count;
     return 0;
 }
+
 #else
 int ds4_session_qwen38_spec_step(ds4_session *s, int token,
                                  int *out_tokens, uint32_t cap,
@@ -79517,8 +79658,9 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
         accepted[0] = first_token;
         return 1;
     }
-    /* The Qwen3.8 draft head only proposes argmax continuations, so sampled
-     * decoding keeps the one-token path. */
+    /* The Qwen3.8 draft head proposes argmax continuations, and the rejection
+     * scheme that would make sampled speculation exact needs its own
+     * distribution validation: sampled decoding keeps the one-token path. */
     if (ds4_session_is_qwen38(s) && ds4_engine_has_qwen38_mtp(s->engine)) {
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
