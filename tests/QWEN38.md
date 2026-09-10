@@ -1,10 +1,9 @@
 # Qwen3.8-27B native text and vision checks (Linux)
 
 This documents the CPU text reference and native CUDA text plus Qwen3-VL
-image path. Competitive CUDA performance, video, full chat/tool template
-parity, Metal execution and recurrent disk-cache serialization are not complete.
-Unsupported cache operations fail explicitly; they must not save a
-DeepSeek-shaped payload.
+image path. Competitive CUDA performance, video, and full chat/tool template
+parity are not complete. Metal and ROCm execution are outside the current
+hardware-validated scope; this work targets Qwen on CUDA.
 
 ## No-model kernel tests
 
@@ -76,10 +75,13 @@ make test-qwen38-cuda-session CUDA_ARCH=sm_120 \
 ```
 
 The session gate checks token-at-a-time eval, no-op sync, changed-prefix
-rebuild, shortening plus extension, finite logits, and explicit rejection of
-an unsupported recurrent payload. No-op sync remains bit-exact; rebuilds
-across MMVQ/MMQ batch shapes must preserve argmax within the numerical gate
-below. On the canonical six-token sentence its CUDA mean NLL was
+rebuild, shortening plus extension, finite logits, and a complete DSV4
+save/load round trip. It verifies both the restored logits and an exactly
+reproduced continuation, proving that GDN recurrence, convolution history and
+GA KV were restored rather than only the visible token history. Truncated
+payload sizes are rejected before mutating the live session. No-op sync remains
+bit-exact; rebuilds across MMVQ/MMQ batch shapes must preserve argmax within the
+numerical gate below. On the canonical six-token sentence its CUDA mean NLL was
 2.43385090 versus 2.43708414 for the FP32 CPU-state oracle, and both generated
 ` Paris` greedily.
 
@@ -128,7 +130,9 @@ nonuniform 300x200 Pillow-resize checksum in merger patch order.
 The public-session test transfers image ownership into the multimodal prompt,
 checks exact no-op sync reuse, continues autoregressive decoding through the
 same recurrent/GA state, requires the greedy result to identify the white
-fixture, and exercises a two-image prompt with separate MRoPE spans.
+fixture, and exercises a two-image prompt with separate MRoPE spans. It also
+round-trips a multimodal disk payload and verifies exact continuation plus
+restoration of the compressed MRoPE frontier and image fingerprint identity.
 
 `ds4-server` selects Qwen's `<|im_start|>` chat rendering and native
 `<tool_call><function=...>` syntax for model id 4. Its model aliases are
@@ -213,9 +217,21 @@ cc -O2 -std=c99 -I. tests/test_qwen38_session.c \
 ```
 
 This checks every final logit after token-by-token eval, no-op sync, changed
-prefix/rebuild, and shortening followed by extension. Expected maximum error:
-**zero** for the same CPU build. Also tests safe rejection of unsupported cache
-save/load. It uses one loaded model and one live session.
+prefix/rebuild, shortening followed by extension, and disk-payload restore.
+Expected maximum error is **zero** for the same CPU build, including the first
+continuation after restore. It uses one loaded model and one live session.
+
+Qwen DSV4 payloads persist checkpoint tokens, host logits, FP32 GDN recurrent
+and convolution state, all live GA K/V rows, the multimodal logical RoPE
+frontier, and bounded image identities. CUDA writes its already-quantized F16
+GA cache directly; the CPU oracle writes F32. The element-size field allows the
+loader to convert either representation when changing backend. Payload size is
+roughly 149 MiB of fixed recurrent/logit state plus 64 KiB per token on CUDA
+(128 KiB per token for CPU checkpoints), so normal KV-store limits still apply.
+The outer KVC header accepts quant tag zero only for dense Qwen model id 4;
+DeepSeek/GLM entries still require their routed-expert 2/4-bit tag. A checked
+server restart stored a 75-token Qwen checkpoint as a 155.26 MiB file, restored
+it in 35.8 ms, and reported all 75 prompt tokens from `disk-text`.
 
 Independent llama.cpp C-API probe (same raw text, no BOS/template, sequential
 CPU decode, CPU weights, KQV and operation offload disabled):

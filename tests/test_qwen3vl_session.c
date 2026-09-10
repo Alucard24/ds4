@@ -78,6 +78,50 @@ int main(int argc, char **argv) {
     require(memcmp(before, after, (size_t)n_vocab * sizeof(float)) == 0,
             "no-op image sync changed logits");
 
+    /* Qwen payloads retain recurrent state, F16 GA KV, multimodal MRoPE position,
+     * and image fingerprints. Restoring must reproduce the next decode exactly. */
+    FILE *cache = tmpfile();
+    require(cache != NULL, "vision payload file");
+    const uint64_t payload_bytes = ds4_session_payload_bytes(session);
+    require(payload_bytes > 150u * 1024u * 1024u, "vision payload size");
+    require(ds4_session_save_payload(session, cache, error, sizeof(error)) == 0,
+            error[0] ? error : "vision payload save");
+    require((uint64_t)ftello(cache) == payload_bytes,
+            "vision payload byte count");
+    require(ds4_session_vision_state_matches(session, &span, 1u),
+            "live image identity mismatch");
+    ds4_vision_span wrong_span = span;
+    wrong_span.embedding.fingerprint[0] ^= 1u;
+    require(!ds4_session_vision_state_matches(session, &wrong_span, 1u),
+            "image fingerprint mismatch accepted");
+
+    const int probe = prompt.v[0];
+    require(ds4_session_eval(session, probe, error, sizeof(error)) == 0,
+            error[0] ? error : "vision payload probe");
+    require(ds4_session_copy_logits(session, after, n_vocab) == n_vocab,
+            "vision probe logits");
+    require(fseeko(cache, 0, SEEK_SET) == 0, "vision payload rewind");
+    require(ds4_session_load_payload(session, cache, payload_bytes,
+                                     error, sizeof(error)) == 0,
+            error[0] ? error : "vision payload load");
+    require(ds4_session_pos(session) == prompt.len,
+            "vision payload restored position");
+    require(ds4_session_vision_state_matches(session, &span, 1u),
+            "restored image identity mismatch");
+    require(ds4_session_copy_logits(session, before, n_vocab) == n_vocab,
+            "restored vision logits");
+    require(ds4_session_eval(session, probe, error, sizeof(error)) == 0,
+            error[0] ? error : "restored vision payload probe");
+    require(ds4_session_copy_logits(session, before, n_vocab) == n_vocab,
+            "restored vision probe logits");
+    require(memcmp(before, after, (size_t)n_vocab * sizeof(float)) == 0,
+            "vision payload changed continuation logits");
+    require(fseeko(cache, 0, SEEK_SET) == 0, "second vision payload rewind");
+    require(ds4_session_load_payload(session, cache, payload_bytes,
+                                     error, sizeof(error)) == 0,
+            error[0] ? error : "second vision payload load");
+    fclose(cache);
+
     char generated[4096] = {0};
     size_t generated_len = 0;
     uint64_t rng = 1;

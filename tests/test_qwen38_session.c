@@ -16,7 +16,8 @@ static void require(int ok, const char *message) {
 
 static double rebuild_logit_tolerance;
 
-static void same_logits(ds4_session *s, const float *want, int n) {
+static void same_logits(ds4_session *s, const float *want, int n,
+                        double tolerance) {
     float *got = malloc(n*sizeof(float));
     require(got != NULL, "logit allocation");
     require(ds4_session_copy_logits(s, got, n) == n, "copy logits");
@@ -30,7 +31,7 @@ static void same_logits(ds4_session *s, const float *want, int n) {
     }
     printf("LOGIT_MAX_ERROR %.9g ARGMAX %d\n", maxerr, got_best);
     require(got_best == want_best, "sync/eval/reset changed argmax");
-    require(maxerr <= rebuild_logit_tolerance, "sync/eval/reset mismatch");
+    require(maxerr <= tolerance, "sync/eval/reset mismatch");
     free(got);
 }
 
@@ -68,26 +69,57 @@ int main(int argc, char **argv) {
     require(last != NULL, "logit allocation");
     require(ds4_session_copy_logits(s, last, nv) == nv, "copy logits");
     require(ds4_session_sync(s, &tokens, err, sizeof(err)) == 0, err);
-    same_logits(s, last, nv); /* unchanged prefix */
+    same_logits(s, last, nv, rebuild_logit_tolerance); /* unchanged prefix */
     /* Force a rewrite to a different first token, then rebuild the full input. */
     int other = tokens.v[0] == 0 ? 1 : 0;
     ds4_tokens rewrite = {.v=&other, .len=1, .cap=1};
     require(ds4_session_sync(s, &rewrite, err, sizeof(err)) == 0, err);
     require(ds4_session_sync(s, &tokens, err, sizeof(err)) == 0, err);
-    same_logits(s, last, nv);
+    same_logits(s, last, nv, rebuild_logit_tolerance);
     /* Shortening resets recurrent history; extending must recover the same state. */
     require(ds4_session_sync(s, &prefix, err, sizeof(err)) == 0, err);
     require(ds4_session_sync(s, &tokens, err, sizeof(err)) == 0, err);
-    same_logits(s, last, nv);
-    /* Do not write a misleading DeepSeek-shaped cache for recurrent state. */
+    same_logits(s, last, nv, rebuild_logit_tolerance);
+
+    /* A payload must restore logits and every persistent GDN/GA state needed
+     * for an exactly reproducible next token. CUDA writes its native F16 GA KV;
+     * the CPU oracle writes F32. */
     FILE *cache = tmpfile();
     require(cache != NULL, "temporary cache");
-    require(ds4_session_payload_bytes(s) == 0, "unsupported payload size");
-    require(ds4_session_save_payload(s, cache, err, sizeof(err)) != 0, "save must reject unsupported codec");
-    require(ftell(cache) == 0, "rejected save wrote data");
-    require(ds4_session_load_payload(s, cache, 0, err, sizeof(err)) != 0, "load must reject unsupported codec");
+    float *saved = malloc(nv * sizeof(float));
+    require(saved != NULL, "saved logit allocation");
+    require(ds4_session_copy_logits(s, saved, nv) == nv, "saved logits");
+    const uint64_t payload_bytes = ds4_session_payload_bytes(s);
+    require(payload_bytes > 150u * 1024u * 1024u, "Qwen payload size");
+    require(ds4_session_save_payload(s, cache, err, sizeof(err)) == 0, err);
+    require((uint64_t)ftello(cache) == payload_bytes, "payload byte count");
+
+    const int probe = tokens.v[tokens.len / 2];
+    require(ds4_session_eval(s, probe, err, sizeof(err)) == 0, err);
+    float *continued = malloc(nv * sizeof(float));
+    require(continued != NULL, "continuation logit allocation");
+    require(ds4_session_copy_logits(s, continued, nv) == nv,
+            "continuation logits");
+
+    require(fseeko(cache, 0, SEEK_SET) == 0, "payload rewind");
+    require(ds4_session_load_payload(s, cache, payload_bytes,
+                                     err, sizeof(err)) == 0, err);
+    require(ds4_session_pos(s) == tokens.len, "restored checkpoint position");
+    same_logits(s, saved, nv, 0.0);
+    require(ds4_session_eval(s, probe, err, sizeof(err)) == 0, err);
+    same_logits(s, continued, nv, 0.0);
+
+    /* Size validation must reject truncation before mutating the live state. */
+    require(fseeko(cache, 0, SEEK_SET) == 0, "truncated payload rewind");
+    require(ds4_session_load_payload(s, cache, payload_bytes - 1u,
+                                     err, sizeof(err)) != 0,
+            "truncated payload accepted");
+    require(ds4_session_pos(s) == tokens.len + 1,
+            "rejected payload changed checkpoint");
+    same_logits(s, continued, nv, 0.0);
+    free(continued);
+    free(saved);
     fclose(cache);
-    same_logits(s, last, nv);
     free(last);
     ds4_session_free(s);
     ds4_tokens_free(&tokens);

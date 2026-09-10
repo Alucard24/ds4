@@ -19507,6 +19507,33 @@ static void test_sha1_bytes_hex_matches_known_vector(void) {
     TEST_ASSERT(!strcmp(sha, "a9993e364706816aba3e25717850c26c9cd0d89d"));
 }
 
+static void test_kv_cache_accepts_qwen_dense_quant_tag(void) {
+    FILE *fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    if (!fp) return;
+
+    uint8_t h[KV_CACHE_FIXED_HEADER];
+    ds4_kvstore_fill_header(h, 4, 0, KV_REASON_COLD, 0,
+                            32, 0, 128, 100, 100, 0);
+    uint8_t text_len[4] = {0};
+    TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+    TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
+    TEST_ASSERT(fseek(fp, 0, SEEK_SET) == 0);
+    ds4_kvstore_entry entry = {0};
+    uint32_t text_bytes = 1;
+    TEST_ASSERT(ds4_kvstore_read_header(fp, &entry, &text_bytes));
+    TEST_ASSERT(entry.model_id == 4 && entry.quant_bits == 0 && text_bytes == 0);
+
+    TEST_ASSERT(fseek(fp, 0, SEEK_SET) == 0);
+    ds4_kvstore_fill_header(h, 0, 0, KV_REASON_COLD, 0,
+                            32, 0, 128, 100, 100, 0);
+    TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+    TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
+    TEST_ASSERT(fseek(fp, 0, SEEK_SET) == 0);
+    TEST_ASSERT(!ds4_kvstore_read_header(fp, &entry, &text_bytes));
+    fclose(fp);
+}
+
 static void test_kv_stub_file(const char *dir, const char *sha,
                               uint8_t reason, uint32_t tokens, uint32_t hits,
                               uint64_t last_used, uint64_t payload_bytes) {
@@ -20743,6 +20770,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
+    test_kv_cache_accepts_qwen_dense_quant_tag();
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
