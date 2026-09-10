@@ -12,6 +12,45 @@ static void require(int ok, const char *message) {
     }
 }
 
+static void check_resized_pattern(void) {
+    ds4_image image = {0};
+    image.width = 300u;
+    image.height = 200u;
+    image.rgb = malloc((size_t)image.width * image.height * 3u);
+    require(image.rgb != NULL, "pattern image allocation");
+    for (uint32_t y = 0; y < image.height; y++) {
+        for (uint32_t x = 0; x < image.width; x++) {
+            uint8_t *pixel = image.rgb + ((size_t)y * image.width + x) * 3u;
+            pixel[0] = (uint8_t)(x * 17u + y * 31u + (x * y) % 251u);
+            pixel[1] = (uint8_t)(x * 7u + y * 13u);
+            pixel[2] = (uint8_t)(x * 3u + y * 29u + (x ^ y));
+        }
+    }
+    ds4_image_patches patches = {0};
+    char error[160] = {0};
+    require(ds4_image_preprocess_qwen3vl(
+                &patches, &image, 8u, 4096u, error, sizeof(error)),
+            error[0] ? error : "Qwen3-VL pattern preprocessing");
+    require(patches.content_width == 288u &&
+            patches.content_height == 192u &&
+            patches.grid_width == 18u && patches.grid_height == 12u &&
+            patches.image_token_count == 54u,
+            "unexpected resized-pattern dimensions");
+    uint64_t hash = UINT64_C(14695981039346656037);
+    const size_t count = (size_t)patches.patch_count * 768u;
+    for (size_t i = 0; i < count; i++) {
+        int pixel = (int)lrintf((patches.patches[i] + 1.0f) * 127.5f);
+        require(pixel >= 0 && pixel <= 255,
+                "resized-pattern sample is outside byte range");
+        hash ^= (uint8_t)pixel;
+        hash *= UINT64_C(1099511628211);
+    }
+    require(hash == UINT64_C(0x6333a6756db1a4d2),
+            "Pillow-compatible Qwen3-VL resize changed");
+    ds4_image_patches_free(&patches);
+    ds4_image_free(&image);
+}
+
 static void check_white(uint32_t width, uint32_t height,
                         uint32_t want_width, uint32_t want_height,
                         uint32_t want_tokens,
@@ -67,6 +106,7 @@ int main(void) {
     check_white(224u, 224u, 224u, 224u, 49u, 0u);
     check_white(512u, 507u, 512u, 512u, 256u, 5u);
     check_white(1u, 1u, 96u, 96u, 9u, 0u);
+    check_resized_pattern();
     puts("Qwen3-VL image preprocessing PASS");
     return 0;
 }

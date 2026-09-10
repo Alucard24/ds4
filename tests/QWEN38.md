@@ -122,6 +122,9 @@ make test-qwen3vl-session CUDA_ARCH=sm_120 \
   DS4_TEST_QWEN38_IMAGE=/path/to/white224.png
 ```
 
+The preprocessing test covers square, padded non-square, minimum-size and a
+nonuniform 300x200 Pillow-resize checksum in merger patch order.
+
 The public-session test transfers image ownership into the multimodal prompt,
 checks exact no-op sync reuse, continues autoregressive decoding through the
 same recurrent/GA state, requires the greedy result to identify the white
@@ -147,29 +150,41 @@ against llama.cpp; the white fixture also remains bit-exact through the first
 layer's QKV projection.
 
 The remaining difference starts in attention. ds4 uses bounded FP32 online
-softmax, while normal llama.cpp MTMD enables lower-precision FlashAttention.
-With FlashAttention disabled, the 224x224 white embedding has mean absolute
-error `0.001429` and relative L2 error `0.00531` (ds4 sum `108.206112`,
-llama.cpp sum `108.482502`). Normal llama.cpp reports sum `110.311216`; its own
-FlashAttention-versus-non-Flash result differs by mean absolute error `0.003031`
-and relative L2 error `0.01215`. On the padded 512x507 Earth PNG, ds4 versus
-non-Flash llama.cpp has mean absolute error `0.001789` and relative L2 error
-`0.00488`. Nonlinear BF16 boundaries amplify the small attention difference
-through later layers, so full embedding parity is still not claimed and raw
-sums are not exact-bit gates. Use lossless PNG fixtures for numerical checks:
-ds4's Iris JPEG decoder and llama.cpp's image decoder need not produce identical
-source pixels. End-to-end greedy smoke tests identify a blank white image and
-describe the Earth fixture as Earth with Africa and Madagascar.
+softmax, while normal llama.cpp MTMD enables lower-precision FlashAttention and
+its non-Flash CUDA path normally permits TF32 GEMMs. Against an independent
+FP64 calculation of the first white-image attention layer, ds4 has mean absolute
+error `2.00e-8` and relative L2 error `3.27e-7`; ordinary non-Flash llama.cpp
+has `6.07e-6` and `9.98e-5`. Running llama.cpp with
+`NVIDIA_TF32_OVERRIDE=0` brings its first-layer result within mean absolute
+error `2.58e-8` of ds4, confirming that this is a precision-policy difference,
+not an attention-layout bug.
+
+Over the complete 224x224 white embedding, ds4 versus non-Flash/no-TF32
+llama.cpp has mean absolute error `0.001350` and relative L2 error `0.00516`
+(ds4 sum `108.206112`, llama.cpp sum `107.587742`). Normal FlashAttention
+llama.cpp reports sum `110.311216` and differs from its own no-TF32 result by
+mean absolute error `0.003280` and relative L2 error `0.01320`. On the padded
+512x507 Earth PNG, ds4 versus non-Flash/no-TF32 llama.cpp has mean absolute
+error `0.001581` and relative L2 error `0.00401`. Nonlinear BF16 boundaries
+amplify tiny attention differences through later layers, so full embedding
+parity is still not claimed and raw sums are not exact-bit gates. Use lossless
+PNG fixtures for numerical checks: ds4's Iris JPEG decoder and llama.cpp's
+image decoder need not produce identical source pixels. End-to-end greedy smoke
+tests identify a blank white image and describe the Earth fixture as Earth with
+Africa and Madagascar.
 
 Dynamic preprocessing uses llama.cpp's normal 8..4096 merged-token limits.
-The current vision attention kernel is bounded in memory but intentionally
-simple and scales quadratically; large high-resolution images still need a
-tiled/flash-attention optimization. One-process timings on the RTX 5070 Ti were
-0.716 s for the complete 224x224 encoder test (49 output tokens), 1.315 s for
-the 512x507 Earth fixture resized to 512x512 (256 tokens), and 3.565 s for a
-768x768 image (576 tokens), including process startup and sidecar mapping. The
-public 192-context session test peaked at 13026 MiB. On a 16GB GPU, reduce
-language context when loading the additional approximately 0.87 GiB sidecar if
+The vision attention kernel remains bounded in memory and scales quadratically;
+large high-resolution images will eventually benefit from tiled or flash
+attention. A one-warp-per-query rewrite removed the old per-key block barriers
+without changing any output bits. Within one loaded engine on the RTX 5070 Ti,
+median warm encode time fell from 27.2 to 9.9 ms for 224x224 (49 output tokens),
+from 613 to 124 ms for the padded 512x507 Earth fixture (256 tokens), and from
+2.89 s to 0.480 s for 768x768 (576 tokens). These calls include image decode,
+preprocessing, temporary allocation and the complete encoder, but exclude model
+open; first-encode times were 0.456, 0.504 and 0.866 s respectively. The public
+192-context session test peaked at 13026 MiB. On a 16GB GPU, reduce language
+context when loading the additional approximately 0.87 GiB sidecar if
 allocation pressure is high.
 
 A warm-process text benchmark can be built and run with:

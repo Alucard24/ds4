@@ -177,48 +177,69 @@ __global__ static void qwen3vl_bias_rope_kernel(
     qkv[base + QWEN3VL_WIDTH + lane + 36u] = k0 * sn + k1 * cs;
 }
 
+/* One warp owns one query/head. Each lane accumulates up to three value
+ * channels; the dot-product grouping mirrors the old 128-thread reduction so
+ * removing its per-key block barriers does not change output bits. */
 __global__ static void qwen3vl_attention_kernel(
         float       *out,
         const float *qkv,
         uint32_t     rows) {
-    __shared__ float dot[128];
     const uint32_t row = blockIdx.x;
     const uint32_t head = blockIdx.y;
     const uint32_t lane = threadIdx.x;
-    if (row >= rows || head >= QWEN3VL_HEADS) return;
+    if (row >= rows || head >= QWEN3VL_HEADS || lane >= 32u) return;
     const uint64_t qbase = (uint64_t)row * QWEN3VL_QKV +
                            (uint64_t)head * QWEN3VL_HEAD_DIM;
-    float acc = 0.0f;
+    float acc[3] = {0.0f, 0.0f, 0.0f};
     float max_score = -INFINITY;
     float denom = 0.0f;
     for (uint32_t key_row = 0; key_row < rows; key_row++) {
         const uint64_t kbase = (uint64_t)key_row * QWEN3VL_QKV +
                                QWEN3VL_WIDTH +
                                (uint64_t)head * QWEN3VL_HEAD_DIM;
-        dot[lane] = lane < QWEN3VL_HEAD_DIM ?
-                    qkv[qbase + lane] * qkv[kbase + lane] : 0.0f;
-        __syncthreads();
-        for (uint32_t stride = 64u; stride != 0u; stride >>= 1u) {
-            if (lane < stride) dot[lane] += dot[lane + stride];
-            __syncthreads();
+        float partial = __fmul_rn(qkv[qbase + lane], qkv[kbase + lane]);
+        if (lane < 8u) {
+            partial = __fadd_rn(partial,
+                __fmul_rn(qkv[qbase + lane + 64u],
+                          qkv[kbase + lane + 64u]));
         }
-        const float score = dot[0] * 0.11785113019775793f;
+        partial = __fadd_rn(partial,
+            __fmul_rn(qkv[qbase + lane + 32u],
+                      qkv[kbase + lane + 32u]));
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const float other = __shfl_down_sync(
+                0xffffffffu, partial, offset, 32);
+            if (lane < (uint32_t)offset) {
+                partial = __fadd_rn(partial, other);
+            }
+        }
+        const float dot = __shfl_sync(0xffffffffu, partial, 0, 32);
+        const float score = dot * 0.11785113019775793f;
         const float next_max = fmaxf(max_score, score);
         const float old_scale = key_row == 0u ? 0.0f : expf(max_score - next_max);
         const float new_scale = expf(score - next_max);
         denom = denom * old_scale + new_scale;
-        if (lane < QWEN3VL_HEAD_DIM) {
-            const uint64_t vbase = (uint64_t)key_row * QWEN3VL_QKV +
-                                   2u * QWEN3VL_WIDTH +
-                                   (uint64_t)head * QWEN3VL_HEAD_DIM;
-            acc = acc * old_scale + new_scale * qkv[vbase + lane];
+        const uint64_t vbase = (uint64_t)key_row * QWEN3VL_QKV +
+                               2u * QWEN3VL_WIDTH +
+                               (uint64_t)head * QWEN3VL_HEAD_DIM;
+#pragma unroll
+        for (uint32_t slot = 0; slot < 3u; slot++) {
+            const uint32_t d = lane + slot * 32u;
+            if (d < QWEN3VL_HEAD_DIM) {
+                acc[slot] = acc[slot] * old_scale +
+                            new_scale * qkv[vbase + d];
+            }
         }
         max_score = next_max;
-        __syncthreads();
     }
-    if (lane < QWEN3VL_HEAD_DIM) {
-        out[(uint64_t)row * QWEN3VL_WIDTH +
-            (uint64_t)head * QWEN3VL_HEAD_DIM + lane] = acc / denom;
+#pragma unroll
+    for (uint32_t slot = 0; slot < 3u; slot++) {
+        const uint32_t d = lane + slot * 32u;
+        if (d < QWEN3VL_HEAD_DIM) {
+            out[(uint64_t)row * QWEN3VL_WIDTH +
+                (uint64_t)head * QWEN3VL_HEAD_DIM + d] = acc[slot] / denom;
+        }
     }
 }
 
@@ -445,7 +466,7 @@ extern "C" int ds4_gpu_qwen3vl_vision_encode(
         }
         if (ok) {
             qwen3vl_attention_kernel<<<dim3(rows, QWEN3VL_HEADS, 1u),
-                128u, 0, DS4_QWEN3VL_VISION_STREAM>>>(
+                32u, 0, DS4_QWEN3VL_VISION_STREAM>>>(
                     (float *)attn->ptr, (const float *)qkv->ptr, rows);
             ok = qwen3vl_launch_ok("Qwen3-VL attention");
         }
