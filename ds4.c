@@ -72437,7 +72437,7 @@ static void qwen38_mtp_prefill_rows(ds4_session *s, const int *tokens,
  *
  * out_tokens receives the committed tokens with out_tokens[0] == token, and
  * s->logits is left predicting the token after them. */
-#define QWEN38_MTP_DRAFT_MAX 3u
+#define QWEN38_MTP_DRAFT_MAX 4u
 
 /* Commit one token through the ordinary token path.  Speculative rounds fall
  * back to this whenever no draft state is available, so the caller's stream
@@ -72603,9 +72603,17 @@ static int qwen38_mtp_commit_round(ds4_session *s, int *out_tokens,
  *   chunk row i (draft i+1 at position p+i) predicts the token at p+i+1, so
  *   draft i+1 is accepted iff that row's argmax is the drafted token.
  *
- * Because acceptance only ever confirms the batched trunk's own argmax, the
- * committed stream is greedy decoding token for token; a partial accept replays
- * the accepted prefix so no rejected draft survives in the recurrent state.
+ * Because acceptance only ever confirms the batched trunk's own argmax, every
+ * committed token is a greedy argmax of a trunk pass that included it; a
+ * partial accept replays the accepted prefix so no rejected draft survives in
+ * the recurrent state.  The committed stream therefore equals one-token greedy
+ * decoding unless two logits are close enough for the chunk and token
+ * reduction orders to disagree, which the gate measures rather than assumes.
+ *
+ * Four drafts is the measured optimum on the 16GB CUDA target: three drafts
+ * gave 1.15x, five and six cost more draft traffic than they recover (1.10x
+ * and 1.09x) because every extra draft re-reads the draft block and the full
+ * LM head.
  *
  * out_tokens receives the committed tokens with out_tokens[0] == token, and
  * s->logits is left predicting the token after them. */

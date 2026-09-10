@@ -317,3 +317,98 @@ cc -O1 -g -std=c99 -I. -fsanitize=address,undefined -fno-omit-frame-pointer \
   ds4_tp.o ds4_ssd.o ds4_layer_pack.o -lm -pthread -o /tmp/qwen-session-asan
 /tmp/qwen-session-asan "$M" 'The quick'
 ```
+
+## Qwen3-VL video (frame sequences)
+
+llama.cpp's own video path shells out to `ffmpeg`; ds4 stays dependency-free and
+takes an ordered frame list instead. A frame sequence rides one temporal merge
+pass: adjacent frames are paired for the temporal convolution slices and the
+last frame is paired with itself when the count is odd, so the temporal grid is
+`ceil(frames/2)` and MRoPE advances by that count. Total image tokens across all
+frame groups stay under 4096 and every frame must have the same dimensions.
+
+```sh
+# CLI: 2..128 ordered PNG/JPEG frames
+./ds4 -m "$M" -p "" --vision mmproj.gguf
+ds4> /video f0.png f1.png f2.png
+```
+
+The API is `ds4_engine_vision_encode_frame_files()` /
+`ds4_engine_vision_encode_frame_memory()`, and the prompt carries
+`<|video_pad|>` instead of `<|image_pad|>` (layout
+`DS4_VISION_LAYOUT_QWEN3VL_VIDEO`). A frame sequence fingerprints as one unit
+over `(frame count, dimensions, per-frame fingerprints)`, so an image checkpoint
+can never be reused for a video or for a different frame list.
+
+Gates:
+
+```sh
+make tests/test_qwen3vl_vision tests/test_qwen3vl_session CUDA_ARCH=sm_120
+./tests/test_qwen3vl_vision "$M" mmproj.gguf /tmp/white224.png
+./tests/test_qwen3vl_session "$M" mmproj.gguf /tmp/white224.png
+```
+
+The still-image checksum must stay `108.206111801`; the temporal gate checks
+that one still fed as two identical frames reproduces the still embedding bit
+for bit and that an odd three-frame sequence equals the still embedding twice.
+The session gate additionally covers video sync, no-op sync, fingerprint
+mismatch rejection and a DSV4 payload round trip with exact continuation logits.
+
+## Qwen3.8 MTP draft head and speculative decoding
+
+The draft head lives in a separate GGUF. `Qwen3.8-27B-NVFP4-MTP-HIGHEST.gguf`
+holds a 64-block trunk ds4 never executes plus `blk.64` (one dense
+global-attention block) and `blk.64.nextn.{eh_proj,enorm,hnorm,shared_head_norm}`.
+ds4 binds only those tensors, preloads their merged byte span (0.79 GiB) and
+reuses the trunk's token embedding and LM head, which is what
+`shared_head_norm` implies. Running the sidecar itself is not possible on 16 GB:
+the file is 23 GB.
+
+```sh
+./ds4 -m "$M" --mtp-model Qwen3.8-27B-NVFP4-MTP-HIGHEST.gguf --raw \
+     -p 'The capital of France is Paris.' --temp 0 -n 64
+```
+
+Draft row `r` pairs the trunk hidden left by position `r-1` with the token
+committed at `r` — the same shift llama.cpp's `qwen35` MTP graph uses — so the
+row's logits predict exactly what the trunk head just predicted. The draft block
+keeps its own K/V rows and never writes trunk state.
+
+### Speculative rounds
+
+`ds4_session_qwen38_spec_step()` commits the pending token through the ordinary
+token path, drafts up to four further tokens and verifies all of them with one
+batched trunk pass. Chunk row `i` holds the trunk's argmax for the token after
+position `p+i`, so draft `i+1` is accepted exactly when that argmax is the
+drafted token; a rejected draft ends the round there and the chunk's argmax at
+that row is the correcting token. A partial accept rewinds the GDN convolution
+and recurrent state to the snapshot taken before the verify chunk and replays
+the accepted prefix plus the correcting token.
+
+Measured on RTX 5070 Ti, 16 GB, greedy, 48-token run:
+
+| drafts per round | tok/round | tok/s | vs one-token |
+|---|---|---|---|
+| 3 | 2.33 | 47.6–48.2 | 1.15–1.16x |
+| **4** | **2.87** | **48.9–49.9** | **1.20x** |
+| 5 | 2.95 | 45.8 | 1.10x (and drifted at token 38/39) |
+| 6 | 3.25 | 45.2 | 1.09x |
+
+Every extra draft re-reads the draft block and the full 248k-vocabulary LM head,
+so decode is bandwidth-bound and four drafts is the measured optimum. Draft
+acceptance is 34/39 (87.2%) against the trunk argmax.
+
+Correctness gate:
+
+```sh
+make tests/test_qwen38_mtp CUDA_ARCH=sm_120
+./tests/test_qwen38_mtp "$M" Qwen3.8-27B-NVFP4-MTP-HIGHEST.gguf 'The capital of France is Paris. The largest ocean on Earth is the Pacific Ocean.'
+```
+
+It asserts that the speculative stream reproduces one-token greedy decoding for
+the whole reference run, that rounds really commit more than one token, and that
+the sidecar leaves the trunk path bit-identical (same tokens and same final
+logits with and without the sidecar). The token-for-token equality is measured
+per run, not guaranteed by construction: acceptance only ever confirms the
+batched trunk's own argmax, so a near-tie between two logits can still flip when
+the chunk and token reduction orders disagree.
