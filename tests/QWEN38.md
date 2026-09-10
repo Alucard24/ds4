@@ -188,18 +188,27 @@ tests identify a blank white image and describe the Earth fixture as Earth with
 Africa and Madagascar.
 
 Dynamic preprocessing uses llama.cpp's normal 8..4096 merged-token limits.
-The vision attention kernel remains bounded in memory and scales quadratically;
-large high-resolution images will eventually benefit from tiled or flash
-attention. A one-warp-per-query rewrite removed the old per-key block barriers
-without changing any output bits. Within one loaded engine on the RTX 5070 Ti,
-median warm encode time fell from 27.2 to 9.9 ms for 224x224 (49 output tokens),
-from 613 to 124 ms for the padded 512x507 Earth fixture (256 tokens), and from
-2.89 s to 0.480 s for 768x768 (576 tokens). These calls include image decode,
+Vision attention remains bounded in memory and quadratic in work. Its kernel now
+groups sixteen query warps per block and stages 32-key K/V tiles in shared
+memory. Every query retains the original key order, FP32 online softmax and
+warp-reduction order; no N² score buffer, TF32, FP16 Q/K/V, or FlashAttention
+path was introduced.
+
+The first one-warp-per-query rewrite removed the old per-key block barriers and
+reduced median warm full-encoder time from 27.2 to 9.9 ms for 224x224, 613 to
+124 ms for the padded 512x507 Earth fixture, and 2.89 s to 0.480 s for 768x768.
+In a fresh paired run for the tiled follow-up, the corresponding one-warp versus
+tiled medians were 9.482 vs 9.323 ms, 121.270 vs 104.165 ms, and 575.284 vs
+409.293 ms. GPU clock state makes absolute runs noisy, so these paired medians
+and exact matching sums (`108.206111801`, `-12235.925095321`, and
+`-2166.399592827`) are the retained gate. Calls include image decode,
 preprocessing, temporary allocation and the complete encoder, but exclude model
-open; first-encode times were 0.456, 0.504 and 0.866 s respectively. The public
-192-context session test peaked at 13026 MiB. On a 16GB GPU, reduce language
-context when loading the additional approximately 0.87 GiB sidecar if
-allocation pressure is high.
+open. The public 192-context session test peaked at 13026 MiB. On a 16GB GPU,
+reduce language context when loading the additional approximately 0.87 GiB
+sidecar if allocation pressure is high. A 2048x2048 RGB fixture exercised the
+maximum 4096 merged image tokens without an allocation failure and completed in
+17.75 s, confirming bounded memory behavior; the upper limit remains
+computationally expensive despite tiling.
 
 A warm-process text benchmark can be built and run with:
 
