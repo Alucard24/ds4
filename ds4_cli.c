@@ -5,6 +5,7 @@
 #include "ds4_help.h"
 #include "ds4_prompt_prefix.h"
 #include "ds4_image.h"
+#include "ds4_video.h"
 #include "linenoise.h"
 
 /* ds4 CLI.
@@ -1299,7 +1300,7 @@ static void print_repl_help(void) {
     puts("  /power N       Set GPU duty cycle percentage, 1..100.");
     puts("  /steer F       Set FFN steering for subsequent tokens; no value shows it.");
     puts("  /read FILE     Submit a text file, PNG, or JPEG.");
-    puts("  /video F...    Submit 2..128 ordered PNG/JPEG video frames (Qwen3-VL).");
+    puts("  /video SRC     Submit a video: one container (ffmpeg) or 2..128 ordered frames.");
     puts("  /quit, /exit   Leave the prompt.");
     puts("  Ctrl+C         Stop generation and return to the prompt.");
 }
@@ -1848,8 +1849,34 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
                  path = strtok_r(NULL, " \t", &save)) {
                 paths[frame_count++] = path;
             }
-            if (frame_count < 2u) {
-                fprintf(stderr, "ds4: /video needs at least two frame files\n");
+            /* A single container is decoded with ffmpeg; two or more paths are
+             * already an ordered frame list. */
+            if (frame_count == 1u && cli_file_container_kind(paths[0])) {
+                char video_error[256] = {0};
+                ds4_vision_embedding video = {0};
+                uint32_t frames_wanted = DS4_VIDEO_DEFAULT_FRAMES;
+                const char *frames_env = getenv("DS4_VIDEO_FRAMES");
+                if (frames_env && frames_env[0]) {
+                    const long v = strtol(frames_env, NULL, 10);
+                    if (v >= 2 && v <= (long)DS4_VIDEO_MAX_FRAMES)
+                        frames_wanted = (uint32_t)v;
+                }
+                if (!ds4_engine_vision_encode_video_file(
+                        engine, paths[0], frames_wanted, &video, video_error,
+                        sizeof(video_error))) {
+                    fprintf(stderr, "ds4: /video failed: %s\n",
+                            video_error[0] ? video_error : "container decode failed");
+                } else {
+                    fprintf(stderr,
+                            "ds4: video %s, %u frames sampled, temporal grid %u, "
+                            "%u tokens\n",
+                            paths[0], frames_wanted, video.grid_time,
+                            video.token_count);
+                    rc = run_chat_turn(engine, cfg, &chat, "", &video);
+                    ds4_vision_embedding_free(&video);
+                }
+            } else if (frame_count < 2u) {
+                fprintf(stderr, "ds4: /video needs a container or at least two frame files\n");
             } else {
                 char video_error[256] = {0};
                 ds4_vision_embedding video = {0};

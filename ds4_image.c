@@ -370,6 +370,21 @@ void ds4_image_free(ds4_image *image) {
     memset(image, 0, sizeof(*image));
 }
 
+void ds4_image_fingerprint_pixels(uint8_t out[32], const uint8_t *rgb,
+                                  uint32_t width, uint32_t height) {
+    if (!out) return;
+    memset(out, 0, 32);
+    if (!rgb || width == 0u || height == 0u) return;
+    ds4_sha256 sha;
+    ds4_sha256_init(&sha);
+    static const char domain[] = "ds4-video-frame-v1";
+    ds4_sha256_update(&sha, domain, sizeof(domain));
+    ds4_sha256_update(&sha, &width, sizeof(width));
+    ds4_sha256_update(&sha, &height, sizeof(height));
+    ds4_sha256_update(&sha, rgb, (uint64_t)width * height * 3u);
+    ds4_sha256_final(&sha, out);
+}
+
 void ds4_image_fingerprint_sequence(uint8_t out[32],
                                     const ds4_image *images,
                                     size_t image_count) {

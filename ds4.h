@@ -272,6 +272,16 @@ int ds4_engine_vision_encode_memory(ds4_engine *e,
                                     size_t error_cap);
 /* Qwen3-VL temporal merge consumes adjacent frame pairs. Frames must have
  * equal source dimensions; an odd final frame is paired with itself. */
+/* Decode a video container with ffmpeg and encode it as one temporal frame
+ * sequence.  `max_frames` is the sampling policy (2..128); the same file always
+ * yields the same frames.  Fails with a message when ffmpeg/ffprobe are not in
+ * PATH, so callers can fall back to the frame-list entry points below. */
+int ds4_engine_vision_encode_video_file(ds4_engine *e,
+                                        const char *path,
+                                        uint32_t max_frames,
+                                        ds4_vision_embedding *out,
+                                        char *error,
+                                        size_t error_cap);
 int ds4_engine_vision_encode_frame_files(ds4_engine *e,
                                          const char *const *paths,
                                          size_t frame_count,

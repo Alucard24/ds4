@@ -412,3 +412,45 @@ logits with and without the sidecar). The token-for-token equality is measured
 per run, not guaranteed by construction: acceptance only ever confirms the
 batched trunk's own argmax, so a near-tie between two logits can still flip when
 the chunk and token reduction orders disagree.
+
+## Video containers (ffmpeg, optional)
+
+A container is an input convenience, never a second preparation path: ffmpeg
+decodes to raw RGB and everything after that is the frame-list path. The
+decoder is `ffprobe`/`ffmpeg` from PATH, exec'd without a shell, so there is no
+link-time dependency and no shell quoting of a file name. When the tools are
+missing the call fails with a message that names them and the frame-list entry
+points keep working.
+
+```sh
+# one container: frames are sampled evenly over the duration
+./ds4 -m "$M" --vision mmproj.gguf -c 16384
+ds4> /video clip.mp4
+
+# sampling policy (default 32, range 2..128)
+DS4_VIDEO_FRAMES=16 ./ds4 -m "$M" --vision mmproj.gguf -c 16384
+```
+
+Policy and identity, both deliberate:
+
+- `max_frames` evenly spaced samples over the whole duration, realised with
+  ffmpeg's `fps` filter, so the same file always yields the same frames. A
+  different value is a different view of the video, not a different file.
+- Frame fingerprints hash the decoded pixels (domain-separated, per frame), not
+  the container bytes, so a cache identity describes what the model saw. A
+  container and its extracted PNG frames therefore have different identities
+  even though they produce identical embeddings.
+
+Gate:
+
+```sh
+make test-qwen3vl-video CUDA_ARCH=sm_120
+```
+
+It generates its own fixture with ffmpeg (`testsrc`, 224x224, 2s), then checks
+that the requested frame count is honoured, that two decodes give identical
+pixels and fingerprints, that different frames never share a fingerprint, that
+four frames merge into two temporal groups, that the identity survives a second
+decode, and — the point of the whole path — that the container's embedding is
+**bit-identical** to the same frames passed as PNG files. Skips itself when
+ffmpeg is not in PATH.

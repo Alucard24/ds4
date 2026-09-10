@@ -44,6 +44,7 @@
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
 #include "ds4_image.h"
+#include "ds4_video.h"
 #include "ds4_tp.h"
 #ifdef DS4_ROCM_BUILD
 #include "ds4_linux_memory.h"
@@ -68153,6 +68154,13 @@ static int ds4_engine_vision_encode_frames(
         free(embedding);
         return 0;
     }
+    if (getenv("DS4_VISION_EMBD_DUMP")) {
+        double sum = 0.0;
+        for (uint64_t i = 0; i < (uint64_t)pair_tokens * groups * QWEN38_N_EMBD; i++)
+            sum += embedding[i];
+        fprintf(stderr, "VISION_FRAMES tokens=%u groups=%u width=%u sum=%.9f\n",
+                pair_tokens * groups, groups, QWEN38_N_EMBD, sum);
+    }
     out->data = embedding;
     out->token_count = pair_tokens * groups;
     out->layout = DS4_VISION_LAYOUT_QWEN3VL_VIDEO;
@@ -68165,6 +68173,22 @@ static int ds4_engine_vision_encode_frames(
     out->content_height = content_height;
     ds4_image_fingerprint_sequence(out->fingerprint, frames, frame_count);
     return 1;
+}
+
+int ds4_engine_vision_encode_video_file(
+        ds4_engine *e, const char *path, uint32_t max_frames,
+        ds4_vision_embedding *out, char *error, size_t error_cap) {
+    if (!e || !path || !path[0] || !out) {
+        if (error && error_cap) snprintf(error, error_cap, "invalid video request");
+        return 0;
+    }
+    ds4_video_frames frames = {0};
+    if (!ds4_video_decode_file(path, max_frames, &frames, error, error_cap))
+        return 0;
+    const int ok = ds4_engine_vision_encode_frames(
+        e, frames.frames, frames.count, out, error, error_cap);
+    ds4_video_frames_free(&frames);
+    return ok;
 }
 
 int ds4_engine_vision_encode_frame_files(
