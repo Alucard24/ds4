@@ -574,6 +574,13 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e);
  * never committed without verification. */
 bool ds4_engine_has_qwen38_mtp(ds4_engine *e);
 bool ds4_session_qwen38_mtp_proposal(const ds4_session *s, int *out_token);
+/* One greedy speculative round: evaluates `token`, drafts up to three further
+ * tokens with the MTP head, verifies them with a single batched trunk pass and
+ * commits the accepted prefix.  out_tokens[0] is `token` itself. */
+int ds4_session_qwen38_spec_step(ds4_session *s, int token,
+                                 int *out_tokens, uint32_t cap,
+                                 uint32_t *out_count, char *err,
+                                 size_t errlen);
 bool ds4_engine_mtp_exact_sampling(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 

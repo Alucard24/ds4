@@ -17,6 +17,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -26,6 +27,12 @@ static int require(int ok, const char *message) {
         return 0;
     }
     return 1;
+}
+
+static double now_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
 static int argmax_of(const float *logits, uint32_t n) {
@@ -43,7 +50,8 @@ static int run_greedy(ds4_engine *engine,
                       float *logits_a,
                       float *logits_b,
                       uint32_t *accepted,
-                      uint32_t *proposed) {
+                      uint32_t *proposed,
+                      double *seconds) {
     const uint32_t n_vocab = ds4_engine_vocab_size(engine);
     ds4_tokens prompt = {0};
     ds4_chat_begin(engine, &prompt);
@@ -64,6 +72,7 @@ static int run_greedy(ds4_engine *engine,
     }
 
     uint32_t kept = 0;
+    const double t0 = now_seconds();
     for (uint32_t step = 0; step < max_tokens; step++) {
         float *trunk = logits_a + (size_t)step * n_vocab;
         if (!require(ds4_session_copy_logits(session, trunk, n_vocab) == (int)n_vocab,
@@ -87,6 +96,7 @@ static int run_greedy(ds4_engine *engine,
             return 0;
         }
     }
+    if (seconds) *seconds = now_seconds() - t0;
     if (logits_b) {
         /* Final-state logits after the whole greedy run, for a sidecar/no-
          * sidecar bit-comparison of the trunk path. */
@@ -103,12 +113,100 @@ static int run_greedy(ds4_engine *engine,
     return 1;
 }
 
+/* Greedy speculative round-trip: the committed stream must equal plain greedy
+ * decoding, and the round must actually commit more than one token at a time.
+ * The wall-clock comparison is only reported, never asserted: this gate exists
+ * to prove equivalence and to surface the measured speedup. */
+static int run_spec(ds4_engine *engine,
+                    const char *text,
+                    uint32_t max_tokens,
+                    int *tokens_out,
+                    uint32_t *rounds,
+                    uint32_t *committed,
+                    double *seconds) {
+    const uint32_t n_vocab = ds4_engine_vocab_size(engine);
+    ds4_tokens prompt = {0};
+    ds4_chat_begin(engine, &prompt);
+    ds4_chat_append_message(engine, &prompt, "user", text);
+    ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+
+    ds4_session *session = NULL;
+    char error[256] = {0};
+    if (!require(ds4_session_create(&session, engine, 256) == 0, "spec session") ||
+        !require(ds4_session_sync(session, &prompt, error, sizeof(error)) == 0,
+                 error[0] ? error : "spec sync")) {
+        ds4_session_free(session);
+        ds4_tokens_free(&prompt);
+        return 0;
+    }
+    float *logits = malloc((size_t)n_vocab * sizeof(float));
+    if (!require(logits != NULL, "spec logits")) {
+        ds4_session_free(session);
+        ds4_tokens_free(&prompt);
+        return 0;
+    }
+    const double t0 = now_seconds();
+    uint32_t kept = 0, round_count = 0, total_committed = 0;
+    int pending = -1;
+    for (;;) {
+        if (!require(ds4_session_copy_logits(session, logits, (int)n_vocab) ==
+                         (int)n_vocab, "spec logits copy")) {
+            free(logits);
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            return 0;
+        }
+        pending = argmax_of(logits, n_vocab);
+        if (pending == ds4_token_eos(engine) || kept >= max_tokens) break;
+        int round_tokens[8];
+        uint32_t count = 0;
+        if (!require(ds4_session_qwen38_spec_step(session, pending,
+                                                  round_tokens, 8u, &count,
+                                                  error, sizeof(error)) == 0,
+                     error[0] ? error : "spec step")) {
+            free(logits);
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            return 0;
+        }
+        if (!require(count >= 1u && count <= 8u, "spec round length")) {
+            free(logits);
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            return 0;
+        }
+        if (!require(round_tokens[0] == pending, "spec round dropped its token")) {
+            free(logits);
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            return 0;
+        }
+        round_count++;
+        total_committed += count;
+        for (uint32_t i = 0; i < count && kept < max_tokens; i++) {
+            if (round_tokens[i] == ds4_token_eos(engine)) {
+                kept = max_tokens;
+                break;
+            }
+            tokens_out[kept++] = round_tokens[i];
+        }
+    }
+    *seconds = now_seconds() - t0;
+    *rounds = round_count;
+    *committed = total_committed;
+    tokens_out[kept] = -1;
+    free(logits);
+    ds4_session_free(session);
+    ds4_tokens_free(&prompt);
+    return 1;
+}
+
 int main(int argc, char **argv) {
     if (argc != 4) {
         fprintf(stderr, "usage: %s TRUNK.gguf MTP.gguf PROMPT\n", argv[0]);
         return 2;
     }
-    const uint32_t max_tokens = 16u;
+    const uint32_t max_tokens = 48u;
     ds4_engine_options options = {0};
     options.model_path = argv[1];
     options.mtp_path = argv[2];
@@ -135,8 +233,9 @@ int main(int argc, char **argv) {
     }
 
     uint32_t accepted = 0, proposed = 0;
+    double greedy_seconds = 0.0;
     if (!run_greedy(engine, argv[3], max_tokens, tokens, logits_a, logits_b,
-                    &accepted, &proposed)) {
+                    &accepted, &proposed, &greedy_seconds)) {
         free(tokens);
         free(logits_a);
         free(logits_b);
@@ -154,6 +253,73 @@ int main(int argc, char **argv) {
         ds4_engine_close(engine);
         return 1;
     }
+
+    /* Speculative round gate: same tokens as plain greedy, more than one token
+     * committed per round, and a measured wall-clock difference. */
+    uint32_t spec_budget = 64u;
+    const char *budget_env = getenv("DS4_TEST_MTP_SPEC_TOKENS");
+    if (budget_env && budget_env[0]) {
+        const long v = strtol(budget_env, NULL, 10);
+        if (v >= 0 && v <= 4096) spec_budget = (uint32_t)v;
+    }
+    int *spec_tokens = calloc((size_t)spec_budget + 1u, sizeof(spec_tokens[0]));
+    uint32_t rounds = 0, committed = 0;
+    double spec_seconds = 0.0;
+    if (!require(spec_tokens != NULL, "spec token buffer") ||
+        !run_spec(engine, argv[3], spec_budget, spec_tokens, &rounds, &committed,
+                  &spec_seconds)) {
+        free(spec_tokens);
+        free(tokens);
+        free(logits_a);
+        free(logits_b);
+        ds4_engine_close(engine);
+        return 1;
+    }
+    uint32_t plain_len = 0;
+    while (plain_len < max_tokens && tokens[plain_len] >= 0) plain_len++;
+    uint32_t spec_len = 0;
+    while (spec_len < spec_budget && spec_tokens[spec_len] >= 0) spec_len++;
+    printf("MTP speculation: %u rounds, %u tokens committed, %.2f tok/round, "
+           "%.3fs (%.1f tok/s)\n",
+           rounds, committed,
+           rounds ? (double)committed / (double)rounds : 0.0, spec_seconds,
+           spec_seconds > 0.0 ? (double)committed / spec_seconds : 0.0);
+    /* The speculative run must cover the whole plain reference stream and agree
+     * with it token for token. */
+    uint32_t agree = 0;
+    while (agree < plain_len && agree < spec_len &&
+           spec_tokens[agree] == tokens[agree]) agree++;
+    printf("MTP speculation agrees with plain greedy on %u/%u tokens\n",
+           agree, plain_len);
+    if (agree < plain_len && agree < spec_len) {
+        printf("MTP first divergence at token %u: spec=%d plain=%d\n",
+               agree, spec_tokens[agree], tokens[agree]);
+    }
+    if (!require(rounds != 0u && committed > rounds,
+                 "speculation never committed more than one token per round") ||
+        !require(spec_len >= plain_len,
+                 "speculative run ended before the plain reference stream") ||
+        !require(memcmp(spec_tokens, tokens,
+                        (size_t)plain_len * sizeof(spec_tokens[0])) == 0,
+                 "speculative stream differs from plain greedy")) {
+        free(spec_tokens);
+        free(tokens);
+        free(logits_a);
+        free(logits_b);
+        ds4_engine_close(engine);
+        return 1;
+    }
+    printf("MTP speculation reproduced %u plain greedy tokens exactly\n",
+           plain_len);
+    printf("MTP decode rate: greedy %.1f tok/s vs speculative %.1f tok/s "
+           "(%.2fx over %u tokens)\n",
+           greedy_seconds > 0.0 ? (double)plain_len / greedy_seconds : 0.0,
+           spec_seconds > 0.0 ? (double)committed / spec_seconds : 0.0,
+           (greedy_seconds > 0.0 && spec_seconds > 0.0) ?
+               (greedy_seconds * (double)committed) /
+                   (spec_seconds * (double)plain_len) : 0.0,
+           plain_len);
+    free(spec_tokens);
 
     /* The draft must never alter the trunk path: the same greedy prompt without
      * the sidecar has to reproduce identical tokens and final logits.  Only one
@@ -187,7 +353,7 @@ int main(int argc, char **argv) {
     uint32_t plain_accepted = 0, plain_proposed = 0;
     const int plain_ok = plain_tokens && plain_logits && plain_final &&
         run_greedy(plain_engine, argv[3], max_tokens, plain_tokens, plain_logits,
-                   plain_final, &plain_accepted, &plain_proposed);
+                   plain_final, &plain_accepted, &plain_proposed, NULL);
     if (!require(plain_ok, "plain reference run") ||
         !require(plain_proposed == 0u, "plain run produced draft proposals") ||
         !require(memcmp(tokens, plain_tokens,

@@ -7663,6 +7663,9 @@ typedef struct {
     ds4_gpu_tensor *ffn_m;
     ds4_gpu_tensor *logits;
     ds4_gpu_tensor *rope_positions;
+    /* Per-row head output used by speculative verification, capped at the
+     * number of draft rows one round can verify. */
+    ds4_gpu_tensor *logits_rows;
     /* Per-row output_norm of the current chunk.  The head keeps using
      * xnorm_row[last] so trunk numerics are untouched; the MTP draft needs a
      * hidden row for every position it warms its own K/V with. */
@@ -7699,6 +7702,13 @@ typedef struct {
     ds4_gpu_tensor *rope_positions;
     ds4_gpu_tensor *head_row[QWEN38_MTP_MAX_ROWS];
     ds4_gpu_tensor *tok_row[QWEN38_MTP_MAX_ROWS];
+    /* Verification scratch: per-row logits of one verify chunk, and a copy of
+     * the recurrent state taken before that chunk so a partially accepted
+     * round can be rewound and replayed instead of re-prefilling. */
+    ds4_gpu_tensor *verify_logits;
+    ds4_gpu_tensor *ssm_snapshot;
+    ds4_gpu_tensor *conv_snapshot;
+    float *verify_logits_host;
     uint32_t ctx_size;
     uint32_t rows;              /* K/V rows filled so far */
     uint32_t valid;             /* rows that match the committed prefix */
@@ -7742,7 +7752,7 @@ static void qwen38_gpu_state_free(ds4_qwen38_gpu_state *st) {
     QWEN38_GPU_FREE(q_full); QWEN38_GPU_FREE(k); QWEN38_GPU_FREE(v);
     QWEN38_GPU_FREE(ffn_g); QWEN38_GPU_FREE(ffn_u); QWEN38_GPU_FREE(ffn_m);
     QWEN38_GPU_FREE(logits); QWEN38_GPU_FREE(rope_positions);
-    QWEN38_GPU_FREE(out_norm);
+    QWEN38_GPU_FREE(out_norm); QWEN38_GPU_FREE(logits_rows);
 #undef QWEN38_GPU_FREE
     memset(st, 0, sizeof(*st));
 }
@@ -7777,6 +7787,7 @@ static int qwen38_gpu_state_init(ds4_qwen38_gpu_state *st, uint32_t ctx_size) {
     QWEN38_GPU_ALLOC(ffn_u, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_N_FF);
     QWEN38_GPU_ALLOC(ffn_m, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_N_FF);
     QWEN38_GPU_ALLOC(logits, DS4_N_VOCAB);
+    QWEN38_GPU_ALLOC(logits_rows, (uint64_t)QWEN38_MTP_MAX_ROWS * DS4_N_VOCAB);
     QWEN38_GPU_ALLOC(out_norm, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_N_EMBD);
     if (!qwen38_gpu_alloc_bytes(&st->rope_positions,
             QWEN38_CUDA_PREFILL_CHUNK * 3u * sizeof(uint32_t),
@@ -7845,6 +7856,9 @@ static void qwen38_mtp_gpu_state_free(ds4_qwen38_mtp_gpu_state *st) {
     QWEN38_MTP_FREE(ffn_g); QWEN38_MTP_FREE(ffn_u); QWEN38_MTP_FREE(ffn_m);
     QWEN38_MTP_FREE(head_norm); QWEN38_MTP_FREE(kv_k); QWEN38_MTP_FREE(kv_v);
     QWEN38_MTP_FREE(logits); QWEN38_MTP_FREE(rope_positions);
+    QWEN38_MTP_FREE(verify_logits); QWEN38_MTP_FREE(ssm_snapshot);
+    QWEN38_MTP_FREE(conv_snapshot);
+    free(st->verify_logits_host);
 #undef QWEN38_MTP_FREE
     memset(st, 0, sizeof(*st));
 }
@@ -7873,6 +7887,10 @@ static int qwen38_mtp_gpu_state_init(ds4_qwen38_mtp_gpu_state *st,
     QWEN38_MTP_ALLOC(ffn_m, rows * QWEN38_N_FF);
     QWEN38_MTP_ALLOC(head_norm, rows * QWEN38_N_EMBD);
     QWEN38_MTP_ALLOC(logits, DS4_N_VOCAB);
+    QWEN38_MTP_ALLOC(verify_logits, rows * (uint64_t)DS4_N_VOCAB);
+    QWEN38_MTP_ALLOC(ssm_snapshot, 48ull * 48 * 128 * 128);
+    QWEN38_MTP_ALLOC(conv_snapshot, 48ull * 3 * QWEN38_CONV_DIM);
+    st->verify_logits_host = malloc((size_t)rows * DS4_N_VOCAB * sizeof(float));
     if (!qwen38_gpu_alloc_bytes(&st->kv_k,
             (uint64_t)ctx_size * QWEN38_GA_KV_DIM * sizeof(uint16_t),
             "mtp_kv_k") ||
@@ -7891,6 +7909,7 @@ static int qwen38_mtp_gpu_state_init(ds4_qwen38_mtp_gpu_state *st,
             QWEN38_N_EMBD * sizeof(float));
         if (!st->head_row[i] || !st->tok_row[i]) goto fail;
     }
+    if (!st->verify_logits_host) goto fail;
     return 1;
 fail:
     qwen38_mtp_gpu_state_free(st);
@@ -8529,6 +8548,10 @@ static int qwen38_gpu_forward_token(ds4_qwen38_gpu_state *st,
     return 1;
 }
 
+/* logits_rows, when non-NULL, also receives the head output of every chunk
+ * row (n_tokens * DS4_N_VOCAB floats).  Speculative verification needs the
+ * per-row argmax; the plain paths keep reading only the last row from
+ * `logits`, so their numerics are unchanged. */
 static int qwen38_gpu_forward_chunk(ds4_qwen38_gpu_state *st,
                                     const ds4_model *m,
                                     const ds4_qwen38_weights *w,
@@ -8537,7 +8560,8 @@ static int qwen38_gpu_forward_chunk(ds4_qwen38_gpu_state *st,
                                     const ds4_vision_span *images,
                                     size_t image_count,
                                     uint32_t *logical_pos,
-                                    float *logits) {
+                                    float *logits,
+                                    float *logits_rows) {
 #define QWEN38_CHUNK_CHECK(expr, label) \
     do { if (!(expr)) { fprintf(stderr, "ds4: Qwen CUDA chunk %s failed\n", label); return 0; } } while (0)
     if (!tokens || !logical_pos || n_tokens == 0 ||
@@ -8672,6 +8696,15 @@ static int qwen38_gpu_forward_chunk(ds4_qwen38_gpu_state *st,
         st->out_norm, st->hidden, m->map, m->size,
         w->output_norm->abs_offset, QWEN38_N_EMBD, n_tokens, 1.0e-6f),
         "output norm rows");
+    if (logits_rows) {
+        QWEN38_CHUNK_CHECK(qwen38_gpu_matvec_rows(
+            st->logits_rows, m, w->output, st->out_norm, n_tokens),
+            "verify output projection");
+        QWEN38_CHUNK_CHECK(ds4_gpu_tensor_read(
+            st->logits_rows, 0, logits_rows,
+            (uint64_t)n_tokens * DS4_N_VOCAB * sizeof(float)),
+            "verify logit read");
+    }
     QWEN38_CHUNK_CHECK(ds4_gpu_rms_norm_weight_tensor(
         st->xnorm_row[n_tokens - 1u], st->hidden_row[n_tokens - 1u],
         m->map, m->size, w->output_norm->abs_offset,
@@ -70493,7 +70526,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 qwen38_gpu_forward_chunk(&s->qwen38_gpu_state, &e->model,
                     &e->qwen38_weights, prompt->v + i, chunk, (uint32_t)i,
                     s->sync_images, s->sync_image_count,
-                    &s->qwen38_rope_pos, s->logits);
+                    &s->qwen38_rope_pos, s->logits, NULL);
             if (ok && token_path) s->qwen38_rope_pos++;
             if (!ok) {
                 snprintf(err, errlen, "Qwen CUDA forward failed at token %d", i);
@@ -70504,8 +70537,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             if (!token_path) {
                 qwen38_mtp_prefill_rows(s, prompt->v + i, (uint32_t)i, chunk,
                                         &s->qwen38_gpu_state);
-            }
-            for (uint32_t j = 0; j < chunk; j++)
+            }            for (uint32_t j = 0; j < chunk; j++)
                 token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
             i += (int)chunk;
             if (s->progress)
@@ -72385,6 +72417,280 @@ static void qwen38_mtp_prefill_rows(ds4_session *s, const int *tokens,
 }
 #endif
 
+#ifndef DS4_NO_GPU
+/* One speculative round.
+ *
+ * `token` is the pending token the caller sampled greedily from s->logits. The
+ * round evaluates it, drafts up to QWEN38_MTP_DRAFT_MAX further tokens with the
+ * MTP head, and verifies them with a single batched trunk pass:
+ *
+ *   chunk row i (draft i+1 at position p+i) predicts the token at p+i+1, so
+ *   draft i+1 is accepted exactly when the chunk's own argmax at that row is
+ *   the drafted token.  A rejected draft ends the round there; the chunk's
+ *   argmax at that row is the correcting token.
+ *
+ * The committed stream is therefore greedy decoding by construction: every
+ * committed token is an argmax of a trunk forward that included it.  On a
+ * partial accept the recurrent state is rewound to the snapshot taken before
+ * the verify chunk and the accepted prefix plus the correcting token are
+ * replayed, so GDN state never keeps a rejected draft.
+ *
+ * out_tokens receives the committed tokens with out_tokens[0] == token, and
+ * s->logits is left predicting the token after them. */
+#define QWEN38_MTP_DRAFT_MAX 3u
+
+/* Commit one token through the ordinary token path.  Speculative rounds fall
+ * back to this whenever no draft state is available, so the caller's stream
+ * stays correct without speculation. */
+static int qwen38_mtp_eval_pending(ds4_session *s, int token,
+                                   char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+    const uint32_t raw_pos = (uint32_t)s->checkpoint.len;
+    if (!s->qwen38_gpu_ready || raw_pos >= s->qwen38_gpu_state.ctx_size) {
+        snprintf(err, errlen, "Qwen3.8 CUDA context reached (%u)",
+                 s->qwen38_gpu_state.ctx_size);
+        s->checkpoint_valid = false;
+        return 1;
+    }
+    qwen38_mtp_note_row(s, token, raw_pos, s->qwen38_rope_pos);
+    int ok = 0;
+    if (s->qwen38_rope_pos == raw_pos) {
+        ok = qwen38_gpu_forward_token(&s->qwen38_gpu_state, &e->model,
+                                      &e->qwen38_weights, token, raw_pos,
+                                      s->logits);
+        if (ok) s->qwen38_rope_pos++;
+    } else {
+        ok = qwen38_gpu_forward_chunk(&s->qwen38_gpu_state, &e->model,
+                                      &e->qwen38_weights, &token, 1u, raw_pos,
+                                      NULL, 0u, &s->qwen38_rope_pos,
+                                      s->logits, NULL);
+    }
+    if (!ok) {
+        snprintf(err, errlen, "Qwen3.8 CUDA decode failed");
+        s->checkpoint_valid = false;
+        return 1;
+    }
+    token_vec_push(&s->checkpoint, token);
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    s->qwen38_mtp_h_pos = (int64_t)raw_pos;
+    return 0;
+}
+
+/* Verify a chunk of draft rows against the trunk and commit the accepted
+ * prefix.
+ *
+ * Draft i occupies position base+i and chunk row i holds the trunk's argmax for
+ * the token after that position, so draft i+1 is accepted exactly when row i
+ * agrees with it; draft 0 was already checked against the pending token's own
+ * logits.  A rejected draft ends the round there and the chunk's argmax at that
+ * row is the correcting token.  On a partial accept the recurrent state is
+ * rewound to the snapshot taken before the chunk and the accepted prefix plus
+ * the correcting token are replayed, so GDN state never keeps a rejected
+ * draft.  The committed stream therefore matches one-token greedy decoding
+ * token for token, which the MTP gate pins down over its whole run. */
+static int qwen38_mtp_commit_round(ds4_session *s, int *out_tokens,
+                                   uint32_t *out_count, const int *drafts,
+                                   uint32_t n_drafts, char *err,
+                                   size_t errlen) {
+    ds4_engine *e = s->engine;
+    ds4_qwen38_mtp_gpu_state *mst = &s->qwen38_mtp_state;
+    ds4_qwen38_gpu_state *trunk = &s->qwen38_gpu_state;
+    const uint32_t base = (uint32_t)s->checkpoint.len;
+    if (n_drafts > QWEN38_MTP_MAX_ROWS ||
+        (uint64_t)base + n_drafts >= trunk->ctx_size) return 1;
+
+    if (!ds4_gpu_tensor_copy(mst->ssm_snapshot, 0, trunk->ssm_state, 0,
+                             ds4_gpu_tensor_bytes(trunk->ssm_state)) ||
+        !ds4_gpu_tensor_copy(mst->conv_snapshot, 0, trunk->conv_state, 0,
+                             ds4_gpu_tensor_bytes(trunk->conv_state))) {
+        snprintf(err, errlen, "Qwen MTP snapshot failed");
+        return 1;
+    }
+    uint32_t logical = s->qwen38_rope_pos;
+    if (!qwen38_gpu_forward_chunk(trunk, &e->model, &e->qwen38_weights, drafts,
+                                  n_drafts, base, NULL, 0u, &logical,
+                                  s->logits, mst->verify_logits_host)) {
+        snprintf(err, errlen, "Qwen MTP verify chunk failed");
+        return 1;
+    }
+
+    uint32_t accepted = 1u;
+    while (accepted < n_drafts) {
+        const float *row = mst->verify_logits_host +
+            (size_t)(accepted - 1u) * DS4_N_VOCAB;
+        if (sample_argmax(row, DS4_N_VOCAB) != drafts[accepted]) break;
+        accepted++;
+    }
+
+    if (accepted == n_drafts) {
+        for (uint32_t i = 0; i < n_drafts; i++) {
+            token_vec_push(&s->checkpoint, drafts[i]);
+            out_tokens[i + 1u] = drafts[i];
+        }
+        *out_count = n_drafts + 1u;
+        s->qwen38_rope_pos = logical;
+        s->qwen38_mtp_h_pos = (int64_t)(base + n_drafts - 1u);
+        mst->rows = base + n_drafts;
+        mst->valid = mst->rows;
+        s->qwen38_mtp_draft_token = sample_argmax(
+            mst->verify_logits_host + (size_t)(n_drafts - 1u) * DS4_N_VOCAB,
+            DS4_N_VOCAB);
+        s->qwen38_mtp_draft_valid = s->qwen38_mtp_draft_token >= 0;
+        return 0;
+    }
+
+    const int correct = sample_argmax(
+        mst->verify_logits_host + (size_t)(accepted - 1u) * DS4_N_VOCAB,
+        DS4_N_VOCAB);
+    if (!ds4_gpu_tensor_copy(trunk->ssm_state, 0, mst->ssm_snapshot, 0,
+                             ds4_gpu_tensor_bytes(trunk->ssm_state)) ||
+        !ds4_gpu_tensor_copy(trunk->conv_state, 0, mst->conv_snapshot, 0,
+                             ds4_gpu_tensor_bytes(trunk->conv_state))) {
+        snprintf(err, errlen, "Qwen MTP rollback failed");
+        s->checkpoint_valid = false;
+        return 1;
+    }
+    int replay[QWEN38_MTP_MAX_ROWS + 1u];
+    uint32_t replay_len = 0;
+    for (uint32_t i = 0; i < accepted; i++) replay[replay_len++] = drafts[i];
+    replay[replay_len++] = correct;
+    uint32_t replay_logical = s->qwen38_rope_pos;
+    if (!qwen38_gpu_forward_chunk(trunk, &e->model, &e->qwen38_weights, replay,
+                                  replay_len, base, NULL, 0u, &replay_logical,
+                                  s->logits, NULL)) {
+        snprintf(err, errlen, "Qwen MTP replay failed");
+        s->checkpoint_valid = false;
+        return 1;
+    }
+    for (uint32_t i = 0; i < replay_len; i++) {
+        token_vec_push(&s->checkpoint, replay[i]);
+        out_tokens[i + 1u] = replay[i];
+    }
+    *out_count = replay_len + 1u;
+    s->qwen38_rope_pos = replay_logical;
+    s->qwen38_mtp_h_pos = (int64_t)(base + replay_len - 1u);
+    mst->rows = base + replay_len;
+    mst->valid = mst->rows;
+    /* The correcting token needs its own draft row before the next round can
+     * propose from it; its hidden is the replay row one position earlier. */
+    const uint64_t row_bytes = QWEN38_N_EMBD * sizeof(float);
+    s->qwen38_mtp_draft_valid = false;
+    if (replay_len >= 2u &&
+        ds4_gpu_tensor_copy(mst->h_in, 0, trunk->out_norm,
+                            (uint64_t)(replay_len - 2u) * row_bytes,
+                            row_bytes)) {
+        const uint32_t position[1] = { s->qwen38_rope_pos - 1u };
+        const uint32_t last_pos = base + replay_len - 1u;
+        if (qwen38_mtp_gpu_forward(mst, &e->mtp_model, &e->qwen38_mtp_weights,
+                                   &e->model, &e->qwen38_weights,
+                                   &replay[replay_len - 1u], position,
+                                   last_pos, 1u, true, s->mtp_logits)) {
+            s->qwen38_mtp_draft_token = sample_argmax(s->mtp_logits, DS4_N_VOCAB);
+            s->qwen38_mtp_draft_valid = s->qwen38_mtp_draft_token >= 0;
+        }
+    }
+    return 0;
+}
+
+/* One speculative round.
+ *
+ * The pending token is committed with the ordinary token path first, so the
+ * trunk state and the MTP row for its position are exactly what plain decoding
+ * would produce.  The draft head then proposes up to QWEN38_MTP_DRAFT_MAX
+ * further tokens, which a single batched trunk pass verifies:
+ *
+ *   chunk row i (draft i+1 at position p+i) predicts the token at p+i+1, so
+ *   draft i+1 is accepted iff that row's argmax is the drafted token.
+ *
+ * Because acceptance only ever confirms the batched trunk's own argmax, the
+ * committed stream is greedy decoding token for token; a partial accept replays
+ * the accepted prefix so no rejected draft survives in the recurrent state.
+ *
+ * out_tokens receives the committed tokens with out_tokens[0] == token, and
+ * s->logits is left predicting the token after them. */
+int ds4_session_qwen38_spec_step(ds4_session *s, int token,
+                                 int *out_tokens, uint32_t cap,
+                                 uint32_t *out_count, char *err,
+                                 size_t errlen) {
+    if (!s || !out_tokens || !out_count || cap == 0u) return 1;
+    ds4_engine *e = s->engine;
+    if (!e || !e->qwen38_mtp_ready || !s->qwen38_mtp_state_ready) {
+        snprintf(err, errlen, "Qwen3.8 MTP drafting is unavailable");
+        return 1;
+    }
+    if (token < 0 || (uint32_t)token >= DS4_N_VOCAB) {
+        snprintf(err, errlen, "invalid pending token");
+        return 1;
+    }
+    ds4_qwen38_mtp_gpu_state *mst = &s->qwen38_mtp_state;
+    const uint32_t base = (uint32_t)s->checkpoint.len;
+    if (s->qwen38_mtp_failed || s->sync_image_count != 0 || cap < 2u ||
+        mst->ctx_size <= base + QWEN38_MTP_DRAFT_MAX ||
+        s->qwen38_mtp_h_pos != (int64_t)base - 1) {
+        if (qwen38_mtp_eval_pending(s, token, err, errlen) != 0) return 1;
+        out_tokens[0] = token;
+        *out_count = 1u;
+        return 0;
+    }
+    if (qwen38_mtp_eval_pending(s, token, err, errlen) != 0) return 1;
+    out_tokens[0] = token;
+    *out_count = 1u;
+    if (!s->qwen38_mtp_draft_valid) return 0;
+
+    const uint32_t committed_base = (uint32_t)s->checkpoint.len;
+    int drafts[QWEN38_MTP_DRAFT_MAX];
+    const int first = s->qwen38_mtp_draft_token;
+    if (first < 0 || (uint32_t)first >= DS4_N_VOCAB) return 0;
+    drafts[0] = first;
+    uint32_t n_drafts = 1u;
+    const uint32_t room = cap - 1u;
+    const uint32_t want = QWEN38_MTP_DRAFT_MAX < room ?
+        QWEN38_MTP_DRAFT_MAX : room;
+    const uint64_t row_bytes = QWEN38_N_EMBD * sizeof(float);
+    while (n_drafts < want) {
+        /* Draft row r pairs the hidden of r-1 with the token of r.  The first
+         * chained row still has the trunk hidden of the committed position;
+         * deeper rows feed the draft head's own hidden back, which is what the
+         * single-block MTP contract allows. */
+        const int src_ok = n_drafts == 1u
+            ? ds4_gpu_tensor_copy(mst->h_in, 0, s->qwen38_gpu_state.xnorm, 0,
+                                  row_bytes)
+            : ds4_gpu_tensor_copy(mst->h_in, 0, mst->head_norm, 0, row_bytes);
+        if (!src_ok) break;
+        const uint32_t position[1] = { s->qwen38_rope_pos };
+        if (!qwen38_mtp_gpu_forward(mst, &e->mtp_model, &e->qwen38_mtp_weights,
+                                    &e->model, &e->qwen38_weights,
+                                    &drafts[n_drafts - 1u], position,
+                                    committed_base + n_drafts - 1u, 1u, true,
+                                    s->mtp_logits)) break;
+        const int next = sample_argmax(s->mtp_logits, DS4_N_VOCAB);
+        if (next < 0 || (uint32_t)next >= DS4_N_VOCAB) break;
+        drafts[n_drafts++] = next;
+    }
+    if (n_drafts < 2u) return 0;
+    if (sample_argmax(s->logits, DS4_N_VOCAB) != drafts[0]) return 0;
+    uint32_t count = 0;
+    if (qwen38_mtp_commit_round(s, out_tokens, &count, drafts, n_drafts,
+                                err, errlen) != 0) {
+        s->qwen38_mtp_failed = true;
+        s->qwen38_mtp_draft_valid = false;
+        return 1;
+    }
+    *out_count = count;
+    return 0;
+}
+#else
+int ds4_session_qwen38_spec_step(ds4_session *s, int token,
+                                 int *out_tokens, uint32_t cap,
+                                 uint32_t *out_count, char *err,
+                                 size_t errlen) {
+    (void)s; (void)token; (void)out_tokens; (void)cap; (void)out_count;
+    snprintf(err, errlen, "Qwen3.8 MTP drafting requires a GPU build");
+    return 1;
+}
+#endif
+
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
@@ -72468,7 +72774,8 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             ok = qwen38_gpu_forward_chunk(&s->qwen38_gpu_state, &e->model,
                                           &e->qwen38_weights, &token, 1u,
                                           raw_pos, NULL, 0u,
-                                          &s->qwen38_rope_pos, s->logits);
+                                          &s->qwen38_rope_pos, s->logits,
+                                          NULL);
         }
         if (ok) s->qwen38_mtp_h_pos = (int64_t)raw_pos;
         if (!ok) {
