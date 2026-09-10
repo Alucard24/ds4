@@ -1,10 +1,28 @@
 #include "ds4.h"
+#include "white224_png.h"
 
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+
+/* Usage: the tests accept an explicit image path, or "-" for the embedded
+ * white 224x224 fixture, so the gate runs without external assets. */
+static const char *materialize_fixture(const char *arg, char *path,
+                                       size_t path_cap) {
+    if (arg && strcmp(arg, "-") != 0) return arg;
+    if (snprintf(path, path_cap, "/tmp/ds4-white224-XXXXXX") < 0) return NULL;
+    const int fd = mkstemp(path);
+    if (fd < 0) return NULL;
+    const ssize_t written = write(fd, white224_png, sizeof(white224_png));
+    if (close(fd) != 0 || written != (ssize_t)sizeof(white224_png)) {
+        unlink(path);
+        return NULL;
+    }
+    return path;
+}
 
 static void require(int ok, const char *message) {
     if (!ok) {
@@ -33,13 +51,17 @@ int main(int argc, char **argv) {
     options.backend = DS4_BACKEND_CUDA;
     options.context_size = 192;
     options.power_percent = 100;
+    char fixture[64] = {0};
+    const char *image_path = materialize_fixture(argv[3], fixture,
+                                                sizeof(fixture));
+    require(image_path != NULL, "embedded white image fixture");
     ds4_engine *engine = NULL;
     require(ds4_engine_open(&engine, &options) == 0, "engine open");
     require(ds4_engine_has_vision(engine), "vision sidecar not available");
 
     char error[256] = {0};
     ds4_vision_embedding image = {0};
-    require(ds4_engine_vision_encode_file(engine, argv[3], &image,
+    require(ds4_engine_vision_encode_file(engine, image_path, &image,
                                           error, sizeof(error)),
             error[0] ? error : "image encode");
     require(image.token_count == 49u && image.grid_width == 7u &&
@@ -184,7 +206,7 @@ int main(int argc, char **argv) {
     ds4_vision_embedding_free(&multi_spans[0].embedding);
     ds4_vision_embedding_free(&multi_spans[1].embedding);
 
-    const char *video_paths[] = {argv[3], argv[3], argv[3]};
+    const char *video_paths[] = {image_path, image_path, image_path};
     ds4_vision_embedding video = {0};
     require(ds4_engine_vision_encode_frame_files(
                 engine, video_paths, 3u, &video, error, sizeof(error)),

@@ -2342,9 +2342,23 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || aligned > limit - g_model_range_bytes) return NULL;
 
-    const uint64_t chunk = cuda_model_arena_chunk_bytes(aligned);
+    /* A single large request can fail while a smaller one still fits, for
+     * example when the context KV or a support model took the last free
+     * gigabytes.  Walking the chunk down keeps most weights resident instead of
+     * abandoning the whole cache, which used to leave every later tensor on the
+     * host path (measured: decode 50 -> 4 tok/s) with nothing printed. */
+    uint64_t chunk = cuda_model_arena_chunk_bytes(aligned);
+    const uint64_t floor_chunk = 256ull * 1048576ull;
+    const uint64_t at_least = aligned > floor_chunk ? aligned : floor_chunk;
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
+    while (err != cudaSuccess && chunk > at_least) {
+        (void)cudaGetLastError();
+        uint64_t next = chunk / 2u;
+        if (next < at_least) next = at_least;
+        chunk = next;
+        err = cudaMalloc(&dev, (size_t)chunk);
+    }
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: CUDA model arena alloc failed for %s (%.2f MiB chunk): %s\n",
                 what ? what : "weights",
@@ -2386,6 +2400,20 @@ static const char *cuda_model_range_ptr_from_fd(
     char *dev = cuda_model_arena_alloc(bytes, what);
     if (!dev) {
         if (getenv("DS4_CUDA_STRICT_WEIGHT_CACHE") != NULL) return NULL;
+        /* Falling back to the host mapping is a ~12x decode slowdown, so it is
+         * never silent: the user has to know the cache ran out, and with which
+         * budget. */
+        static int host_fallback_notice;
+        if (!host_fallback_notice) {
+            host_fallback_notice = 1;
+            fprintf(stderr,
+                    "ds4: CUDA weight cache is full: %s and every later tensor "
+                    "are read from host memory, which makes decode far slower. "
+                    "Lower --ctx, free VRAM, raise the cache budget with "
+                    "DS4_CUDA_MODEL_CACHE_GB, or set DS4_CUDA_STRICT_WEIGHT_CACHE=1 "
+                    "to fail instead of degrading.\n",
+                    what ? what : "the next weight range");
+        }
         return cuda_model_ptr(model_map, offset);
     }
     cudaError_t err = cudaSuccess;
@@ -32866,6 +32894,20 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
                 weight_type);
         return 0;
     }
+}
+
+extern "C" int ds4_gpu_memory_info(uint64_t *free_bytes, uint64_t *total_bytes) {
+    if (!free_bytes || !total_bytes) return 0;
+    *free_bytes = 0;
+    *total_bytes = 0;
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    *free_bytes = (uint64_t)free_b;
+    *total_bytes = (uint64_t)total_b;
+    return 1;
 }
 
 extern "C" uint64_t ds4_gpu_recommended_working_set_size(void) {

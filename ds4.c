@@ -7752,6 +7752,8 @@ typedef struct {
     uint32_t valid;             /* rows that match the committed prefix */
 } ds4_qwen38_mtp_gpu_state;
 
+static void qwen38_mtp_drop_history(ds4_session *s);
+
 static int qwen38_gpu_alloc_bytes(ds4_gpu_tensor **out, uint64_t bytes,
                                   const char *label) {
     *out = ds4_gpu_tensor_alloc(bytes);
@@ -7899,6 +7901,26 @@ static void qwen38_mtp_gpu_state_free(ds4_qwen38_mtp_gpu_state *st) {
     free(st->verify_logits_host);
 #undef QWEN38_MTP_FREE
     memset(st, 0, sizeof(*st));
+}
+
+/* Bytes one session's draft state occupies: the activation rows plus the
+ * verification scratch, the recurrent snapshot and the draft's own K/V.  The
+ * residency guard below sizes the sidecar against this plus the trunk. */
+static uint64_t qwen38_mtp_state_bytes(uint32_t ctx_size) {
+    const uint64_t rows = QWEN38_MTP_MAX_ROWS;
+    uint64_t bytes = (uint64_t)ctx_size * QWEN38_GA_KV_DIM * sizeof(uint16_t) * 2ull;
+    bytes += rows * 3ull * sizeof(uint32_t);
+    bytes += rows * (uint64_t)DS4_N_VOCAB * sizeof(float);
+    uint64_t floats = rows * QWEN38_N_EMBD * 6ull;              /* rows + xnorm */
+    floats += rows * 2ull * QWEN38_N_EMBD;                      /* concat */
+    floats += rows * 2ull * QWEN38_N_HEAD * QWEN38_HEAD_DIM;    /* q_full */
+    floats += rows * 2ull * QWEN38_N_HEAD_KV * QWEN38_HEAD_DIM; /* k, v */
+    floats += rows * QWEN38_VALUE_DIM * 2ull;                   /* attn, proj */
+    floats += rows * QWEN38_N_FF * 3ull;                        /* ffn */
+    floats += rows * (uint64_t)DS4_N_VOCAB * 2ull;              /* logits, verify */
+    floats += 48ull * 48 * 128 * 128;                           /* ssm_snapshot */
+    floats += 48ull * 3 * QWEN38_CONV_DIM;                      /* conv_snapshot */
+    return bytes + floats * sizeof(float);
 }
 
 static int qwen38_mtp_gpu_state_init(ds4_qwen38_mtp_gpu_state *st,
@@ -58406,10 +58428,15 @@ static int ds4_session_load_qwen38_payload(ds4_session *s, FILE *fp,
     s->checkpoint_images = new_images;
     s->checkpoint_image_count = image_count;
     s->qwen38_rope_pos = rope_pos;
+    s->checkpoint_valid = true;
+    /* The restored payload carries trunk state, not draft state: the draft
+     * rows for this prefix were never written. */
+#ifndef DS4_NO_GPU
+    qwen38_mtp_drop_history(s);
+#endif
     s->qwen38_mtp_h_pos = -1;
     s->qwen38_mtp_draft_valid = false;
     s->qwen38_mtp_draft_token = -1;
-    s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
     s->greedy_splitkv_segment.len = 0;
     s->greedy_splitkv_anchor_valid = false;
@@ -59285,7 +59312,11 @@ bool ds4_engine_mtp_exact_sampling(ds4_engine *e) {
 }
 
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
-    if (ds4_engine_has_qwen38_mtp(e)) return (int)QWEN38_MTP_DRAFT_MAX + 1;
+    /* --quality means one token at a time; the draft head only ever proposes
+     * argmax continuations, so it stays off there like every other batched
+     * verification path. */
+    if (ds4_engine_has_qwen38_mtp(e) && !e->quality)
+        return (int)QWEN38_MTP_DRAFT_MAX + 1;
     if (e && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 ? 2 : 0;
     }
@@ -66047,7 +66078,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
  * table and LM head stay the trunk's: nextn.shared_head_norm exists precisely
  * because those are shared. */
 static int qwen38_mtp_sidecar_open(ds4_engine *e, const char *path,
-                                   bool graph_backend) {
+                                   bool graph_backend, int context_hint) {
 #ifndef DS4_NO_GPU
     ds4_str arch = {0};
     /* The sidecar shares its file with an unexecuted trunk, so its parse
@@ -66073,6 +66104,64 @@ static int qwen38_mtp_sidecar_open(ds4_engine *e, const char *path,
     uint64_t *mtp_offsets = NULL;
     uint64_t *mtp_sizes = NULL;
     uint32_t mtp_span_count = 0;
+    /* Residency check before anything is preloaded.
+     *
+     * The draft head only pays for itself while the trunk, the context and the
+     * sidecar all stay resident.  Measured on a 16 GiB device: 10.95 GiB of
+     * trunk + a 24k context + the sidecar and its state did not fit, and decode
+     * collapsed from ~50 to ~4.2 tok/s with speculation either on or off, so
+     * the failure is residency and it hits whether or not the rounds run.
+     * The bound is "everything resident minus the 2 GiB the driver and desktop
+     * hold": on this 16 GiB card that allows the measured working 16k
+     * configuration (13.24 GiB estimated) and refuses the measured collapsing
+     * ones (24k at 13.63, 32k at 14.30).  Refusing here keeps the trunk at full
+     * speed and says why; DS4_MTP_ALLOW_OVERCOMMIT=1 forces the sidecar in on a
+     * device whose real budget is larger than the query reports. */
+    if (getenv("DS4_MTP_ALLOW_OVERCOMMIT") == NULL) {
+        uint64_t free_bytes = 0, total_bytes = 0;
+        uint64_t sidecar_bytes = 0;
+        const uint32_t guard_ctx = context_hint > 0 ?
+            (uint32_t)context_hint : 32768u;
+        const uint64_t ctx_bytes =
+            qwen38_memory_estimate((int)guard_ctx, true).total_bytes;
+        const uint64_t state_bytes = qwen38_mtp_state_bytes(guard_ctx);
+        uint64_t *span_offsets = NULL;
+        uint64_t *span_sizes = NULL;
+        uint32_t span_count = 0;
+        if (qwen38_mtp_sidecar_spans(&e->qwen38_mtp_weights, &span_offsets,
+                                     &span_sizes, &span_count)) {
+            for (uint32_t i = 0; i < span_count; i++) sidecar_bytes += span_sizes[i];
+            free(span_offsets);
+            free(span_sizes);
+        }
+        /* Tensor payload only: the metadata block is never resident. */
+        const uint64_t trunk_bytes = e->model.size > e->model.tensor_data_pos ?
+            e->model.size - e->model.tensor_data_pos : e->model.size;
+        const uint64_t needed = trunk_bytes + ctx_bytes + sidecar_bytes +
+                                state_bytes;
+        const uint64_t reserve = 2ull * 1024ull * 1024ull * 1024ull;
+        const bool bounded = ds4_gpu_memory_info(&free_bytes, &total_bytes) &&
+                             total_bytes > reserve;
+        if (bounded && needed > total_bytes - reserve) {
+            fprintf(stderr,
+                    "ds4: skipping the Qwen3.8 MTP draft head: %u-token context "
+                    "needs ~%.2f GiB resident (trunk %.2f + context %.2f + "
+                    "draft %.2f) of the %.2f GiB this device reports, leaving "
+                    "less than the 2 GiB the driver needs\n",
+                    guard_ctx, (double)needed / 1073741824.0,
+                    (double)e->model.size / 1073741824.0,
+                    (double)ctx_bytes / 1073741824.0,
+                    (double)(sidecar_bytes + state_bytes) / 1073741824.0,
+                    (double)total_bytes / 1073741824.0);
+            fprintf(stderr,
+                    "ds4: lower --ctx, or set DS4_MTP_ALLOW_OVERCOMMIT=1 to "
+                    "load it anyway (decode may drop to a few tokens per "
+                    "second)\n");
+            e->support_kind = DS4_SUPPORT_NONE;
+            model_close(&e->mtp_model);
+            return 0;
+        }
+    }
     if (!qwen38_mtp_sidecar_spans(&e->qwen38_mtp_weights, &mtp_offsets,
                                   &mtp_sizes, &mtp_span_count) ||
         !ds4_gpu_set_model_map_range(
@@ -66104,7 +66193,7 @@ static int qwen38_mtp_sidecar_open(ds4_engine *e, const char *path,
             path, DS4_N_LAYER);
     return 0;
 #else
-    (void)e; (void)path; (void)graph_backend;
+    (void)e; (void)path; (void)graph_backend; (void)context_hint;
     fprintf(stderr, "ds4: Qwen3.8 MTP drafting requires a GPU build\n");
     return 1;
 #endif
@@ -66501,7 +66590,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (opt->inspect_only) {
             if (opt->mtp_path && opt->mtp_path[0] &&
                 opt->distributed.role == DS4_DISTRIBUTED_NONE &&
-                qwen38_mtp_sidecar_open(e, opt->mtp_path, false) != 0) {
+                qwen38_mtp_sidecar_open(e, opt->mtp_path, false,
+                                                      opt->context_size) != 0) {
                 ds4_engine_close(e);
                 *out = NULL;
                 return 1;
@@ -66559,7 +66649,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
          * this path rather than in the generic support-model block below. */
         if (opt->mtp_path && opt->mtp_path[0] &&
             opt->distributed.role == DS4_DISTRIBUTED_NONE &&
-            qwen38_mtp_sidecar_open(e, opt->mtp_path, graph_backend) != 0) {
+            qwen38_mtp_sidecar_open(e, opt->mtp_path, graph_backend,
+                                    opt->context_size) != 0) {
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -72389,6 +72480,39 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
     default:
         break;
     }
+}
+
+/* Drop the draft head's K/V history.
+ *
+ * The trunk K/V is authoritative, but the draft's rows describe a token
+ * sequence of its own.  When the session prefix is replaced or rewound, rows
+ * below the new base belong to the old prefix; zeroing them keeps the draft
+ * attending to a well-defined (empty) history instead of a stale one.  The
+ * draft is only a proposal, so this trades some acceptance for determinism
+ * and never affects the committed stream. */
+static void qwen38_mtp_drop_history(ds4_session *s) {
+    if (!s || !s->qwen38_mtp_state_ready) return;
+    ds4_qwen38_mtp_gpu_state *mst = &s->qwen38_mtp_state;
+    if (!mst->rows) {
+        s->qwen38_mtp_h_pos = -1;
+        s->qwen38_mtp_draft_valid = false;
+        return;
+    }
+    /* fill_f32 counts f32 elements, and these tensors are FP16. */
+    const uint64_t kv_floats = ds4_gpu_tensor_bytes(mst->kv_k) / sizeof(float);
+    if (!ds4_gpu_tensor_fill_f32(mst->kv_k, 0.0f, kv_floats) ||
+        !ds4_gpu_tensor_fill_f32(mst->kv_v, 0.0f,
+                                 ds4_gpu_tensor_bytes(mst->kv_v) /
+                                     sizeof(float))) {
+        /* The draft would attend to unknown K/V from here on, so stop
+         * proposing rather than propose from garbage. */
+        s->qwen38_mtp_failed = true;
+    }
+    mst->rows = 0;
+    mst->valid = 0;
+    s->qwen38_mtp_h_pos = -1;
+    s->qwen38_mtp_draft_valid = false;
+    s->qwen38_mtp_draft_token = -1;
 }
 
 /* Run one MTP draft row for a position being committed.
@@ -79502,6 +79626,7 @@ void ds4_session_invalidate(ds4_session *s) {
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
     ds4_session_glm_reset_dense_cache(s);
+    qwen38_mtp_drop_history(s);
 #endif
 }
 
@@ -79530,6 +79655,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     s->glm_mtp_have = 0;
     s->glm_mtp_rollback_valid = false;
     ds4_session_glm_cap_dense_cache(s);
+    qwen38_mtp_drop_history(s);
 #endif
 }
 

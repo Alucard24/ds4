@@ -4635,6 +4635,14 @@ void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
     g_stream_expert_cache_expert_bytes = bytes;
 }
 
+int ds4_gpu_memory_info(uint64_t *free_bytes, uint64_t *total_bytes) {
+    /* Metal sizes from its own allocation budget rather than from a free-VRAM
+     * query, and the Qwen3.8 draft head is CUDA-only. */
+    if (free_bytes) *free_bytes = 0;
+    if (total_bytes) *total_bytes = 0;
+    return 0;
+}
+
 uint64_t ds4_gpu_recommended_working_set_size(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!g_device) return 0;

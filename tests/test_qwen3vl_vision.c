@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "white224_png.h"
 #include "ds4_image.h"
 
 #include <errno.h>
@@ -6,6 +7,23 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+
+/* Usage: the tests accept an explicit image path, or "-" for the embedded
+ * white 224x224 fixture, so the gate runs without external assets. */
+static const char *materialize_fixture(const char *arg, char *path,
+                                       size_t path_cap) {
+    if (arg && strcmp(arg, "-") != 0) return arg;
+    if (snprintf(path, path_cap, "/tmp/ds4-white224-XXXXXX") < 0) return NULL;
+    const int fd = mkstemp(path);
+    if (fd < 0) return NULL;
+    const ssize_t written = write(fd, white224_png, sizeof(white224_png));
+    if (close(fd) != 0 || written != (ssize_t)sizeof(white224_png)) {
+        unlink(path);
+        return NULL;
+    }
+    return path;
+}
 
 static int write_f32(const char *path, const float *data, size_t count) {
     FILE *fp = fopen(path, "wb");
@@ -32,11 +50,18 @@ int main(int argc, char **argv) {
     options.backend = DS4_BACKEND_CUDA;
     options.inspect_only = true;
 
+    char fixture[64] = {0};
+    const char *image_path = materialize_fixture(argv[3], fixture,
+                                                sizeof(fixture));
+    if (!image_path) {
+        fprintf(stderr, "cannot materialize the embedded white image fixture\n");
+        return 1;
+    }
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &options) != 0) return 1;
     char error[256] = {0};
     ds4_vision_embedding embedding = {0};
-    if (!ds4_engine_vision_encode_file(engine, argv[3], &embedding,
+    if (!ds4_engine_vision_encode_file(engine, image_path, &embedding,
                                        error, sizeof(error))) {
         fprintf(stderr, "Qwen3-VL encode failed: %s\n", error);
         ds4_engine_close(engine);
@@ -69,7 +94,7 @@ int main(int argc, char **argv) {
            embedding.grid_width, embedding.grid_height,
            embedding.token_count, sum);
 
-    const char *pair_paths[] = {argv[3], argv[3]};
+    const char *pair_paths[] = {image_path, image_path};
     ds4_vision_embedding pair = {0};
     if (!ds4_engine_vision_encode_frame_files(
             engine, pair_paths, 2u, &pair, error, sizeof(error)) ||
@@ -83,7 +108,7 @@ int main(int argc, char **argv) {
     }
     ds4_vision_embedding_free(&pair);
 
-    const char *odd_paths[] = {argv[3], argv[3], argv[3]};
+    const char *odd_paths[] = {image_path, image_path, image_path};
     ds4_vision_embedding odd = {0};
     if (!ds4_engine_vision_encode_frame_files(
             engine, odd_paths, 3u, &odd, error, sizeof(error)) ||
