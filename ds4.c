@@ -2328,6 +2328,13 @@ static const char *tensor_type_name(uint32_t type) {
     return info ? info->name : "unknown";
 }
 
+/* A support-model GGUF can carry a whole trunk this process never binds: the
+ * Qwen3.8 MTP sidecar is a 65-block file whose first 64 blocks belong to a
+ * different quantization of the same model.  Warning once per unexecuted
+ * tensor there buries the startup log, so the sidecar open quiets the parse
+ * warnings; binding still refuses anything it cannot execute. */
+static bool g_model_parse_quiet_types;
+
 static bool tensor_nbytes(uint32_t type, uint64_t elements, uint64_t *bytes) {
     const gguf_type_info *info = tensor_type(type);
     if (!info || info->block_elems == 0) return false;
@@ -2574,10 +2581,12 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
         if (!cursor_u64(c, &t->rel_offset)) ds4_die(c->error);
 
         if (!tensor_nbytes(t->type, t->elements, &t->bytes)) {
-            ds4_log(stderr,
-                DS4_LOG_WARNING,
-                "ds4: warning: tensor %.*s has unsupported GGUF type %u\n",
-                (int)t->name.len, t->name.ptr, t->type);
+            if (!g_model_parse_quiet_types) {
+                ds4_log(stderr,
+                    DS4_LOG_WARNING,
+                    "ds4: warning: tensor %.*s has unsupported GGUF type %u\n",
+                    (int)t->name.len, t->name.ptr, t->type);
+            }
         }
     }
 
@@ -6547,7 +6556,26 @@ static void config_validate_glm53_model(const ds4_model *m) {
 static void config_validate_qwen38_model(const ds4_model *m) {
     g_ds4_shape = DS4_SHAPE_QWEN38;
 
-    config_expect_u32("block_count", required_u32(m, "qwen35.block_count"), 64);
+    const uint32_t blocks = required_u32(m, "qwen35.block_count");
+    if (blocks != 64u) {
+        uint32_t nextn = 0;
+        if (model_get_u32(m, "qwen35.nextn_predict_layers", &nextn) && nextn != 0) {
+            /* A single GGUF carrying both the trunk and an embedded draft head
+             * is a valid llama.cpp layout that this engine deliberately does
+             * not run: it binds the trunk and the draft head from separate
+             * files.  Say so instead of only reporting a block count. */
+            fprintf(stderr,
+                    "ds4: this Qwen3.8 GGUF stores %u trunk blocks plus %u "
+                    "embedded MTP head block(s), a layout this engine does not "
+                    "run as a main model\n", blocks - nextn, nextn);
+            fprintf(stderr,
+                    "ds4: run the 64-block trunk (e.g. the IQ3_S quantization) "
+                    "and pass this file as --mtp-model for the draft head, or "
+                    "run this quantization with llama.cpp\n");
+            exit(1);
+        }
+    }
+    config_expect_u32("block_count", blocks, 64);
     config_expect_u32("embedding_length", required_u32(m, "qwen35.embedding_length"), 5120);
     config_expect_u32("feed_forward_length", required_u32(m, "qwen35.feed_forward_length"), 17408);
     config_expect_u32("head_count", required_u32(m, "qwen35.attention.head_count"), 24);
@@ -7283,6 +7311,10 @@ typedef struct {
  * table and the LM head stay the trunk's, which is what `shared_head_norm`
  * names. The head therefore costs one attention block, not a second model. */
 #define QWEN38_MTP_MAX_ROWS 8u
+/* Draft tokens proposed per speculative round.  Four is the measured
+ * optimum: every extra draft re-reads the draft block and the full LM head, so
+ * five and six cost more than they recover on the 16GB CUDA target. */
+#define QWEN38_MTP_DRAFT_MAX 4u
 
 typedef struct {
     const ds4_tensor *eh_proj;          /* (2*n_embd, n_embd) */
@@ -7327,8 +7359,14 @@ static void qwen38_check_tensor(const ds4_tensor *t,
     }
     if (!qwen38_tensor_type_supported(t, matrix)) {
         fprintf(stderr,
-                "ds4: qwen38 tensor %s has unsupported type %s\n",
-                name, tensor_type_name(t->type));
+                "ds4: qwen38 tensor %s uses GGUF type %u (%s), which this "
+                "engine does not execute\n",
+                name, t->type, tensor_type_name(t->type));
+        fprintf(stderr,
+                "ds4: only the mixed-IQ trunk formats are executable; a "
+                "Qwen3.8 file quantized differently still works as --mtp-model "
+                "over an executable trunk, or run that quantization with "
+                "llama.cpp\n");
         exit(1);
     }
 }
@@ -59247,6 +59285,7 @@ bool ds4_engine_mtp_exact_sampling(ds4_engine *e) {
 }
 
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
+    if (ds4_engine_has_qwen38_mtp(e)) return (int)QWEN38_MTP_DRAFT_MAX + 1;
     if (e && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 ? 2 : 0;
     }
@@ -66011,7 +66050,11 @@ static int qwen38_mtp_sidecar_open(ds4_engine *e, const char *path,
                                    bool graph_backend) {
 #ifndef DS4_NO_GPU
     ds4_str arch = {0};
+    /* The sidecar shares its file with an unexecuted trunk, so its parse
+     * warnings say nothing about what this process can run. */
+    g_model_parse_quiet_types = true;
     model_open(&e->mtp_model, path, graph_backend, true);
+    g_model_parse_quiet_types = false;
     if (!model_get_string(&e->mtp_model, "general.architecture", &arch) ||
         !ds4_streq(arch, "qwen35")) {
         fprintf(stderr, "ds4: --mtp-model %s is not a Qwen3.8 GGUF\n", path);
@@ -68431,6 +68474,20 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
         s->qwen38_gpu_ready = true;
         if (e->qwen38_mtp_ready) {
+            /* Measured on a 16 GiB device: model (10.95 GiB) + a 24k context
+             * (1.6 GiB) + the sidecar and its state (0.96 GiB) no longer stay
+             * resident, and every token then streams weights from host memory.
+             * Decode collapsed from ~50 to ~4.2 tok/s with speculation either
+             * on or off, so the cause is residency, not the draft rounds. */
+            if (ctx_size >= 24576) {
+                fprintf(stderr,
+                        "ds4: warning: --mtp-model with a %d-token context "
+                        "exceeds the resident budget measured on a 16 GiB "
+                        "device (sidecar 0.79 GiB + 0.17 GiB state); decode "
+                        "may collapse to a few tokens per second. 16k measured "
+                        "safe; drop --mtp-model or lower --ctx otherwise.\n",
+                        ctx_size);
+            }
             if (!qwen38_mtp_gpu_state_init(&s->qwen38_mtp_state,
                                            (uint32_t)ctx_size)) {
                 fprintf(stderr,
@@ -72437,8 +72494,6 @@ static void qwen38_mtp_prefill_rows(ds4_session *s, const int *tokens,
  *
  * out_tokens receives the committed tokens with out_tokens[0] == token, and
  * s->logits is left predicting the token after them. */
-#define QWEN38_MTP_DRAFT_MAX 4u
-
 /* Commit one token through the ordinary token path.  Speculative rounds fall
  * back to this whenever no draft state is available, so the caller's stream
  * stays correct without speculation. */
@@ -78436,6 +78491,28 @@ static int ds4_session_eval_speculative_argmax_impl(
         accepted[0] = first_token;
         return 1;
     }
+    /* Qwen3.8 uses its own round: the pending token goes through the ordinary
+     * token path and the draft head's proposals are verified with one batched
+     * trunk pass, which is exactly what the caller's greedy loop wants. */
+    if (ds4_session_is_qwen38(s) && ds4_engine_has_qwen38_mtp(s->engine)) {
+        (void)max_tokens;
+        (void)eos_token;
+        if (!accepted || accepted_cap <= 0) return 0;
+#ifndef DS4_NO_GPU
+        uint32_t cap = (uint32_t)accepted_cap;
+        if (cap > QWEN38_MTP_DRAFT_MAX + 1u) cap = QWEN38_MTP_DRAFT_MAX + 1u;
+        uint32_t count = 0;
+        if (ds4_session_qwen38_spec_step(s, first_token, accepted, cap, &count,
+                                         err, errlen) != 0) {
+            return -1;
+        }
+        return (int)count;
+#else
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+#endif
+    }
     if (ds4_session_is_glm(s)) {
         (void)max_tokens;
         (void)eos_token;
@@ -79288,6 +79365,13 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
     }
     if (accepted_cap > max_tokens) accepted_cap = max_tokens;
     if (s->distributed || ds4_session_is_cpu(s)) {
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
+    /* The Qwen3.8 draft head only proposes argmax continuations, so sampled
+     * decoding keeps the one-token path. */
+    if (ds4_session_is_qwen38(s) && ds4_engine_has_qwen38_mtp(s->engine)) {
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;
