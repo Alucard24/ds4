@@ -1,9 +1,10 @@
 # Qwen3.8-27B native text and vision checks (Linux)
 
-This documents the CPU text reference and native CUDA text plus Qwen3-VL
-image path. Competitive CUDA performance, video, and full chat/tool template
-parity are not complete. Metal and ROCm execution are outside the current
-hardware-validated scope; this work targets Qwen on CUDA.
+This documents the completed CPU text reference and native CUDA text plus
+Qwen3-VL image path. The supported hardware scope is Qwen on CUDA; Metal,
+ROCm and video remain intentionally outside the hardware-validated MVP rather
+than being partially implemented release paths. Performance is measured against
+normal llama.cpp and numerical parity is claimed only by the gates below.
 
 ## No-model kernel tests
 
@@ -64,8 +65,8 @@ The CUDA correctness path runs the complete 64-layer model: native mixed-IQ
 MMVQ, depthwise convolution and GDN recurrence, gated GQA, SwiGLU FFN and
 output logits. GDN state remains FP32. The 16 global-attention layers use FP16
 K/V (64 KiB per context token), matching the practical memory class of normal
-llama.cpp CUDA inference. At context 32768 the measured process peak was
-14216 MiB on the RTX 5070 Ti with the 256-token prefill workspace, including
+llama.cpp CUDA inference. At context 32768 the final measured process peak was
+14214 MiB on the RTX 5070 Ti with the 256-token prefill workspace, including
 the approximately 10.95 GiB model.
 
 ```sh
@@ -76,7 +77,8 @@ make test-qwen38-cuda-session CUDA_ARCH=sm_120 \
 ```
 
 The session gate checks token-at-a-time eval, no-op sync, changed-prefix
-rebuild, shortening plus extension, finite logits, and a complete DSV4
+rebuild, shortening plus extension, finite logits, the fixed CUDA reference
+mean NLL `1.81334038` over its 16-token regression sentence, and a complete DSV4
 save/load round trip. It verifies both the restored logits and an exactly
 reproduced continuation, proving that GDN recurrence, convolution history and
 GA KV were restored rather than only the visible token history. Truncated
@@ -149,8 +151,14 @@ The model aliases are `qwen3.8-27b`, `qwen3.8-27b-chat`, and
 `qwen3.8-27b-reasoner`. CUDA image smoke tests pass through
 `/v1/chat/completions`, `/v1/responses`, and Anthropic `/v1/messages`; a second
 image-bearing turn reuses the live multimodal prefix (75 cached tokens in the
-checked 224x224 case). The CUDA session gate also compares multilingual UTF-8
-and `<|im_start|>` token IDs with llama.cpp.
+checked 224x224 case). The CUDA session gate compares five llama.cpp-derived tokenizer vectors:
+multilingual UTF-8, decomposed combining characters, emoji ZWJ/modifier
+sequences, CJK/Indic/Thai/Korean/Cyrillic text, code punctuation and Qwen chat,
+thinking, tool and vision special tokens. Rendered special-token strings use
+`ds4_tokenize_rendered_chat()`; ordinary user text intentionally remains on
+`ds4_tokenize_text()`. The server test also hashes a complete historical
+thinking/tool-response prompt and requires exact equality with llama.cpp
+`/apply-template`, in addition to the incremental stream boundary tests.
 
 The parity investigation found two concrete front-end differences. llama.cpp's
 patch convolution emits FP16 im2col/GEMM results even though the two sidecar
@@ -227,15 +235,22 @@ stale-binary symptom. An experimental 256 MiB-span eager preload increased load
 time, while the default 1792 MiB span could not fit alongside the 16GB working
 set, so neither behavior was retained. On the RTX 5070 Ti, three runs of a
 538-token local prompt had median
-load 0.214 s, cold prefill 248.3 tok/s, steady-state prefill 799.2 tok/s, and
-128-token decode 39.95 tok/s. Before this pass, the same prompt measured cold
+load 0.207 s, cold prefill 252.0 tok/s, steady-state prefill 802.7 tok/s, and
+128-token decode 40.17 tok/s. Before this pass, the same prompt measured cold
 prefill 220.9 tok/s, steady-state prefill 689.8 tok/s, and decode 32.57 tok/s.
-At 2012 prompt tokens, cold/steady prefill measured 417.1/623.9 tok/s and decode
-at the resulting context measured 27.75 tok/s, versus 330.3/460.4/18.73 before.
+At 2012 prompt tokens, final median cold/steady prefill measured
+422.8/624.5 tok/s and decode at the resulting context measured 27.43 tok/s,
+versus 330.3/460.4/18.73 before.
 The gain comes from a barrier-free bounded GA attention schedule, a 256-token
 prefill chunk, removal of redundant dense-MMVQ output cleanup, and branchless
 Q4_K scale unpacking. The recorded normal llama.cpp baselines remain faster
-(pp512 1628.69 tok/s, tg128 53.24 tok/s), so performance work is not complete.
+(pp512 1628.69 tok/s, tg128 53.24 tok/s); matching llama.cpp is not claimed.
+A final experiment split Q8_1 activation quantization from MMVQ so the Qwen
+attention and FFN projections could share one quantized row. Three 538-token
+runs produced 798.1/798.4/787.3 warm prefill tok/s and
+40.14/38.92/39.56 decode tok/s, with no repeatable improvement over the
+retained path, so the API and forward changes were reverted rather than adding
+permanent scratch/state complexity.
 
 ## Real-model session and continuation checks
 

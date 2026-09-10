@@ -17223,6 +17223,9 @@ static void test_render_qwen_template_history(void) {
         "\"description\":\"run\",\"name\":\"bash\"}", NULL,
         DS4_THINK_HIGH);
     TEST_ASSERT(prompt != NULL);
+    char prompt_sha[41];
+    sha1_bytes_hex(prompt, strlen(prompt), prompt_sha);
+    TEST_ASSERT(!strcmp(prompt_sha, "bda362f23ad229cf90a8274c276b0507d322f064"));
     TEST_ASSERT(strstr(prompt,
         "<tools>\n{\"type\": \"function\", \"function\": {"
         "\"name\": \"bash\", \"description\": \"run\", \"parameters\": "

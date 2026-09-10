@@ -17,19 +17,59 @@ static void require(int ok, const char *message) {
 static double rebuild_logit_tolerance;
 
 static void check_qwen_tokenizer(ds4_engine *e) {
-    static const int expected[] = {
+    static const int ids0[] = {
         9419, 11, 50203, 1892, 220, 99986, 171405, 59720, 102, 9008,
         237, 121, 373, 235, 88995, 119, 198, 248045, 74455, 198,
     };
-    ds4_tokens got = {0};
-    ds4_tokenize_rendered_chat(e,
-        "Hello, café — 中文 العربية 👩🏽‍💻\n<|im_start|>assistant\n",
-        &got);
-    require(got.len == (int)(sizeof(expected) / sizeof(expected[0])),
-            "multilingual tokenizer length mismatch");
-    require(memcmp(got.v, expected, sizeof(expected)) == 0,
-            "multilingual/special tokenizer IDs differ from llama.cpp");
-    ds4_tokens_free(&got);
+    static const int ids1[] = {
+        727, 50203, 2007, 1590, 198, 827, 5046, 95789, 763, 328,
+        9008, 239, 102, 9008, 237, 121, 373, 235, 88995, 119, 487,
+        328, 77, 763, 220, 18, 13, 16, 19, 92, 198,
+    };
+    static const int ids2[] = {
+        248045, 74455, 198, 248068, 198, 3965, 40312, 198, 248069,
+        198, 248058, 198, 27, 1628, 21402, 956, 29, 198, 27, 15704,
+        28, 5454, 29, 198, 24751, 198, 510, 15704, 29, 198, 510,
+        1628, 29, 198, 248059, 248046, 198,
+    };
+    static const int ids3[] = {
+        68, 52033, 3825, 59720, 101, 373, 235, 9008, 239, 102, 373,
+        235, 9008, 239, 100, 373, 235, 9008, 239, 99, 190488, 150127,
+        177453, 181204, 190925, 211075, 198,
+    };
+    static const int ids4[] = {248053, 248056, 248054, 248057};
+    static const struct {
+        const char *text;
+        const int *ids;
+        size_t count;
+        int rendered;
+    } cases[] = {
+        {"Hello, café — 中文 العربية 👩🏽‍💻\n<|im_start|>assistant\n",
+         ids0, sizeof(ids0) / sizeof(ids0[0]), 1},
+        {"def café(x):\n\treturn {\"中\": \"👩🏽‍💻\", \"n\": 3.14}\n",
+         ids1, sizeof(ids1) / sizeof(ids1[0]), 0},
+        {"<|im_start|>assistant\n<think>\nragiona\n</think>\n<tool_call>\n"
+         "<function=bash>\n<parameter=command>\npwd\n</parameter>\n"
+         "</function>\n</tool_call><|im_end|>\n",
+         ids2, sizeof(ids2) / sizeof(ids2[0]), 1},
+        {"é é 👨‍👩‍👧‍👦 हिन्दी ไทย 한국어 русский\n",
+         ids3, sizeof(ids3) / sizeof(ids3[0]), 0},
+        {"<|vision_start|><|image_pad|><|vision_end|><|video_pad|>",
+         ids4, sizeof(ids4) / sizeof(ids4[0]), 1},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ds4_tokens got = {0};
+        if (cases[i].rendered)
+            ds4_tokenize_rendered_chat(e, cases[i].text, &got);
+        else
+            ds4_tokenize_text(e, cases[i].text, &got);
+        if (got.len != (int)cases[i].count ||
+            memcmp(got.v, cases[i].ids, cases[i].count * sizeof(int)) != 0) {
+            fprintf(stderr, "FAIL: tokenizer case %zu differs from llama.cpp\n", i);
+            exit(1);
+        }
+        ds4_tokens_free(&got);
+    }
 }
 
 static void same_logits(ds4_session *s, const float *want, int n,
@@ -80,7 +120,14 @@ int main(int argc, char **argv) {
         nll -= score.logprob;
         require(ds4_session_eval(s, tokens.v[i], err, sizeof(err)) == 0, err);
     }
-    printf("MEAN_NLL %.9g TOKENS %d\n", nll/(tokens.len-1), tokens.len-1);
+    const double mean_nll = nll / (tokens.len - 1);
+    printf("MEAN_NLL %.9g TOKENS %d\n", mean_nll, tokens.len - 1);
+    if (use_cuda && !strcmp(argv[2],
+            "The capital of France is Paris. The largest ocean on Earth is "
+            "the Pacific Ocean.")) {
+        require(fabs(mean_nll - 1.81334038) <= 1.0e-5,
+                "CUDA reference NLL drift");
+    }
     const int nv = 248320;
     float *last = malloc(nv*sizeof(float));
     require(last != NULL, "logit allocation");
