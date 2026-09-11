@@ -551,3 +551,42 @@ smaller and quicker.
 The context that fits follows from the size: 24576 tokens with the draft head
 active (28672 is refused by the residency guard, which prints the arithmetic),
 against 16384 with the sidecar.
+
+## KV cache quantization: -ctk and -ctv
+
+The attention KV cache costs 2048 bytes per position per layer in each of K and
+V: 64 KiB per token, so 32768 tokens is the whole context a 16 GiB card can hold
+in f16. `-ctk q8_0 -ctv q8_0` stores 32 values per block behind an fp16 scale,
+1088 bytes per position, 34 KiB per token, about **66k tokens** of context.
+
+| KV | bytes per token | context that fits | MEAN_NLL |
+|---|---|---|---|
+| f16 (default) | 64 KiB | ~36k (measured 32768) | 1.81334038 |
+| q8_0 | 34 KiB | ~66k (measured 65536 loads) | 1.81927471 (+0.33%) |
+
+Recall was measured rather than assumed: one prompt of 19530 tokens carrying four
+access codes at 2%, 25%, 50% and 75% of the context, asked for at the end.
+
+    f16    code 32: PASS-A-4821  code 160: PASS-B-1397  code 325: PASS-C-7342  code 490: PASS-D-9615
+    q8_0   code 32: PASS-A-4821  code 160: PASS-B-1397  code 325: PASS-C-7342  code 490: PASS-D-9615
+
+Four for four in both, same answers. That bounds catastrophic loss, not subtle
+degradation - the 0.33% NLL is the measure for that - but it is the test that
+would have caught a broken quantization.
+
+The price today is prefill speed: the same prompt took 53 s in f16 and 1 min 26 s
+in q8_0, because the q8_0 prefill twin reads the cache directly instead of
+staging a shared tile (at one byte plus a scale per value the copy looked like it
+would cost more in barriers than it saves; at depth that is wrong and the tile is
+worth adding).
+
+The kernels are duplicated rather than unified because the build uses
+`--use_fast_math`: an earlier attempt threaded a runtime flag through the shared
+read helpers and moved the release path to 1.80874846. The f16 kernels are byte
+for byte untouched and qwen38_ga_*_q8 are new code with their own baseline.
+
+`-ctk` and `-ctv` must name the same type - K and V share one layout and one pair
+of kernels - and q4_0 is refused until its twin exists. The disk KV payload
+refuses to write or read while it does not record the format, because a q8_0
+cache reloaded as f16 would decode garbage. `DS4_KV_Q8=1` is the hook the test
+binaries use, since they take no engine options.
