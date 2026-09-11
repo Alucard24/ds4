@@ -4974,6 +4974,7 @@ extern "C" int ds4_mmq_quant_dense(
         DS4_MMQ_CASE(GGML_TYPE_IQ3_XXS, "ds4_mmq_iq3_xxs_dense");
         DS4_MMQ_CASE(GGML_TYPE_IQ3_S,   "ds4_mmq_iq3_s_dense");
         DS4_MMQ_CASE(GGML_TYPE_IQ4_XS,  "ds4_mmq_iq4_xs_dense");
+        DS4_MMQ_CASE(GGML_TYPE_Q6_K,    "ds4_mmq_q6_K_dense");
         default:
             fprintf(stderr, "ds4_mmq_quant_dense: unsupported type %u\n", weight_type);
             return -1;
@@ -4996,6 +4997,7 @@ extern "C" int ds4_mmq_quant_dense_vec(
         DS4_MMQ_VEC_CASE(GGML_TYPE_IQ3_S,   "ds4_mmq_iq3_s_dense_vec");
         DS4_MMQ_VEC_CASE(GGML_TYPE_IQ4_XS,  "ds4_mmq_iq4_xs_dense_vec");
         DS4_MMQ_VEC_CASE(GGML_TYPE_IQ1_M,   "ds4_mmq_iq1_m_dense_vec");
+        DS4_MMQ_VEC_CASE(GGML_TYPE_Q6_K,    "ds4_mmq_q6_K_dense_vec");
         default:
             fprintf(stderr, "ds4_mmq_quant_dense_vec: unsupported type %u\n", weight_type);
             return -1;
@@ -5040,4 +5042,9 @@ template void mul_mat_q_case<GGML_TYPE_IQ4_XS>(
 template void mul_mat_q_case<GGML_TYPE_Q4_K>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_MXFP4>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+/* Q6_K was in the vendored kernels all along; only the instantiations the ds4
+ * API exposes were missing.  Needed by the Qwen3.8 MTP draft head when a single
+ * GGUF carries it inside the trunk. */
+template void mul_mat_q_case<GGML_TYPE_Q6_K>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);

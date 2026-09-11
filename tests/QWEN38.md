@@ -527,3 +527,27 @@ four frames merge into two temporal groups, that the identity survives a second
 decode, and — the point of the whole path — that the container's embedding is
 **bit-identical** to the same frames passed as PNG files. Skips itself when
 ffmpeg is not in PATH.
+
+## Q6_K and the self-contained MTP file
+
+`Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` is the trunk with the draft head inside it:
+the same 851 trunk tensors plus block 64 and its `nextn.*`, 11.29 GiB against
+10.96 for the trunk alone.  The engine used to refuse that layout by design and
+require the separate NVFP4 sidecar, which costs 1.09 GiB resident; the draft
+block here is Q6_K (eight tensors) and F32 (seven norms), and Q6_K turned out to
+be declared in the loader's type enum but never executable - missing from the
+geometry table, from both MMQ and MMVQ dispatchers, from the batched and
+single-row matvec switches and from the public matmul entry.  The vendored MMQ
+and MMVQ kernels had carried Q6_K all along; only the ds4-side wiring was
+absent, so the fix was to name it in the five places a quant type has to appear.
+
+Served with `--mtp` the draft head is bound from the same file and the embedding
+table and LM head stay the trunk's, exactly as `--mtp-model` does for a sidecar.
+Greedy output over 40 tokens is identical to the trunk run without drafting, the
+trunk NLL gate is unchanged at 1.81334038, and decode measures 64.9 tok/s
+against 54.6 for the NVFP4 sidecar on the same prompt - the Q6_K draft is both
+smaller and quicker.
+
+The context that fits follows from the size: 24576 tokens with the draft head
+active (28672 is refused by the residency guard, which prints the arithmetic),
+against 16384 with the sidecar.

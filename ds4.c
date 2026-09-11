@@ -6558,25 +6558,25 @@ static void config_validate_qwen38_model(const ds4_model *m) {
     g_ds4_shape = DS4_SHAPE_QWEN38;
 
     const uint32_t blocks = required_u32(m, "qwen35.block_count");
-    if (blocks != 64u) {
+    /* A single GGUF carrying the trunk and an embedded draft head - the llama.cpp
+     * layout of 64 blocks plus qwen35.nextn_predict_layers more - is accepted:
+     * the trunk iterates DS4_N_LAYER blocks and the head is bound as the draft
+     * block it already is.  It used to be refused here by design, which forced
+     * the 1.09 GiB NVFP4 sidecar for a head that weighs 0.33 GiB in the same
+     * quantization as the trunk. */
+    {
         uint32_t nextn = 0;
-        if (model_get_u32(m, "qwen35.nextn_predict_layers", &nextn) && nextn != 0) {
-            /* A single GGUF carrying both the trunk and an embedded draft head
-             * is a valid llama.cpp layout that this engine deliberately does
-             * not run: it binds the trunk and the draft head from separate
-             * files.  Say so instead of only reporting a block count. */
+        const bool embedded =
+            model_get_u32(m, "qwen35.nextn_predict_layers", &nextn) && nextn != 0;
+        if (blocks != 64u && !(embedded && blocks == 64u + nextn)) {
             fprintf(stderr,
-                    "ds4: this Qwen3.8 GGUF stores %u trunk blocks plus %u "
-                    "embedded MTP head block(s), a layout this engine does not "
-                    "run as a main model\n", blocks - nextn, nextn);
-            fprintf(stderr,
-                    "ds4: run the 64-block trunk (e.g. the IQ3_S quantization) "
-                    "and pass this file as --mtp-model for the draft head, or "
-                    "run this quantization with llama.cpp\n");
+                    "ds4: this Qwen3.8 GGUF declares %u blocks; the engine runs "
+                    "64, or a 64-block trunk plus the %u embedded MTP head block(s)"
+                    " it declares\n", blocks, nextn);
             exit(1);
         }
     }
-    config_expect_u32("block_count", blocks, 64);
+    config_expect_u32("block_count", 64, 64);
     config_expect_u32("embedding_length", required_u32(m, "qwen35.embedding_length"), 5120);
     config_expect_u32("feed_forward_length", required_u32(m, "qwen35.feed_forward_length"), 17408);
     config_expect_u32("head_count", required_u32(m, "qwen35.attention.head_count"), 24);
@@ -7345,6 +7345,7 @@ static bool qwen38_tensor_type_supported(const ds4_tensor *t, bool matrix) {
     case DS4_TENSOR_BF16:
     case DS4_TENSOR_Q4_K:
     case DS4_TENSOR_Q2_K:
+    case DS4_TENSOR_Q6_K:
     case DS4_TENSOR_IQ2_XXS:
     case DS4_TENSOR_IQ2_XS:
     case DS4_TENSOR_IQ2_S:
@@ -8530,6 +8531,9 @@ static int qwen38_gpu_matvec_rows(ds4_gpu_tensor *out, const ds4_model *m,
             (uint32_t)weight->dim[1], x, n_tokens);
     case DS4_TENSOR_Q2_K:
     case DS4_TENSOR_Q4_K:
+    /* The Qwen3.8 MTP draft head uses Q6_K when a single GGUF carries it inside
+     * the trunk; the dispatch is the same packed-weight path as the trunk. */
+    case DS4_TENSOR_Q6_K:
     case DS4_TENSOR_IQ2_XXS:
     case DS4_TENSOR_IQ2_XS:
     case DS4_TENSOR_IQ2_S:
@@ -41231,6 +41235,10 @@ struct ds4_engine {
      * its embedding table and LM head stay the trunk's. */
     bool qwen38_mtp_ready;
     uint32_t qwen38_mtp_block;
+    /* Where the draft head's tensors live: the sidecar model for --mtp-model,
+     * or the trunk model itself when one GGUF carries both (64 + nextn blocks).
+     * The forward path needs the right map for every draft weight. */
+    const ds4_model *qwen38_mtp_source;
     int dspark_exec_tier;
     uint32_t support_stages;
     int mtp_draft_tokens;
@@ -66297,6 +66305,127 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                     const ds4_gpu_config *gpu_cfg);
 
 
+#ifndef DS4_NO_GPU
+/* Bind the draft head described by the Qwen3.8 MTP tensors out of `src` and
+ * preload its spans.
+ *
+ * `src` is the sidecar for --mtp-model, and the model itself when one GGUF
+ * carries both the trunk and the head (64 + nextn blocks).  The tensors are the
+ * same either way - blk.<n_layer>.nextn.* plus that block's global-attention
+ * weights - and the embedding table and LM head stay the trunk's, because
+ * nextn.shared_head_norm exists precisely because those are shared.
+ *
+ * Two things differ, and only two.  An embedded head lives inside the tensor
+ * payload of the file that is already mapped, so its bytes are not counted a
+ * second time in the residency estimate and the map range and file descriptor
+ * do not need setting up.  And when the estimate says the working set will not
+ * fit, an embedded head is simply declined - the trunk keeps running at full
+ * context - where a sidecar is closed and the support state cleared.
+ */
+static int qwen38_mtp_bind_draft(ds4_engine *e, const ds4_model *src,
+                                 bool embedded, int context_hint) {
+    weights_bind_qwen38_mtp(&e->qwen38_mtp_weights, src, DS4_N_LAYER);
+    uint64_t *mtp_offsets = NULL;
+    uint64_t *mtp_sizes = NULL;
+    uint32_t mtp_span_count = 0;
+    if (!qwen38_mtp_sidecar_spans(&e->qwen38_mtp_weights, &mtp_offsets,
+                                  &mtp_sizes, &mtp_span_count)) {
+        fprintf(stderr, "ds4: the Qwen3.8 MTP draft tensors are not all present\n");
+        return 1;
+    }
+    /* Residency check before anything is preloaded.
+     *
+     * The draft head only pays for itself while the trunk, the context and the
+     * draft all stay resident.  Measured on a 16 GiB device: 10.95 GiB of trunk
+     * + a 24k context + an external sidecar and its state did not fit, and
+     * decode collapsed from ~50 to ~4.2 tok/s with speculation either on or
+     * off, so the failure is residency and it hits whether or not the rounds
+     * run.  The bound is "everything resident minus the 2 GiB the driver and
+     * desktop hold".  Declining here keeps the trunk at full speed and says
+     * why; DS4_MTP_ALLOW_OVERCOMMIT=1 forces it in on a device whose real
+     * budget is larger than the query reports. */
+    if (getenv("DS4_MTP_ALLOW_OVERCOMMIT") == NULL) {
+        uint64_t free_bytes = 0, total_bytes = 0;
+        uint64_t draft_bytes = 0;
+        const uint32_t guard_ctx = context_hint > 0 ?
+            (uint32_t)context_hint : 32768u;
+        const uint64_t ctx_bytes =
+            qwen38_memory_estimate((int)guard_ctx, true).total_bytes;
+        const uint64_t state_bytes = qwen38_mtp_state_bytes(guard_ctx);
+        for (uint32_t i = 0; i < mtp_span_count; i++) draft_bytes += mtp_sizes[i];
+        /* Tensor payload only: the metadata block is never resident. */
+        const uint64_t trunk_bytes = e->model.size > e->model.tensor_data_pos ?
+            e->model.size - e->model.tensor_data_pos : e->model.size;
+        /* An embedded head is part of that payload already. */
+        const uint64_t needed = trunk_bytes + ctx_bytes + state_bytes +
+                                (embedded ? 0 : draft_bytes);
+        const uint64_t reserve = 2ull * 1024ull * 1024ull * 1024ull;
+        const bool bounded = ds4_gpu_memory_info(&free_bytes, &total_bytes) &&
+                             total_bytes > reserve;
+        if (bounded && needed > total_bytes - reserve) {
+            fprintf(stderr,
+                    "ds4: skipping the Qwen3.8 MTP draft head: %u-token context "
+                    "needs ~%.2f GiB resident (trunk %.2f + context %.2f + "
+                    "draft %.2f%s) of the %.2f GiB this device reports, leaving "
+                    "less than the 2 GiB the driver needs\n",
+                    guard_ctx, (double)needed / 1073741824.0,
+                    (double)e->model.size / 1073741824.0,
+                    (double)ctx_bytes / 1073741824.0,
+                    (double)(draft_bytes + state_bytes) / 1073741824.0,
+                    embedded ? ", already inside the trunk" : "",
+                    (double)total_bytes / 1073741824.0);
+            fprintf(stderr,
+                    "ds4: lower --ctx, or set DS4_MTP_ALLOW_OVERCOMMIT=1 to "
+                    "load it anyway (decode may drop to a few tokens per "
+                    "second)\n");
+            free(mtp_offsets);
+            free(mtp_sizes);
+            if (!embedded) {
+                e->support_kind = DS4_SUPPORT_NONE;
+                model_close(&e->mtp_model);
+            }
+            return 0;
+        }
+    }
+    if (!embedded) {
+        if (!ds4_gpu_set_model_map_range(
+                src->map, src->size, src->tensor_data_pos,
+                src->size - src->tensor_data_pos, src->max_tensor_bytes)) {
+            fprintf(stderr, "ds4: failed to map the Qwen3.8 MTP sidecar\n");
+            free(mtp_offsets);
+            free(mtp_sizes);
+            return 1;
+        }
+        (void)ds4_gpu_set_model_fd_for_map(src->fd, src->map);
+    }
+    const bool cached = accelerator_cache_model_tensors(
+        e->backend, src, mtp_offsets, mtp_sizes, mtp_span_count);
+    free(mtp_offsets);
+    free(mtp_sizes);
+    if (!embedded) {
+        (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+    }
+    if (!cached) {
+        fprintf(stderr, "ds4: %s failed to prepare the Qwen3.8 MTP draft cache\n",
+                ds4_backend_name(e->backend));
+        return 1;
+    }
+    e->qwen38_mtp_block = DS4_N_LAYER;
+    e->qwen38_mtp_source = src;
+    e->qwen38_mtp_ready = true;
+    if (embedded) {
+        fprintf(stderr,
+                "ds4: Qwen3.8 MTP draft head bound from the model itself "
+                "(block %u; trunk embeddings and LM head reused)\n", DS4_N_LAYER);
+    } else {
+        fprintf(stderr,
+                "ds4: Qwen3.8 MTP draft head loaded from the sidecar "
+                "(block %u; trunk embeddings and LM head reused)\n", DS4_N_LAYER);
+    }
+    return 0;
+}
+#endif /* DS4_NO_GPU */
+
 /* Load the Qwen3.8 MTP draft sidecar.
  *
  * The sidecar GGUF shares a file with a full 64-block trunk this process never
@@ -66326,98 +66455,9 @@ static int qwen38_mtp_sidecar_open(ds4_engine *e, const char *path,
         e->support_stages = 0;
         return 0;
     }
-    weights_bind_qwen38_mtp(&e->qwen38_mtp_weights, &e->mtp_model,
-                            DS4_N_LAYER);
-    uint64_t *mtp_offsets = NULL;
-    uint64_t *mtp_sizes = NULL;
-    uint32_t mtp_span_count = 0;
-    /* Residency check before anything is preloaded.
-     *
-     * The draft head only pays for itself while the trunk, the context and the
-     * sidecar all stay resident.  Measured on a 16 GiB device: 10.95 GiB of
-     * trunk + a 24k context + the sidecar and its state did not fit, and decode
-     * collapsed from ~50 to ~4.2 tok/s with speculation either on or off, so
-     * the failure is residency and it hits whether or not the rounds run.
-     * The bound is "everything resident minus the 2 GiB the driver and desktop
-     * hold": on this 16 GiB card that allows the measured working 16k
-     * configuration (13.24 GiB estimated) and refuses the measured collapsing
-     * ones (24k at 13.63, 32k at 14.30).  Refusing here keeps the trunk at full
-     * speed and says why; DS4_MTP_ALLOW_OVERCOMMIT=1 forces the sidecar in on a
-     * device whose real budget is larger than the query reports. */
-    if (getenv("DS4_MTP_ALLOW_OVERCOMMIT") == NULL) {
-        uint64_t free_bytes = 0, total_bytes = 0;
-        uint64_t sidecar_bytes = 0;
-        const uint32_t guard_ctx = context_hint > 0 ?
-            (uint32_t)context_hint : 32768u;
-        const uint64_t ctx_bytes =
-            qwen38_memory_estimate((int)guard_ctx, true).total_bytes;
-        const uint64_t state_bytes = qwen38_mtp_state_bytes(guard_ctx);
-        uint64_t *span_offsets = NULL;
-        uint64_t *span_sizes = NULL;
-        uint32_t span_count = 0;
-        if (qwen38_mtp_sidecar_spans(&e->qwen38_mtp_weights, &span_offsets,
-                                     &span_sizes, &span_count)) {
-            for (uint32_t i = 0; i < span_count; i++) sidecar_bytes += span_sizes[i];
-            free(span_offsets);
-            free(span_sizes);
-        }
-        /* Tensor payload only: the metadata block is never resident. */
-        const uint64_t trunk_bytes = e->model.size > e->model.tensor_data_pos ?
-            e->model.size - e->model.tensor_data_pos : e->model.size;
-        const uint64_t needed = trunk_bytes + ctx_bytes + sidecar_bytes +
-                                state_bytes;
-        const uint64_t reserve = 2ull * 1024ull * 1024ull * 1024ull;
-        const bool bounded = ds4_gpu_memory_info(&free_bytes, &total_bytes) &&
-                             total_bytes > reserve;
-        if (bounded && needed > total_bytes - reserve) {
-            fprintf(stderr,
-                    "ds4: skipping the Qwen3.8 MTP draft head: %u-token context "
-                    "needs ~%.2f GiB resident (trunk %.2f + context %.2f + "
-                    "draft %.2f) of the %.2f GiB this device reports, leaving "
-                    "less than the 2 GiB the driver needs\n",
-                    guard_ctx, (double)needed / 1073741824.0,
-                    (double)e->model.size / 1073741824.0,
-                    (double)ctx_bytes / 1073741824.0,
-                    (double)(sidecar_bytes + state_bytes) / 1073741824.0,
-                    (double)total_bytes / 1073741824.0);
-            fprintf(stderr,
-                    "ds4: lower --ctx, or set DS4_MTP_ALLOW_OVERCOMMIT=1 to "
-                    "load it anyway (decode may drop to a few tokens per "
-                    "second)\n");
-            e->support_kind = DS4_SUPPORT_NONE;
-            model_close(&e->mtp_model);
-            return 0;
-        }
-    }
-    if (!qwen38_mtp_sidecar_spans(&e->qwen38_mtp_weights, &mtp_offsets,
-                                  &mtp_sizes, &mtp_span_count) ||
-        !ds4_gpu_set_model_map_range(
-            e->mtp_model.map, e->mtp_model.size,
-            e->mtp_model.tensor_data_pos,
-            e->mtp_model.size - e->mtp_model.tensor_data_pos,
-            e->mtp_model.max_tensor_bytes)) {
-        fprintf(stderr, "ds4: failed to map the Qwen3.8 MTP sidecar\n");
-        free(mtp_offsets);
-        free(mtp_sizes);
+    if (qwen38_mtp_bind_draft(e, &e->mtp_model, false, context_hint) != 0) {
         return 1;
     }
-    (void)ds4_gpu_set_model_fd_for_map(e->mtp_model.fd, e->mtp_model.map);
-    const bool cached = accelerator_cache_model_tensors(
-        e->backend, &e->mtp_model, mtp_offsets, mtp_sizes, mtp_span_count);
-    free(mtp_offsets);
-    free(mtp_sizes);
-    (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
-    if (!cached) {
-        fprintf(stderr, "ds4: %s failed to prepare the Qwen3.8 MTP draft cache\n",
-                ds4_backend_name(e->backend));
-        return 1;
-    }
-    e->qwen38_mtp_block = DS4_N_LAYER;
-    e->qwen38_mtp_ready = true;
-    fprintf(stderr,
-            "ds4: Qwen3.8 MTP draft head loaded from %s (block %u; trunk "
-            "embeddings and LM head reused)\n",
-            path, DS4_N_LAYER);
     return 0;
 #else
     (void)e; (void)path; (void)graph_backend; (void)context_hint;
@@ -66826,8 +66866,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = e;
             return 0;
         }
+        /* --mtp is not in this list: it selects the draft head the model itself
+         * carries (64 + nextn blocks) and is bound below, on this path.  The
+         * rest of the list is unsupported for this family. */
         if (load_slice || opt->distributed.role != DS4_DISTRIBUTED_NONE ||
-            opt->tp.role != DS4_TP_NONE || opt->glm_mtp ||
+            opt->tp.role != DS4_TP_NONE ||
             opt->dspark || opt->directional_steering_file) {
             fprintf(stderr, "ds4: Qwen3.8 does not support layer slicing, "
                             "distributed/TP or steering yet\n");
@@ -66887,8 +66930,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
             }
         }
 #endif
-        /* The Qwen3.8 engine returns here, so the draft sidecar is loaded on
-         * this path rather than in the generic support-model block below. */
+        /* The Qwen3.8 engine returns here, so the draft head is bound on this
+         * path rather than in the generic support-model block below: from an
+         * external sidecar when --mtp-model names one, or from this same file
+         * when --mtp is given and the GGUF carries the head (64 + nextn
+         * blocks). */
         if (opt->mtp_path && opt->mtp_path[0] &&
             opt->distributed.role == DS4_DISTRIBUTED_NONE &&
             qwen38_mtp_sidecar_open(e, opt->mtp_path, graph_backend,
@@ -66896,6 +66942,23 @@ static int ds4_engine_open_internal(ds4_engine **out,
             ds4_engine_close(e);
             *out = NULL;
             return 1;
+        }
+        if ((!opt->mtp_path || !opt->mtp_path[0]) && opt->glm_mtp &&
+            opt->distributed.role == DS4_DISTRIBUTED_NONE) {
+            uint32_t embedded_nextn = 0;
+            if (model_get_u32(&e->model, "qwen35.nextn_predict_layers",
+                              &embedded_nextn) && embedded_nextn != 0) {
+                if (qwen38_mtp_bind_draft(e, &e->model, true,
+                                          opt->context_size) != 0) {
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+            } else {
+                fprintf(stderr,
+                        "ds4: --mtp requires a model with embedded MTP weights; "
+                        "this Qwen3.8 GGUF declares none, use --mtp-model FILE\n");
+            }
         }
         *out = e;
         return 0;
@@ -72815,7 +72878,7 @@ static void qwen38_mtp_note_row(ds4_session *s, int token, uint32_t pos,
         if (!ds4_gpu_tensor_fill_f32(mst->h_in, 0.0f, QWEN38_N_EMBD)) goto fail;
     }
     const uint32_t position[1] = { logical_pos };
-    if (!qwen38_mtp_gpu_forward(mst, &e->mtp_model, &e->qwen38_mtp_weights,
+    if (!qwen38_mtp_gpu_forward(mst, e->qwen38_mtp_source, &e->qwen38_mtp_weights,
                                 &e->model, &e->qwen38_weights, &token,
                                 position, pos, 1u, true, s->mtp_logits)) goto fail;
     s->qwen38_mtp_draft_token = sample_argmax(s->mtp_logits, DS4_N_VOCAB);
@@ -72855,7 +72918,7 @@ static void qwen38_mtp_refresh_proposal(ds4_session *s, uint32_t pos,
     }
     const int token = s->checkpoint.v[pos];
     const uint32_t position[1] = { s->qwen38_rope_pos - 1u };
-    if (!qwen38_mtp_gpu_forward(mst, &e->mtp_model, &e->qwen38_mtp_weights,
+    if (!qwen38_mtp_gpu_forward(mst, e->qwen38_mtp_source, &e->qwen38_mtp_weights,
                                 &e->model, &e->qwen38_weights, &token,
                                 position, pos, 1u, true, s->mtp_logits)) return;
     s->qwen38_mtp_draft_token = sample_argmax(s->mtp_logits, DS4_N_VOCAB);
@@ -72894,7 +72957,7 @@ static void qwen38_mtp_prefill_rows(ds4_session *s, const int *tokens,
         }
         uint32_t positions[QWEN38_MTP_MAX_ROWS];
         for (uint32_t i = 0; i < rows; i++) positions[i] = first_pos + done + i;
-        if (!qwen38_mtp_gpu_forward(mst, &e->mtp_model,
+        if (!qwen38_mtp_gpu_forward(mst, e->qwen38_mtp_source,
                                     &e->qwen38_mtp_weights, &e->model,
                                     &e->qwen38_weights, tokens + done,
                                     positions, first_pos + done, rows, false,
@@ -73069,7 +73132,7 @@ static int qwen38_mtp_commit_round(ds4_session *s, int *out_tokens,
                             row_bytes)) {
         const uint32_t position[1] = { s->qwen38_rope_pos - 1u };
         const uint32_t last_pos = base + replay_len - 1u;
-        if (qwen38_mtp_gpu_forward(mst, &e->mtp_model, &e->qwen38_mtp_weights,
+        if (qwen38_mtp_gpu_forward(mst, e->qwen38_mtp_source, &e->qwen38_mtp_weights,
                                    &e->model, &e->qwen38_weights,
                                    &replay[replay_len - 1u], position,
                                    last_pos, 1u, true, s->mtp_logits)) {
@@ -73157,7 +73220,7 @@ int ds4_session_qwen38_spec_step(ds4_session *s, int token,
             : ds4_gpu_tensor_copy(mst->h_in, 0, mst->head_norm, 0, row_bytes);
         if (!src_ok) break;
         const uint32_t position[1] = { s->qwen38_rope_pos };
-        if (!qwen38_mtp_gpu_forward(mst, &e->mtp_model, &e->qwen38_mtp_weights,
+        if (!qwen38_mtp_gpu_forward(mst, e->qwen38_mtp_source, &e->qwen38_mtp_weights,
                                     &e->model, &e->qwen38_weights,
                                     &drafts[n_drafts - 1u], position,
                                     committed_base + n_drafts - 1u, 1u, true,

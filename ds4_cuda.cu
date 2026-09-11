@@ -33058,6 +33058,10 @@ static int cuda_matmul_mmq_dense_quant(
     switch (weight_type) {
     case 10u: block_elems = 256u; block_bytes = 84u; label = "Q2_K"; break;
     case 12u: block_elems = 256u; block_bytes = 144u; label = "Q4_K"; break;
+    /* 256 weights in 210 bytes: ql[128] + qh[64] + scales[16] + one fp16 scale.
+     * The vendored MMQ and MMVQ kernels have carried Q6_K all along; it was the
+     * ds4-side geometry table that never named it. */
+    case 14u: block_elems = 256u; block_bytes = 210u; label = "Q6_K"; break;
     case 16u: block_elems = 256u; block_bytes = 66u; label = "IQ2_XXS"; break;
     case 17u: block_elems = 256u; block_bytes = 74u; label = "IQ2_XS"; break;
     case 18u: block_elems = 256u; block_bytes = 98u; label = "IQ3_XXS"; break;
@@ -33068,10 +33072,22 @@ static int cuda_matmul_mmq_dense_quant(
     case 39u: block_elems = 32u; block_bytes = 17u; label = "MXFP4"; break;
     default: return 0;
     }
+    /* DS4_MMQ_GEOM_TRACE=1 names the check that refused a quantized matmul and
+     * prints the numbers it used.  The checks used to return 0 in silence,
+     * which cost most of a session the first time Q6_K met this function. */
+    const bool geom_trace = getenv("DS4_MMQ_GEOM_TRACE") != NULL;
     if (!out || !x || !model_map || in_dim == 0u || out_dim == 0u ||
         n_tok == 0u || in_dim % block_elems != 0u ||
         in_dim > INT_MAX || out_dim > INT_MAX || n_tok > INT_MAX ||
         out_dim > UINT64_MAX / ((in_dim / block_elems) * block_bytes)) {
+        if (geom_trace) {
+            fprintf(stderr, "ds4: GEOM %s refused: out=%p x=%p map=%p in_dim=%llu "
+                    "out_dim=%llu n_tok=%llu block_elems=%llu block_bytes=%llu\n",
+                    label, (void *)out, (const void *)x, model_map,
+                    (unsigned long long)in_dim, (unsigned long long)out_dim,
+                    (unsigned long long)n_tok, (unsigned long long)block_elems,
+                    (unsigned long long)block_bytes);
+        }
         return 0;
     }
     const uint64_t row_bytes = (in_dim / block_elems) * block_bytes;
@@ -33087,12 +33103,31 @@ static int cuda_matmul_mmq_dense_quant(
         output_elements > UINT64_MAX / sizeof(float) ||
         x->bytes < input_elements * sizeof(float) ||
         out->bytes < output_elements * sizeof(float)) {
+        if (geom_trace) {
+            fprintf(stderr, "ds4: GEOM %s refused at the weight span: offset=%llu "
+                    "weight_bytes=%llu model_size=%llu x_bytes=%llu out_bytes=%llu "
+                    "need_x=%llu need_out=%llu\n", label,
+                    (unsigned long long)weight_offset,
+                    (unsigned long long)weight_bytes,
+                    (unsigned long long)model_size,
+                    (unsigned long long)x->bytes, (unsigned long long)out->bytes,
+                    (unsigned long long)(input_elements * sizeof(float)),
+                    (unsigned long long)(output_elements * sizeof(float)));
+        }
         return 0;
     }
     const int tier = ds4_tensor_device_idx(out);
     const void *weights = cuda_resolve_weight_ptr(
         model_map, weight_offset, weight_bytes, tier, label);
-    if (!weights) return 0;
+    if (!weights) {
+        if (geom_trace) {
+            fprintf(stderr, "ds4: GEOM %s: the weight span is not in the device "
+                    "cache (offset=%llu bytes=%llu tier=%d)\n", label,
+                    (unsigned long long)weight_offset,
+                    (unsigned long long)weight_bytes, tier);
+        }
+        return 0;
+    }
     int rc = -1;
     if (weight_type != 39u && n_tok <= 8u) {
         rc = ds4_mmq_quant_dense_vec(weights, weight_type,
@@ -33141,6 +33176,7 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
                                          x, n_tok);
     case 10u:  /* Q2_K */
     case 12u:  /* Q4_K */
+    case 14u:  /* Q6_K, used by the Qwen3.8 MTP draft head */
     case 16u:  /* IQ2_XXS */
     case 17u:  /* IQ2_XS */
     case 18u:  /* IQ3_XXS */
