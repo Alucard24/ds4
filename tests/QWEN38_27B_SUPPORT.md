@@ -158,3 +158,55 @@ Repeat robustly before using it as an optimization acceptance gate.
   `identifier rsqrtf is undefined in device code`.
 - `make -B ds4 CUDA_ARCH=sm_120` succeeds. End-to-end Qwen CUDA graph remains
   unimplemented at this checkpoint.
+
+## Long context: the -ctk / -ctv KV cache type (CUDA)
+
+The attention KV cache holds 2048 bytes per position per layer in each of K and
+V, which is 64 KiB per token in f16, so a 16 GiB card runs out of context at
+32768 tokens. `-ctk q8_0 -ctv q8_0` stores 32 values per block behind an fp16
+scale - 1088 bytes per position, 34 KiB per token - and roughly doubles the
+context that fits:
+
+| KV | bytes/token | context that fits | MEAN_NLL |
+|---|---|---|---|
+| `f16` (default) | 64 KiB | 32768 measured | **1.81334038** |
+| `q8_0` | 34 KiB | **~66k** (65536 loads) | **1.81927471** (+0.33%) |
+
+Writing neither flag is exactly the previous behaviour: f16 stays the release
+path and its gate is unchanged. The names are llama.cpp's, so the values are the
+ones that command line already has.
+
+```sh
+# long context, quantized KV
+./ds4-server -m <trunk> -ctk q8_0 -ctv q8_0 --ctx 65536 ...
+
+# unchanged default
+./ds4-server -m <trunk> --ctx 32768 ...
+```
+
+Recall was measured rather than assumed: four access codes placed at 2%, 25%,
+50% and 75% of a 19530-token prompt, asked for at the end. Four for four in both
+formats, with identical answers. That rules out a broken quantization, not
+subtle degradation - the NLL figure is the measure for that.
+
+Three things to know before choosing it:
+
+- **Prefill is about 1.8x slower**: 282 tok/s against 514 on the same prompt.
+  The attention is bound by the per-key latency chain, and dequantizing a q8_0
+  value costs a byte load, a scale load, a conversion and a multiply inside that
+  chain. A shared-memory tile was tried for this and measured nothing.
+- **The disk KV cache refuses to write or read in a quantized session.** The
+  payload header does not record the format yet, and a q8_0 cache reloaded as
+  f16 would decode garbage. The server reports the checkpoint as failed and
+  keeps serving; the cost is that every new request pays its own prefill.
+- **K and V must name the same type.** They share one layout and one pair of
+  kernels; a mixed pair is refused at startup rather than stored as one.
+
+`q4_0` is refused at parse time until its kernel twin exists. Its 576 bytes per
+position (18.4 KiB per token) would allow about 125k tokens, so 131072 stays out
+of reach even then without giving up the vision encoder.
+
+The kernels are duplicated rather than unified on purpose: the build uses
+`--use_fast_math`, so a refactor that is only "semantically" equivalent can move
+the release path's numbers, and one did. `DS4_KV_Q8=1` selects the same format
+for the test binaries, which take no engine options.
