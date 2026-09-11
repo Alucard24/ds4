@@ -27282,12 +27282,19 @@ __global__ static void qwen38_gdn_decode_kernel(
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
     const uint32_t warp = tid >> 5u;
-    if (head >= QWEN38_CUDA_HEADS_V || tid >= QWEN38_CUDA_HEAD_DIM) return;
+    if (head >= QWEN38_CUDA_HEADS_V) return;
+    /* 256 threads = 8 warps.  Only the first 128 threads own an element of the
+     * 128-wide q/k/o slices, but all eight warps walk state rows: the warp's
+     * 32 rows were the serial chain, and halving that chain per warp is what
+     * this block shape buys.  Threads 128..255 contribute zeros to the q/k/o
+     * reductions, and adding 0.0f is exact, so every reduction keeps its order
+     * and its value. */
+    const bool owns_elt = tid < QWEN38_CUDA_HEAD_DIM;
 
     __shared__ float q[QWEN38_CUDA_HEAD_DIM];
     __shared__ float k[QWEN38_CUDA_HEAD_DIM];
     __shared__ float o[QWEN38_CUDA_HEAD_DIM];
-    __shared__ float rq[4], rk[4], ro[4];
+    __shared__ float rq[8], rk[8], ro[8];
     __shared__ float q_inv, k_inv, decay, beta_h;
     /* The recurrent state lives in shared memory for the whole token loop.
      * It used to be read and written in global memory once per token, and at
@@ -27302,26 +27309,31 @@ __global__ static void qwen38_gdn_decode_kernel(
     const uint32_t key0 = lane * 4u;
     const uint64_t state_head =
         (uint64_t)head * QWEN38_CUDA_HEAD_DIM * QWEN38_CUDA_HEAD_DIM;
-    for (uint32_t i = tid; i < state_elems; i += QWEN38_CUDA_HEAD_DIM) {
+    for (uint32_t i = tid; i < state_elems; i += blockDim.x) {
         state_sh[i] = state[state_head + i];
     }
     __syncthreads();
 
     for (uint32_t token = 0; token < n_tokens; token++) {
         const uint64_t qkv_row = (uint64_t)token * QWEN38_CUDA_CONV_DIM;
-        q[tid] = qkv[qkv_row +
-            (uint64_t)qk_head * QWEN38_CUDA_HEAD_DIM + tid];
-        k[tid] = qkv[qkv_row +
-            (uint64_t)QWEN38_CUDA_HEADS_QK * QWEN38_CUDA_HEAD_DIM +
-            (uint64_t)qk_head * QWEN38_CUDA_HEAD_DIM + tid];
-        float qs = warp_sum_f32(q[tid] * q[tid]);
-        float ks = warp_sum_f32(k[tid] * k[tid]);
+        float qs = 0.0f, ks = 0.0f;
+        if (owns_elt) {
+            q[tid] = qkv[qkv_row +
+                (uint64_t)qk_head * QWEN38_CUDA_HEAD_DIM + tid];
+            k[tid] = qkv[qkv_row +
+                (uint64_t)QWEN38_CUDA_HEADS_QK * QWEN38_CUDA_HEAD_DIM +
+                (uint64_t)qk_head * QWEN38_CUDA_HEAD_DIM + tid];
+            qs = q[tid] * q[tid];
+            ks = k[tid] * k[tid];
+        }
+        qs = warp_sum_f32(qs);
+        ks = warp_sum_f32(ks);
         if (lane == 0u) { rq[warp] = qs; rk[warp] = ks; }
         __syncthreads();
         if (tid == 0u) {
             float qsum = 0.0f, ksum = 0.0f;
 #pragma unroll
-            for (int i = 0; i < 4; i++) { qsum += rq[i]; ksum += rk[i]; }
+            for (int i = 0; i < 8; i++) { qsum += rq[i]; ksum += rk[i]; }
             q_inv = ds4_cuda_rsqrtf(qsum + 1.0e-6f);
             k_inv = ds4_cuda_rsqrtf(ksum + 1.0e-6f);
             const uint64_t scalar = (uint64_t)token * QWEN38_CUDA_HEADS_V + head;
@@ -27331,8 +27343,10 @@ __global__ static void qwen38_gdn_decode_kernel(
             beta_h = 1.0f / (1.0f + expf(-beta[scalar]));
         }
         __syncthreads();
-        q[tid] *= q_inv;
-        k[tid] *= k_inv;
+        if (owns_elt) {
+            q[tid] *= q_inv;
+            k[tid] *= k_inv;
+        }
         __syncthreads();
 
         const float4 q4 = *(const float4 *)(q + key0);
@@ -27344,8 +27358,8 @@ __global__ static void qwen38_gdn_decode_kernel(
          * so the interleaving is invisible in the results.  A four-row variant
          * measured 212 ms on one run and 290 ms on the next, against 230/228 for
          * this one, so it was not kept. */
-        for (uint32_t value = warp; value < QWEN38_CUDA_HEAD_DIM; value += 8u) {
-            const uint32_t value_b = value + 4u;
+        for (uint32_t value = warp; value < QWEN38_CUDA_HEAD_DIM; value += 16u) {
+            const uint32_t value_b = value + 8u;
             float4 *hp = (float4 *)(state_sh +
                 (uint64_t)value * QWEN38_CUDA_HEAD_DIM + key0);
             float4 *hpb = (float4 *)(state_sh +
@@ -27398,24 +27412,27 @@ __global__ static void qwen38_gdn_decode_kernel(
             }
         }
         __syncthreads();
-        float os = warp_sum_f32(o[tid] * o[tid]);
+        const float ov = owns_elt ? o[tid] : 0.0f;
+        const float os = warp_sum_f32(ov * ov);
         if (lane == 0u) ro[warp] = os;
         __syncthreads();
         if (tid == 0u) {
             float sum = 0.0f;
 #pragma unroll
-            for (int i = 0; i < 4; i++) sum += ro[i];
+            for (int i = 0; i < 8; i++) sum += ro[i];
             ro[0] = ds4_cuda_rsqrtf(sum / QWEN38_CUDA_HEAD_DIM + 1.0e-6f);
         }
         __syncthreads();
-        const uint64_t out_at = (uint64_t)token * QWEN38_CUDA_VALUE_DIM +
-            (uint64_t)head * QWEN38_CUDA_HEAD_DIM + tid;
-        const float zg = z[out_at];
-        out[out_at] = o[tid] * ro[0] * norm[tid] *
-            (zg / (1.0f + expf(-zg)));
+        if (owns_elt) {
+            const uint64_t out_at = (uint64_t)token * QWEN38_CUDA_VALUE_DIM +
+                (uint64_t)head * QWEN38_CUDA_HEAD_DIM + tid;
+            const float zg = z[out_at];
+            out[out_at] = o[tid] * ro[0] * norm[tid] *
+                (zg / (1.0f + expf(-zg)));
+        }
         __syncthreads();
     }
-    for (uint32_t i = tid; i < state_elems; i += QWEN38_CUDA_HEAD_DIM) {
+    for (uint32_t i = tid; i < state_elems; i += blockDim.x) {
         state[state_head + i] = state_sh[i];
     }
 }
@@ -27607,7 +27624,7 @@ extern "C" int ds4_gpu_qwen38_gdn_chunk(
         (float *)qkv->ptr, (float *)conv_state->ptr, conv, n_tokens);
     if (!cuda_ok(cudaGetLastError(), "Qwen GDN convolution launch")) return 0;
     qwen38_gdn_ensure_state_shared();
-    qwen38_gdn_decode_kernel<<<48,128,QWEN38_GDN_STATE_SHARED_BYTES,
+    qwen38_gdn_decode_kernel<<<48,256,QWEN38_GDN_STATE_SHARED_BYTES,
                                cuda_decode_stream()>>>(
         (float *)out->ptr, (float *)recurrent_state->ptr,
         (const float *)qkv->ptr, (const float *)z->ptr,
