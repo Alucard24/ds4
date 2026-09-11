@@ -58430,13 +58430,16 @@ static int ds4_session_save_qwen38_payload(ds4_session *s, FILE *fp,
     /* A q8_0 KV cache has a different layout and the payload header does not
      * record it yet, so a file written now would be reloaded as f16 by a later
      * run and silently decode garbage.  Refusing is the only honest answer
-     * until the header carries the format. */
+     * until the header carries the format.  The CPU build has no quantized KV,
+     * so for it the question does not arise. */
+#ifndef DS4_NO_GPU
     if (ds4_gpu_qwen38_kv_quant_is_q8()) {
         payload_set_err(err, errlen,
                         "the Qwen3.8 KV disk payload does not record the KV "
                         "format yet, so a q8_0 cache cannot be written");
         return 1;
     }
+#endif
     if (s->checkpoint_image_count > UINT32_MAX) {
         payload_set_err(err, errlen, "too many Qwen image identities to save");
         return 1;
@@ -58559,12 +58562,14 @@ static int ds4_session_load_qwen38_payload(ds4_session *s, FILE *fp,
                                             char *err, size_t errlen) {
     /* The mirror of the guard above: a file on disk was written by an f16 run
      * at best, and this session cannot tell. */
+#ifndef DS4_NO_GPU
     if (ds4_gpu_qwen38_kv_quant_is_q8()) {
         payload_set_err(err, errlen,
                         "the Qwen3.8 KV disk payload does not record the KV "
                         "format yet, so a q8_0 session cannot load one");
         return 1;
     }
+#endif
     const uint32_t saved_ctx = h[2];
     const uint32_t kv_element_bytes = h[4];
     const uint32_t rope_pos = h[5];
@@ -66943,7 +66948,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
+#ifndef DS4_NO_GPU
         ds4_gpu_qwen38_set_kv_quant((opt->ctk_q8 || opt->ctv_q8) ? 1 : 0);
+#endif
         if ((opt->ctk_q8 || opt->ctv_q8) &&
             getenv("DS4_KV_Q8") == NULL) {
             fprintf(stderr,
@@ -67030,12 +67037,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
             uint32_t embedded_nextn = 0;
             if (model_get_u32(&e->model, "qwen35.nextn_predict_layers",
                               &embedded_nextn) && embedded_nextn != 0) {
+#ifndef DS4_NO_GPU
                 if (qwen38_mtp_bind_draft(e, &e->model, true,
                                           opt->context_size) != 0) {
                     ds4_engine_close(e);
                     *out = NULL;
                     return 1;
                 }
+#endif
             } else {
                 fprintf(stderr,
                         "ds4: --mtp requires a model with embedded MTP weights; "
