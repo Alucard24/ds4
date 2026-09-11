@@ -27512,7 +27512,7 @@ extern "C" int ds4_gpu_qwen38_gdn_chunk(
         uint64_t norm_offset, uint32_t n_tokens) {
     const uint64_t state_count = 48ull * 128 * 128;
     if (!out || !conv_state || !recurrent_state || !qkv || !z || !alpha || !beta ||
-        n_tokens == 0u || n_tokens > 256u ||
+        n_tokens == 0u || n_tokens > 512u ||
         out->bytes < (uint64_t)n_tokens*6144*4 ||
         conv_state->bytes < 3ull*10240*4 ||
         recurrent_state->bytes < state_count*4 ||
@@ -27560,7 +27560,7 @@ extern "C" int ds4_gpu_qwen38_ga_prepare_chunk(
         uint64_t k_norm_offset, const ds4_gpu_tensor *rope_positions,
         uint32_t start_pos, uint32_t n_tokens, uint32_t ctx_size) {
     if (!q_full || !k_cache || !v_cache || !k || !v || n_tokens == 0u ||
-        n_tokens > 256u || start_pos >= ctx_size || n_tokens > ctx_size-start_pos ||
+        n_tokens > 512u || start_pos >= ctx_size || n_tokens > ctx_size-start_pos ||
         q_full->bytes < (uint64_t)n_tokens*12288*4 ||
         k->bytes < (uint64_t)n_tokens*1024*4 ||
         v->bytes < (uint64_t)n_tokens*1024*4 ||
@@ -27602,7 +27602,7 @@ extern "C" int ds4_gpu_qwen38_ga_chunk(
         const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
         uint32_t start_pos, uint32_t n_tokens, uint32_t ctx_size) {
     if (!out || !q_full || !k_cache || !v_cache || n_tokens == 0u ||
-        n_tokens > 256u || start_pos >= ctx_size || n_tokens > ctx_size-start_pos ||
+        n_tokens > 512u || start_pos >= ctx_size || n_tokens > ctx_size-start_pos ||
         out->bytes < (uint64_t)n_tokens*6144*4 ||
         q_full->bytes < (uint64_t)n_tokens*12288*4 ||
         k_cache->bytes < (uint64_t)ctx_size*1024*2 ||
