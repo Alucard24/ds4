@@ -4294,6 +4294,39 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
+    /* Launch diagnostics, off by default.
+     *
+     * The prefill gap has been narrowed to "the kernel is neither compute- nor
+     * bandwidth-bound", and there is no profiler on this platform.  These
+     * numbers are what a profiler would have shown first: the tile width the
+     * picker landed on, the grid it implies, and the occupancy the launch
+     * actually achieves for that shared-memory request. */
+    if (getenv("DS4_MMQ_LAUNCH_TRACE") != NULL) {
+        static int printed = 0;
+        if (printed < 12) {
+            printed++;
+            cudaFuncAttributes attr = {};
+            int active = -1;
+            (void)cudaFuncGetAttributes(&attr, (const void *)mul_mat_q<type, mmq_x, false>);
+            (void)cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &active, mul_mat_q<type, mmq_x, false>,
+                    (int)block_dims.x * (int)block_dims.y, (size_t)nbytes_shared);
+            fprintf(stderr,
+                    "MMQTRACE type=%d J=%d I_y=%d ncols_x=%lld nrows_x=%lld "
+                    "ncols_max=%lld grid=(%d,%d,%d) block=(%d,%d) shared=%d "
+                    "regs=%d smem_static=%zu maxthreads=%d blocks_per_sm=%d "
+                    "warps_per_sm=%d nsm=%d stream_k=%d\n",
+                    (int)type, mmq_x, mmq_y,
+                    (long long)args.ncols_x, (long long)args.nrows_x,
+                    (long long)args.ncols_max,
+                    (int)block_nums_xy_tiling.x, (int)block_nums_xy_tiling.y,
+                    (int)block_nums_xy_tiling.z,
+                    (int)block_dims.x, (int)block_dims.y, nbytes_shared,
+                    attr.numRegs, attr.sharedSizeBytes, attr.maxThreadsPerBlock,
+                    active, active * nwarps, nsm, args.use_stream_k ? 1 : 0);
+        }
+    }
+
     if (!args.use_stream_k) {
         if (args.nrows_x % mmq_y == 0) {
             constexpr bool need_check = false;

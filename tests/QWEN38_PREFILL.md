@@ -1,6 +1,66 @@
-# Qwen3.8 prefill: porting the MMQ kernels to the current upstream design
+# Qwen3.8 prefill: the gap was lazy weight loading, not the kernels
 
-Status: **diagnosed; the port is done and the hypothesis it tested is REFUTED.**
+Status: **RESOLVED.** The 8x prefill gap was a missing weight preload on the
+Qwen engine path, not the MMQ kernels. Fixed; the first prompt runs at ~1030
+tok/s instead of ~200 tok/s, and the same prompt through llama.cpp is 1526-1632.
+
+## The measurement error that hid it
+
+The phase report printed the three fine-grained matmul counters (FFN norm, gate,
+up) as a running total instead of per chunk, so a warm chunk looked as slow as a
+cold one and the residency hypothesis was discarded too early. Fixed: the
+counters are now deltas.
+
+With the fix, two different 350-token prompts in one process:
+
+| | FFN gate, 64 layers | chunk |
+|---|---|---|
+| first prompt (cold) | 364.8 ms | 1207 ms |
+| second prompt (resident) | **41 ms** | **422 ms** |
+
+41 ms for 64 gate matmuls is **0.64 ms per matmul = 48 TMAC/s**, the same rate
+llama.cpp reaches. 364.8 ms is the same kernel with the weights still in host
+memory: each weight range was faulted in on first use at about 23 GB/s
+(114 MB per matmul / 5 ms).
+
+## The fix
+
+Every model family preloads its tensor spans at engine open except Qwen3.8,
+whose branch returns before the generic preload. It now calls
+`accelerator_cache_model_tensors()` like the others. The cost moves from the
+first reply into startup (the process still finishes a 350-token prompt, load
+included, in 2.59-2.68 s).
+
+## Numbers after the fix
+
+| | ds4 | llama.cpp |
+|---|---|---|
+| 350-token prefill, first prompt after start | ~1030 tok/s | 1526-1632 tok/s (pp512) |
+| decode | 42.5 tok/s, 53.9 with MTP speculation (1.27x) | 54.3 tok/s (tg128) |
+| NLL gate | 1.81334038 unchanged | - |
+
+The residual factor of ~1.6 is in the non-GEMM part of the chunk, where the GDN
+recurrence and the GA attention now dominate: the recurrence is a sequential
+scan over tokens with 48 blocks of 128 threads, which is the algorithmic item
+left if more prefill speed is wanted.
+
+## What the investigation ruled out (all by measurement)
+
+- kernel revision: the ported later upstream revision runs at the same speed
+  (gate 350.9 vs 343.4 ms per 64 layers), and `mma.cuh` is byte-identical;
+- tile width: `DS4_CUDA_MMQ_X_MAX` sweep, 128 default vs 64 is -6%, rest worse;
+- occupancy: the kernel uses 254-255 registers in both builds, giving one
+  resident block per SM (8 of 64 warps) in llama.cpp as well - verified with
+  cuobjdump -res-usage on both binaries;
+- `-DNDEBUG`: added to the MMQ objects, registers unchanged at 255;
+- cuBLAS for large batches: `ggml_cuda_should_use_mmq()` returns true whenever
+  Turing MMA is available, so llama.cpp runs the same MMQ kernels;
+- per-call pool allocation, duplicated matmuls: no measurable effect;
+- code generation: the SASS differs by 11% instructions, which cannot explain 8x.
+
+## Superseded text
+
+Kept because it documents the porting surface and the dead ends.
 
 Result of running the ported revision against the vendored one, same model, same
 chunk (350 tokens), phase timing per matmul, 64 layers each:

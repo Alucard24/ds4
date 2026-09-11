@@ -8728,10 +8728,16 @@ static void qwen38_phase_collect(void) {
     g_qwen38_phase.ffn[1] += totals[7] / 1000.0;
     g_qwen38_phase.head += totals[8] / 1000.0;
     g_qwen38_phase.proj[0] += 0.0;
-    static double extra[3];
-    extra[0] += totals[9] / 1000.0;
-    extra[1] += totals[10] / 1000.0;
-    extra[2] += totals[11] / 1000.0;
+    /* Printed per chunk, not accumulated: an earlier version kept a running
+     * total and made a warm chunk look as slow as the cold one. */
+    static double extra_prev[3];
+    double extra[3];
+    extra[0] = totals[9] / 1000.0 - extra_prev[0];
+    extra[1] = totals[10] / 1000.0 - extra_prev[1];
+    extra[2] = totals[11] / 1000.0 - extra_prev[2];
+    extra_prev[0] += extra[0];
+    extra_prev[1] += extra[1];
+    extra_prev[2] += extra[2];
     /* Group 9 closes the interval before the gate matmul (the post-attention
      * norm), 10 and 11 the gate and up matmuls themselves. */
     fprintf(stderr,
@@ -66843,6 +66849,21 @@ static int ds4_engine_open_internal(ds4_engine **out,
             }
             ds4_gpu_set_quality(e->quality);
             ds4_gpu_set_glm_model(0);
+            /* Bring the weights into device memory here, like every other
+             * family does.  Without this the Qwen path faulted each range in on
+             * first use, and a 350-token prompt paid for the whole 10.95 GiB at
+             * about 23 GB/s: measured per matmul, the first chunk cost 5.7 ms
+             * against 0.64 ms once the weights were resident, which is the same
+             * 48 TMAC/s the reference implementation reaches.  Paying it once
+             * at startup instead of inside the first reply is the whole fix. */
+            if (!accelerator_cache_model_tensors(e->backend, &e->model,
+                                                 NULL, NULL, 0)) {
+                fprintf(stderr,
+                        "ds4: CUDA failed to prepare the Qwen3.8 weight cache\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
         }
 #endif
         /* The Qwen3.8 engine returns here, so the draft sidecar is loaded on
