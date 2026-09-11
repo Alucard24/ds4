@@ -66,8 +66,9 @@ MMVQ, depthwise convolution and GDN recurrence, gated GQA, SwiGLU FFN and
 output logits. GDN state remains FP32. The 16 global-attention layers use FP16
 K/V (64 KiB per context token), matching the practical memory class of normal
 llama.cpp CUDA inference. At context 32768 the final measured process peak was
-14214 MiB on the RTX 5070 Ti with the 256-token prefill workspace, including
-the approximately 10.95 GiB model.
+14214 MiB on the RTX 5070 Ti with the prefill workspace, including the
+approximately 10.95 GiB model. The workspace has since grown from 256 to 512
+tokens per chunk, which adds about 10 MiB of scratch.
 
 ```sh
 make clean
@@ -88,7 +89,7 @@ numerical gate below. On the canonical six-token sentence its CUDA mean NLL was
 2.43385090 versus 2.43708414 for the FP32 CPU-state oracle, and both generated
 ` Paris` greedily.
 
-CUDA prefill is layer-major in bounded chunks of at most 256 tokens. Batches up
+CUDA prefill is layer-major in bounded chunks of at most 512 tokens. Batches up
 to eight use MMVQ; larger batches use native packed-weight MMQ, with the lone
 IQ1_M matrix row-sliced through MMVQ. `DS4_QWEN38_PREFILL_CHUNK=1..256` and
 `DS4_QWEN38_PREFILL_SEQUENTIAL=1` are diagnostic comparison controls, not
@@ -227,24 +228,37 @@ make tests/test_qwen38_cuda_perf CUDA_ARCH=sm_120
 ```
 
 The benchmark reports both the first (`COLD_PREFILL`) sync and a same-session
-rebuild (`PREFILL`), because the first sync also populates ds4's lazy CUDA model
-cache. Qwen takes its dedicated engine-open branch after registering the model
-map, before the generic eager tensor-span preparation used by the other model
-families; the missing generic preload log is therefore expected rather than a
-stale-binary symptom. An experimental 256 MiB-span eager preload increased load
-time, while the default 1792 MiB span could not fit alongside the 16GB working
-set, so neither behavior was retained. On the RTX 5070 Ti, three runs of a
-538-token local prompt had median
-load 0.207 s, cold prefill 252.0 tok/s, steady-state prefill 802.7 tok/s, and
-128-token decode 40.17 tok/s. Before this pass, the same prompt measured cold
-prefill 220.9 tok/s, steady-state prefill 689.8 tok/s, and decode 32.57 tok/s.
-At 2012 prompt tokens, final median cold/steady prefill measured
-422.8/624.5 tok/s and decode at the resulting context measured 27.43 tok/s,
-versus 330.3/460.4/18.73 before.
-The gain comes from a barrier-free bounded GA attention schedule, a 256-token
-prefill chunk, removal of redundant dense-MMVQ output cleanup, and branchless
-Q4_K scale unpacking. The recorded normal llama.cpp baselines remain faster
+rebuild (`PREFILL`).
+
+That lazy population was measured later and turned out to be the whole prefill
+gap: the Qwen branch returned before the generic eager tensor-span preparation
+used by the other families, so a first prompt faulted every weight range in at
+about 23 GB/s inside its own prefill windows. The branch now runs that preload,
+which is why the earlier "cold prefill" numbers below are superseded: with the
+weights resident there is no cold/steady split, and a 350-token first prompt
+measures 665 tok/s with a 2000-token prompt at 661 tok/s on the RTX 5070 Ti.
+The kernel itself was never slow - 0.64 ms per 5120x17408 gate matmul, 48
+TMAC/s, the rate llama.cpp reaches; the earlier numbers came from runs that paid
+the upload inside the measurement. See `tests/QWEN38_PREFILL.md`.
+
+Recorded measurements before that change, kept for the trail: load 0.207 s, cold
+prefill 252.0 tok/s, steady-state prefill 802.7 tok/s, 128-token decode
+40.17 tok/s on a 538-token prompt; at 2012 tokens, cold/steady 422.8/624.5 tok/s
+with decode 27.43 tok/s. The decode figures still hold; the prefill ones were
+measuring the upload.
+The gain comes from a barrier-free bounded GA attention schedule, the prefill
+chunk, removal of redundant dense-MMVQ output cleanup, and branchless Q4_K scale
+unpacking. Two later changes moved the prefill again, both numerics-neutral and
+both verified against the gate: the Qwen weight preload at engine open, and
+keeping the GDN recurrent state in a 64 KiB shared tile for the whole chunk
+instead of reading and writing it in global memory once per token (103 GiB of
+traffic per chunk). The recurrence fell from 204.8 to 141.9 ms per 350-token
+chunk and the chunk total from 334.8 to 271.5 ms, with trunk NLL unchanged at
+1.81334038. The recorded normal llama.cpp baselines remain faster
 (pp512 1628.69 tok/s, tg128 53.24 tok/s); matching llama.cpp is not claimed.
+The MTP speculative round now reaches 1.30x on this prompt (41.4 -> 53.7 tok/s)
+with the stream identical to one-token greedy.
+
 A final experiment split Q8_1 activation quantization from MMVQ so the Qwen
 attention and FFN projections could share one quantized row. Three 538-token
 runs produced 798.1/798.4/787.3 warm prefill tok/s and
