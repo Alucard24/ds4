@@ -546,6 +546,13 @@ int ds4_gpu_embed_tokens_quant_tensor(
         uint32_t                n_tokens,
         uint32_t                n_embd);
 
+/* KV cache format for the Qwen3.8 attention layers.  0 is f16, the release
+ * path; 1 is q8_0, which stores 32 values per block behind an fp16 scale and
+ * costs 1088 bytes per position per layer against 2048.  Set once when the
+ * engine opens, before any session allocates its caches. */
+void ds4_gpu_qwen38_set_kv_quant(int q8);
+int ds4_gpu_qwen38_kv_quant_is_q8(void);
+
 int ds4_gpu_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,

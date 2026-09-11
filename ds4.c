@@ -7841,10 +7841,18 @@ static int qwen38_gpu_state_init(ds4_qwen38_gpu_state *st, uint32_t ctx_size) {
     do { if (!qwen38_gpu_alloc_tensor(&st->name, (count), #name)) goto fail; } while (0)
     QWEN38_GPU_ALLOC(ssm_state, 48ull * 48 * 128 * 128);
     QWEN38_GPU_ALLOC(conv_state, 48ull * 3 * QWEN38_CONV_DIM);
+    /* KV format for the GA layers: f16 (the release path) unless DS4_KV_Q8 is
+     * set, in which case the q8_0 twins are used and the caches are sized
+     * 1088 bytes per position per layer against 2048.  The switch lives here
+     * rather than in a frontend while the feature is being measured; -ctk/-ctv
+     * are the user-facing form. */
+    const int kv_q8 = getenv("DS4_KV_Q8") != NULL ? 1 : 0;
+    ds4_gpu_qwen38_set_kv_quant(kv_q8);
+    const uint64_t kv_pos_bytes = kv_q8 ? 1088ull : 2048ull;
     if (!qwen38_gpu_alloc_bytes(&st->attn_k,
-            16ull * ctx_size * 1024 * sizeof(uint16_t), "attn_k")) goto fail;
+            16ull * ctx_size * kv_pos_bytes, "attn_k")) goto fail;
     if (!qwen38_gpu_alloc_bytes(&st->attn_v,
-            16ull * ctx_size * 1024 * sizeof(uint16_t), "attn_v")) goto fail;
+            16ull * ctx_size * kv_pos_bytes, "attn_v")) goto fail;
     QWEN38_GPU_ALLOC(hidden, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_N_EMBD);
     QWEN38_GPU_ALLOC(xnorm, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_N_EMBD);
     QWEN38_GPU_ALLOC(qkv, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_CONV_DIM);
@@ -7900,11 +7908,11 @@ static int qwen38_gpu_state_init(ds4_qwen38_gpu_state *st, uint32_t ctx_size) {
     }
     for (uint32_t i = 0; i < 16; i++) {
         st->attn_k_layer[i] = ds4_gpu_tensor_view(st->attn_k,
-            i * ((uint64_t)ctx_size * 1024 * sizeof(uint16_t)),
-            (uint64_t)ctx_size * 1024 * sizeof(uint16_t));
+            i * ((uint64_t)ctx_size * kv_pos_bytes),
+            (uint64_t)ctx_size * kv_pos_bytes);
         st->attn_v_layer[i] = ds4_gpu_tensor_view(st->attn_v,
-            i * ((uint64_t)ctx_size * 1024 * sizeof(uint16_t)),
-            (uint64_t)ctx_size * 1024 * sizeof(uint16_t));
+            i * ((uint64_t)ctx_size * kv_pos_bytes),
+            (uint64_t)ctx_size * kv_pos_bytes);
         if (!st->attn_k_layer[i] || !st->attn_v_layer[i]) goto fail;
     }
     if (!ds4_gpu_tensor_fill_f32(st->ssm_state, 0.0f, 48ull * 48 * 128 * 128) ||
@@ -58409,6 +58417,16 @@ static int session_qwen38_validate_vision_identities(
 
 static int ds4_session_save_qwen38_payload(ds4_session *s, FILE *fp,
                                             char *err, size_t errlen) {
+    /* A q8_0 KV cache has a different layout and the payload header does not
+     * record it yet, so a file written now would be reloaded as f16 by a later
+     * run and silently decode garbage.  Refusing is the only honest answer
+     * until the header carries the format. */
+    if (ds4_gpu_qwen38_kv_quant_is_q8()) {
+        payload_set_err(err, errlen,
+                        "the Qwen3.8 KV disk payload does not record the KV "
+                        "format yet, so a q8_0 cache cannot be written");
+        return 1;
+    }
     if (s->checkpoint_image_count > UINT32_MAX) {
         payload_set_err(err, errlen, "too many Qwen image identities to save");
         return 1;
@@ -58529,6 +58547,14 @@ static int ds4_session_load_qwen38_payload(ds4_session *s, FILE *fp,
                                             const uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS],
                                             uint64_t *remaining,
                                             char *err, size_t errlen) {
+    /* The mirror of the guard above: a file on disk was written by an f16 run
+     * at best, and this session cannot tell. */
+    if (ds4_gpu_qwen38_kv_quant_is_q8()) {
+        payload_set_err(err, errlen,
+                        "the Qwen3.8 KV disk payload does not record the KV "
+                        "format yet, so a q8_0 session cannot load one");
+        return 1;
+    }
     const uint32_t saved_ctx = h[2];
     const uint32_t kv_element_bytes = h[4];
     const uint32_t rope_pos = h[5];
