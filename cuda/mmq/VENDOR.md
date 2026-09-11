@@ -162,7 +162,7 @@ compile check.
 | Source | https://github.com/ggml-org/llama.cpp |
 | Commit | `f19e44ea489e` |
 | Files | `mmq.cuh`, `mmq-load-tiles.cuh`, `mmq-vec-dot.cuh`, `mmq-config-*.cuh`, `common.cuh`, `vecdotq.cuh`, `mma.cuh` |
-| Why | the older revision runs the prefill GEMM at 5.7-6.2 TMAC/s where this one reaches ~47 on the same model and card (see `tests/QWEN38_PREFILL_MMQ_PORT.md`) |
+| Why | originally added to test whether a stale MMQ revision explained the Qwen3.8 prefill gap.  It does not: measured head to head on the same model and card, the later revision is the *same* speed (FFN gate 350.9 vs 343.4 ms, FFN up 319.7 vs 314.2 ms).  The gap was weight residency and cache requests in the attention, both fixed elsewhere, and the old revision reaches ~48 TMAC/s once the weights are resident.  See `tests/QWEN38_PREFILL.md`. |
 
 Two headers in this directory needed a small addition for the later revision:
 `ggml-common.h` gained the `Q2_0` quant type (upstream added it after these
