@@ -236,8 +236,29 @@ used by the other families, so a first prompt faulted every weight range in at
 about 23 GB/s inside its own prefill windows. The branch now runs that preload,
 which is why the earlier "cold prefill" numbers below are superseded: with the
 weights resident there is no cold/steady split, and a 350-token first prompt
-measures 753-763 tok/s with a 2000-token prompt at 770-776 tok/s on the RTX
+measures 817-969 tok/s (noisy, that figure is dominated by the per-session
+setup described above) with a 2000-token prompt at 1179-1181 tok/s on the RTX
 5070 Ti (the block shape settled at 512 threads).
+
+The largest single win since the first stable point is in the GA attention
+prefill, which was bound by the number of requests it sent to the cache: every
+warp pulled its own copy of the key vector and its own slice of the value vector
+straight from the cache, once per key, so the cost grew as queries x keys
+without bound (69.6/208.0/344.9/470.1 ms for the four 512-token chunks of a
+2000-token prompt). Staging a 32-key tile of keys and values in shared memory,
+loaded once per block, brought that to 16.8/50.9/86.1/108.1 ms - a factor of
+four to four and a half - and took the 2000-token prefill from 789 to 1180
+tok/s. Decode is untouched: at one query there is nothing to share a tile with,
+so that path keeps the old kernel shape and the launcher picks by token count.
+
+Two experiments toward this measured nothing and are worth recording, because
+together they are what identified the real limit. Removing an eight-fold
+redundancy in the score computation (all eight warps of a block were computing
+the same 256-dim score from the same lanes) changed the time by less than a
+percent: those warps were sharing the same L1 lines, so the redundancy cost no
+traffic and was really hiding its own latency. Interleaving two keys per
+iteration changed nothing either. Only then did the request count turn out to be
+the thing.
 The kernel itself was never slow - 0.64 ms per 5120x17408 gate matmul, 48
 TMAC/s, the rate llama.cpp reaches; the earlier numbers came from runs that paid
 the upload inside the measurement. See `tests/QWEN38_PREFILL.md`.
