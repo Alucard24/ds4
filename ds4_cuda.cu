@@ -27283,18 +27283,18 @@ __global__ static void qwen38_gdn_decode_kernel(
     const uint32_t lane = tid & 31u;
     const uint32_t warp = tid >> 5u;
     if (head >= QWEN38_CUDA_HEADS_V) return;
-    /* 256 threads = 8 warps.  Only the first 128 threads own an element of the
-     * 128-wide q/k/o slices, but all eight warps walk state rows: the warp's
-     * 32 rows were the serial chain, and halving that chain per warp is what
-     * this block shape buys.  Threads 128..255 contribute zeros to the q/k/o
-     * reductions, and adding 0.0f is exact, so every reduction keeps its order
-     * and its value. */
+    /* 512 threads = 16 warps.  Only the first 128 threads own an element of the
+     * 128-wide q/k/o slices, but every warp walks state rows: the warp's share
+     * of the 128 rows is the serial chain, and shortening it is what this block
+     * shape buys.  The threads that own no q/k/o element contribute zeros to
+     * those three reductions, and adding 0.0f is exact, so every reduction
+     * keeps its order and its value. */
     const bool owns_elt = tid < QWEN38_CUDA_HEAD_DIM;
 
     __shared__ float q[QWEN38_CUDA_HEAD_DIM];
     __shared__ float k[QWEN38_CUDA_HEAD_DIM];
     __shared__ float o[QWEN38_CUDA_HEAD_DIM];
-    __shared__ float rq[8], rk[8], ro[8];
+    __shared__ float rq[16], rk[16], ro[16];
     __shared__ float q_inv, k_inv, decay, beta_h;
     /* The recurrent state lives in shared memory for the whole token loop.
      * It used to be read and written in global memory once per token, and at
@@ -27333,7 +27333,7 @@ __global__ static void qwen38_gdn_decode_kernel(
         if (tid == 0u) {
             float qsum = 0.0f, ksum = 0.0f;
 #pragma unroll
-            for (int i = 0; i < 8; i++) { qsum += rq[i]; ksum += rk[i]; }
+            for (int i = 0; i < 16; i++) { qsum += rq[i]; ksum += rk[i]; }
             q_inv = ds4_cuda_rsqrtf(qsum + 1.0e-6f);
             k_inv = ds4_cuda_rsqrtf(ksum + 1.0e-6f);
             const uint64_t scalar = (uint64_t)token * QWEN38_CUDA_HEADS_V + head;
@@ -27358,8 +27358,8 @@ __global__ static void qwen38_gdn_decode_kernel(
          * so the interleaving is invisible in the results.  A four-row variant
          * measured 212 ms on one run and 290 ms on the next, against 230/228 for
          * this one, so it was not kept. */
-        for (uint32_t value = warp; value < QWEN38_CUDA_HEAD_DIM; value += 16u) {
-            const uint32_t value_b = value + 8u;
+        for (uint32_t value = warp; value < QWEN38_CUDA_HEAD_DIM; value += 32u) {
+            const uint32_t value_b = value + 16u;
             float4 *hp = (float4 *)(state_sh +
                 (uint64_t)value * QWEN38_CUDA_HEAD_DIM + key0);
             float4 *hpb = (float4 *)(state_sh +
@@ -27419,7 +27419,7 @@ __global__ static void qwen38_gdn_decode_kernel(
         if (tid == 0u) {
             float sum = 0.0f;
 #pragma unroll
-            for (int i = 0; i < 8; i++) sum += ro[i];
+            for (int i = 0; i < 16; i++) sum += ro[i];
             ro[0] = ds4_cuda_rsqrtf(sum / QWEN38_CUDA_HEAD_DIM + 1.0e-6f);
         }
         __syncthreads();
@@ -27624,7 +27624,7 @@ extern "C" int ds4_gpu_qwen38_gdn_chunk(
         (float *)qkv->ptr, (float *)conv_state->ptr, conv, n_tokens);
     if (!cuda_ok(cudaGetLastError(), "Qwen GDN convolution launch")) return 0;
     qwen38_gdn_ensure_state_shared();
-    qwen38_gdn_decode_kernel<<<48,256,QWEN38_GDN_STATE_SHARED_BYTES,
+    qwen38_gdn_decode_kernel<<<48,512,QWEN38_GDN_STATE_SHARED_BYTES,
                                cuda_decode_stream()>>>(
         (float *)out->ptr, (float *)recurrent_state->ptr,
         (const float *)qkv->ptr, (const float *)z->ptr,
