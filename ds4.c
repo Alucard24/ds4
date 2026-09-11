@@ -8745,6 +8745,14 @@ static void qwen38_phase_collect(void) {
             extra[0] * 1e3, extra[1] * 1e3, extra[2] * 1e3);
 }
 
+/* Host wall clock for the phase report: the window sum above says how much of
+ * a chunk is inside the instrumented segments, this says how long the chunk
+ * really took and therefore how much of it is not in any window.  It was the
+ * only way to see the remaining per-chunk cost once the kernels themselves got
+ * fast. */
+static double g_qwen38_chunk_enter;
+static double g_qwen38_prev_report;
+
 static void qwen38_phase_report(uint32_t n_tokens) {
     if (!qwen38_phase_enabled()) return;
     const qwen38_phase_time *a = &g_qwen38_phase;
@@ -8761,6 +8769,18 @@ static void qwen38_phase_report(uint32_t n_tokens) {
             a->attn_out[0] * 1e3, a->attn_out[1] * 1e3,
             a->ffn[0] * 1e3, a->ffn[1] * 1e3,
             a->head * 1e3, total * 1e3);
+    {
+        const double now = qwen38_phase_now();
+        if (g_qwen38_prev_report > 0.0) {
+            fprintf(stderr,
+                    "QWEN38PHASE-WALL since_prev=%.1f chunk_wall=%.1f "
+                    "outside_windows=%.1f ms\n",
+                    (now - g_qwen38_prev_report) * 1e3,
+                    (now - g_qwen38_chunk_enter) * 1e3,
+                    (now - g_qwen38_chunk_enter) * 1e3 - total * 1e3);
+        }
+        g_qwen38_prev_report = now;
+    }
 }
 
 /* logits_rows, when non-NULL, also receives the head output of every chunk
@@ -8777,6 +8797,7 @@ static int qwen38_gpu_forward_chunk(ds4_qwen38_gpu_state *st,
                                     uint32_t *logical_pos,
                                     float *logits,
                                     float *logits_rows) {
+    if (qwen38_phase_enabled()) g_qwen38_chunk_enter = qwen38_phase_now();
 #define QWEN38_CHUNK_CHECK(expr, label) \
     do { if (!(expr)) { fprintf(stderr, "ds4: Qwen CUDA chunk %s failed\n", label); return 0; } } while (0)
     if (!tokens || !logical_pos || n_tokens == 0 ||
