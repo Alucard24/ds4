@@ -27861,6 +27861,12 @@ extern "C" int ds4_gpu_qwen38_ga_chunk(
         q_full->bytes < (uint64_t)n_tokens*12288*4 ||
         k_cache->bytes < (uint64_t)ctx_size*1024*2 ||
         v_cache->bytes < (uint64_t)ctx_size*1024*2) return 0;
+    /* The single-row shape is used for decode at every depth.  Staging the keys
+     * and values in shared memory does not help it: measured on a 24k context,
+     * the tiled kernel gives 3.95 tok/s against 4.43 for this one, because the
+     * cost is not the per-key load latency but the serial chain of shuffles and
+     * exponentials that only 24 to 48 warps are walking.  The tile pays off in
+     * the prefill, where a block has rows enough to fill it. */
     if (n_tokens == 1u) {
         const dim3 grid(QWEN38_CUDA_GA_HEADS, 1u, 1u);
         qwen38_ga_decode_single_kernel<<<grid,256,0,cuda_decode_stream()>>>(

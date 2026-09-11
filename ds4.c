@@ -8572,6 +8572,29 @@ static bool qwen38_gdn_proj_fuse_enabled(void) {
     return cached != 0;
 }
 
+/* The single-token path reports phase timings as well, and it sits above the
+ * helpers that do it, so they are declared here.  g_qwen38_chunk_enter cannot be
+ * declared forward - statics are not - so it is defined here instead of in the
+ * phase section below. */
+typedef struct {
+    double proj[2];    /* input projections, [GDN, GA] */
+    double core[2];    /* recurrence or attention */
+    double attn_out[2];/* FFN gate and up */
+    double ffn[2];     /* SwiGLU, FFN down, residual */
+    double head;       /* output norm and LM head */
+    uint32_t layers[2];
+    uint64_t chunks;
+} qwen38_phase_time;
+
+static qwen38_phase_time g_qwen38_phase;
+
+static bool qwen38_phase_enabled(void);
+static double qwen38_phase_now(void);
+static void qwen38_phase_mark(int group);
+static void qwen38_phase_collect(void);
+static void qwen38_phase_report(uint32_t n_tokens);
+static double g_qwen38_chunk_enter;
+
 static int qwen38_gpu_forward_token(ds4_qwen38_gpu_state *st,
                                     const ds4_model *m,
                                     const ds4_qwen38_weights *w,
@@ -8586,6 +8609,15 @@ static int qwen38_gpu_forward_token(ds4_qwen38_gpu_state *st,
         st->hidden, m->map, m->size, w->token_embd->abs_offset,
         w->token_embd->type, DS4_N_VOCAB, (uint32_t)token,
         QWEN38_N_EMBD), "token embedding");
+    /* Phase timing for the single-token path: the chunk path reports its own
+     * windows, and without these a decode step had no attribution at all - the
+     * 24k-context decode measured 4.4 tok/s with no way to see which phase was
+     * paying for it.  Three marks are enough to separate the GA projections
+     * from the attention itself; everything else lands in the wall clock. */
+    if (qwen38_phase_enabled()) {
+        g_qwen38_chunk_enter = qwen38_phase_now();
+        ds4_gpu_phase_reset();
+    }
     if (getenv("DS4_EMBD_DUMP"))
         QWEN38_GPU_CHECK(qwen38_gpu_debug_prefix(st->hidden, 16, "E"), "embedding dump");
 
@@ -8639,6 +8671,7 @@ static int qwen38_gpu_forward_token(ds4_qwen38_gpu_state *st,
             QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->proj, m, l->ssm_out, st->o), "GDN output");
         } else {
             const uint32_t ga = il / 4u;
+            qwen38_phase_mark(4);
             QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->q_full, m, l->attn_q, st->xnorm), "GA Q");
             QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->k, m, l->attn_k, st->xnorm), "GA K");
             QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->v, m, l->attn_v, st->xnorm), "GA V");
@@ -8647,9 +8680,11 @@ static int qwen38_gpu_forward_token(ds4_qwen38_gpu_state *st,
                 st->k, st->v, m->map, m->size,
                 l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
                 pos, st->ctx_size), "GA prepare");
+            qwen38_phase_mark(5);
             QWEN38_GPU_CHECK(ds4_gpu_qwen38_ga_decode(
                 st->attn, st->q_full, st->attn_k_layer[ga],
                 st->attn_v_layer[ga], pos, st->ctx_size), "GA attention");
+            qwen38_phase_mark(6);
             QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->proj, m, l->attn_output, st->attn), "GA output");
         }
         QWEN38_GPU_CHECK(ds4_gpu_add_tensor(st->hidden, st->hidden,
@@ -8673,6 +8708,12 @@ static int qwen38_gpu_forward_token(ds4_qwen38_gpu_state *st,
     QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->logits, m, w->output, st->xnorm), "output projection");
     QWEN38_GPU_CHECK(ds4_gpu_tensor_read(st->logits, 0, logits,
                                          (uint64_t)DS4_N_VOCAB * sizeof(float)), "logit read");
+    if (qwen38_phase_enabled()) {
+        qwen38_phase_collect();
+        g_qwen38_phase.chunks++;
+        qwen38_phase_report(1u);
+        memset(&g_qwen38_phase, 0, sizeof(g_qwen38_phase));
+    }
 #undef QWEN38_GPU_CHECK
     return 1;
 }
@@ -8685,17 +8726,7 @@ static int qwen38_gpu_forward_token(ds4_qwen38_gpu_state *st,
  * under synchronization and 386 ms without it.  The marks below record CUDA
  * events in stream order instead, and the backend turns consecutive events
  * into true GPU segment times without waiting for anything. */
-typedef struct {
-    double proj[2];    /* input projections, [GDN, GA] */
-    double core[2];    /* recurrence or attention */
-    double attn_out[2];/* FFN gate and up */
-    double ffn[2];     /* SwiGLU, FFN down, residual */
-    double head;       /* output norm and LM head */
-    uint32_t layers[2];
-    uint64_t chunks;
-} qwen38_phase_time;
 
-static qwen38_phase_time g_qwen38_phase;
 static int g_qwen38_phase_on = -1;
 
 static bool qwen38_phase_enabled(void) {
@@ -8754,7 +8785,6 @@ static void qwen38_phase_collect(void) {
  * really took and therefore how much of it is not in any window.  It was the
  * only way to see the remaining per-chunk cost once the kernels themselves got
  * fast. */
-static double g_qwen38_chunk_enter;
 static double g_qwen38_prev_report;
 
 static void qwen38_phase_report(uint32_t n_tokens) {
