@@ -27337,25 +27337,65 @@ __global__ static void qwen38_gdn_decode_kernel(
 
         const float4 q4 = *(const float4 *)(q + key0);
         const float4 k4 = *(const float4 *)(k + key0);
-        for (uint32_t value = warp; value < QWEN38_CUDA_HEAD_DIM; value += 4u) {
+        /* Two state rows per iteration.  Each row needs two warp-wide
+         * shuffle reductions, and doing them one row at a time left that
+         * latency exposed: the recurrence was 8.4 us per token per layer.  Rows
+         * are independent and each row keeps its own reduction tree unchanged,
+         * so the interleaving is invisible in the results.  A four-row variant
+         * measured 212 ms on one run and 290 ms on the next, against 230/228 for
+         * this one, so it was not kept. */
+        for (uint32_t value = warp; value < QWEN38_CUDA_HEAD_DIM; value += 8u) {
+            const uint32_t value_b = value + 4u;
             float4 *hp = (float4 *)(state_sh +
                 (uint64_t)value * QWEN38_CUDA_HEAD_DIM + key0);
+            float4 *hpb = (float4 *)(state_sh +
+                (uint64_t)value_b * QWEN38_CUDA_HEAD_DIM + key0);
             float4 h = *hp;
+            float4 hb = *hpb;
             h.x *= decay; h.y *= decay; h.z *= decay; h.w *= decay;
-            const float pred = __shfl_sync(0xffffffffu,
-                warp_sum_f32(dot4_f32(h, k4)), 0);
-            const float vv = qkv[qkv_row +
+            hb.x *= decay; hb.y *= decay; hb.z *= decay; hb.w *= decay;
+
+            float p = dot4_f32(h, k4);
+            float pb = dot4_f32(hb, k4);
+            for (int off = 16; off > 0; off >>= 1) {
+                p += __shfl_down_sync(0xffffffffu, p, off);
+                pb += __shfl_down_sync(0xffffffffu, pb, off);
+            }
+            const float pred = __shfl_sync(0xffffffffu, p, 0);
+            const float pred_b = __shfl_sync(0xffffffffu, pb, 0);
+
+            const uint64_t vbase = qkv_row +
                 2u * QWEN38_CUDA_HEADS_QK * QWEN38_CUDA_HEAD_DIM +
-                (uint64_t)head * QWEN38_CUDA_HEAD_DIM + value];
-            const float delta = (vv - pred) * beta_h;
+                (uint64_t)head * QWEN38_CUDA_HEAD_DIM;
+            const float delta = (qkv[vbase + value] - pred) * beta_h;
+            const float delta_b = (qkv[vbase + value_b] - pred_b) * beta_h;
             h.x = fmaf(k4.x, delta, h.x);
             h.y = fmaf(k4.y, delta, h.y);
             h.z = fmaf(k4.z, delta, h.z);
             h.w = fmaf(k4.w, delta, h.w);
+            hb.x = fmaf(k4.x, delta_b, hb.x);
+            hb.y = fmaf(k4.y, delta_b, hb.y);
+            hb.z = fmaf(k4.z, delta_b, hb.z);
+            hb.w = fmaf(k4.w, delta_b, hb.w);
             *hp = h;
-            const float result = __shfl_sync(0xffffffffu,
-                warp_sum_f32(dot4_f32(h, q4)), 0) * 0.08838834764831845f;
-            if (lane == 0u) o[value] = result;
+            *hpb = hb;
+
+            float r = dot4_f32(h, q4);
+            float rb = dot4_f32(hb, q4);
+            for (int off = 16; off > 0; off >>= 1) {
+                r += __shfl_down_sync(0xffffffffu, r, off);
+                rb += __shfl_down_sync(0xffffffffu, rb, off);
+            }
+            /* The shuffles stay outside the lane-0 branch: a full-mask
+             * __shfl_sync executed by one thread deadlocks. */
+            const float result = __shfl_sync(0xffffffffu, r, 0) *
+                                 0.08838834764831845f;
+            const float result_b = __shfl_sync(0xffffffffu, rb, 0) *
+                                   0.08838834764831845f;
+            if (lane == 0u) {
+                o[value] = result;
+                o[value_b] = result_b;
+            }
         }
         __syncthreads();
         float os = warp_sum_f32(o[tid] * o[tid]);

@@ -236,7 +236,8 @@ used by the other families, so a first prompt faulted every weight range in at
 about 23 GB/s inside its own prefill windows. The branch now runs that preload,
 which is why the earlier "cold prefill" numbers below are superseded: with the
 weights resident there is no cold/steady split, and a 350-token first prompt
-measures 665 tok/s with a 2000-token prompt at 661 tok/s on the RTX 5070 Ti.
+measures 690 tok/s with a 2000-token prompt at 712-715 tok/s on the RTX 5070
+Ti.
 The kernel itself was never slow - 0.64 ms per 5120x17408 gate matmul, 48
 TMAC/s, the rate llama.cpp reaches; the earlier numbers came from runs that paid
 the upload inside the measurement. See `tests/QWEN38_PREFILL.md`.
@@ -253,8 +254,11 @@ both verified against the gate: the Qwen weight preload at engine open, and
 keeping the GDN recurrent state in a 64 KiB shared tile for the whole chunk
 instead of reading and writing it in global memory once per token (103 GiB of
 traffic per chunk). The recurrence fell from 204.8 to 141.9 ms per 350-token
-chunk and the chunk total from 334.8 to 271.5 ms, with trunk NLL unchanged at
-1.81334038. The recorded normal llama.cpp baselines remain faster
+chunk and the chunk total from 334.8 to 271.5 ms, then to 97.4 and 227.5 ms by
+processing two state rows per iteration in that kernel (each row needs two
+warp-wide shuffle reductions, and rows are independent); a four-row variant was
+not repeatable (212 ms on one run, 290 on the next) and was dropped. Trunk NLL
+unchanged at 1.81334038 through all of it. The recorded normal llama.cpp baselines remain faster
 (pp512 1628.69 tok/s, tg128 53.24 tok/s); matching llama.cpp is not claimed.
 The MTP speculative round now reaches 1.30x on this prompt (41.4 -> 53.7 tok/s)
 with the stream identical to one-token greedy.
