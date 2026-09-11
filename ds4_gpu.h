@@ -266,6 +266,12 @@ uint64_t ds4_gpu_recommended_working_set_size(void);
  * backend cannot report them, in which case callers must not size work from
  * it (a driver-level answer is a hint, never a guarantee). */
 int ds4_gpu_memory_info(uint64_t *free_bytes, uint64_t *total_bytes);
+/* In-stream phase timing for diagnostics: mark a boundary, then collect the
+ * elapsed GPU time of each segment.  No synchronization is involved, so the
+ * measured pipeline is the real one. */
+void ds4_gpu_phase_reset(void);
+int ds4_gpu_phase_mark(int group);
+int ds4_gpu_phase_finish(float *totals, int groups);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
 typedef struct ds4_gpu_stream_expert_table {

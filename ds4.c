@@ -8675,16 +8675,17 @@ static int qwen38_gpu_forward_token(ds4_qwen38_gpu_state *st,
 
 /* Phase timing for the chunk path.
  *
- * Without a profiler (nsys/ncu are not available here) the only way to know
- * where prefill time goes is to bound each phase with a synchronization.  One
- * sync per phase costs a few microseconds against a phase measured in
- * milliseconds, which is why this is worth having and why it is opt-in: it
- * perturbs the schedule it measures. */
+ * No profiler exists on this platform (nsys/ncu absent, nvprof refuses
+ * compute capability 8.0+), and bounding phases with a synchronization does
+ * not measure work: it drains the pipeline, so the same chunk reported 1793 ms
+ * under synchronization and 386 ms without it.  The marks below record CUDA
+ * events in stream order instead, and the backend turns consecutive events
+ * into true GPU segment times without waiting for anything. */
 typedef struct {
     double proj[2];    /* input projections, [GDN, GA] */
     double core[2];    /* recurrence or attention */
-    double attn_out[2];/* output projection, residual, post-attention norm */
-    double ffn[2];     /* gate/up/down, SwiGLU, residual */
+    double attn_out[2];/* FFN gate and up */
+    double ffn[2];     /* SwiGLU, FFN down, residual */
     double head;       /* output norm and LM head */
     uint32_t layers[2];
     uint64_t chunks;
@@ -8705,12 +8706,37 @@ static double qwen38_phase_now(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
-static void qwen38_phase_mark(double *slot, double *since) {
+/* Group ids match the report order: 0..3 are GDN proj/core/ffn-gate/ffn-down
+ * and 4..7 the GA ones, 8 the head. */
+#define QWEN38_PHASE_HEAD_GROUP 8
+
+static void qwen38_phase_mark(int group) {
     if (!qwen38_phase_enabled()) return;
-    if (!ds4_gpu_synchronize()) return;
-    const double now = qwen38_phase_now();
-    *slot += now - *since;
-    *since = now;
+    (void)ds4_gpu_phase_mark(group);
+}
+
+static void qwen38_phase_collect(void) {
+    float totals[12] = {0};
+    if (!ds4_gpu_phase_finish(totals, 12)) return;
+    g_qwen38_phase.proj[0] += totals[0] / 1000.0;
+    g_qwen38_phase.core[0] += totals[1] / 1000.0;
+    g_qwen38_phase.attn_out[0] += totals[2] / 1000.0;
+    g_qwen38_phase.ffn[0] += totals[3] / 1000.0;
+    g_qwen38_phase.proj[1] += totals[4] / 1000.0;
+    g_qwen38_phase.core[1] += totals[5] / 1000.0;
+    g_qwen38_phase.attn_out[1] += totals[6] / 1000.0;
+    g_qwen38_phase.ffn[1] += totals[7] / 1000.0;
+    g_qwen38_phase.head += totals[8] / 1000.0;
+    g_qwen38_phase.proj[0] += 0.0;
+    static double extra[3];
+    extra[0] += totals[9] / 1000.0;
+    extra[1] += totals[10] / 1000.0;
+    extra[2] += totals[11] / 1000.0;
+    /* Group 9 closes the interval before the gate matmul (the post-attention
+     * norm), 10 and 11 the gate and up matmuls themselves. */
+    fprintf(stderr,
+            "QWEN38PHASE-EXTRA ffn_norm=%.1f gate=%.1f up=%.1f ms\n",
+            extra[0] * 1e3, extra[1] * 1e3, extra[2] * 1e3);
 }
 
 static void qwen38_phase_report(uint32_t n_tokens) {
@@ -8810,7 +8836,7 @@ static int qwen38_gpu_forward_chunk(ds4_qwen38_gpu_state *st,
         st->rope_positions, 0, rope_positions,
         (uint64_t)n_tokens * 3u * sizeof(uint32_t)), "MRoPE positions");
 
-    double phase_t0 = qwen38_phase_enabled() ? qwen38_phase_now() : 0.0;
+    if (qwen38_phase_enabled()) ds4_gpu_phase_reset();
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const bool phase_gdn = ((il + 1u) % 4u) != 0u;
         const uint32_t phase_kind = phase_gdn ? 0u : 1u;
@@ -8830,14 +8856,14 @@ static int qwen38_gpu_forward_chunk(ds4_qwen38_gpu_state *st,
                 st->beta, m, l->ssm_beta, st->xnorm, n_tokens), "GDN beta");
             QWEN38_CHUNK_CHECK(qwen38_gpu_matvec_rows(
                 st->alpha, m, l->ssm_alpha, st->xnorm, n_tokens), "GDN alpha");
-            qwen38_phase_mark(&g_qwen38_phase.proj[0], &phase_t0);
+            qwen38_phase_mark(0);
             QWEN38_CHUNK_CHECK(ds4_gpu_qwen38_gdn_chunk(
                 st->o, st->conv_layer[gdn], st->ssm_layer[gdn],
                 st->qkv, st->z, st->alpha, st->beta,
                 m->map, m->size, l->ssm_conv1d->abs_offset,
                 l->ssm_a->abs_offset, l->ssm_dt->abs_offset,
                 l->ssm_norm->abs_offset, n_tokens), "GDN recurrence");
-            qwen38_phase_mark(&g_qwen38_phase.core[0], &phase_t0);
+            qwen38_phase_mark(1);
             QWEN38_CHUNK_CHECK(qwen38_gpu_matvec_rows(
                 st->proj, m, l->ssm_out, st->o, n_tokens), "GDN output");
         } else {
@@ -8848,7 +8874,7 @@ static int qwen38_gpu_forward_chunk(ds4_qwen38_gpu_state *st,
                 st->k, m, l->attn_k, st->xnorm, n_tokens), "GA K");
             QWEN38_CHUNK_CHECK(qwen38_gpu_matvec_rows(
                 st->v, m, l->attn_v, st->xnorm, n_tokens), "GA V");
-            qwen38_phase_mark(&g_qwen38_phase.proj[1], &phase_t0);
+            qwen38_phase_mark(4);
             QWEN38_CHUNK_CHECK(ds4_gpu_qwen38_ga_prepare_chunk(
                 st->q_full, st->attn_k_layer[ga], st->attn_v_layer[ga],
                 st->k, st->v, m->map, m->size,
@@ -8859,22 +8885,26 @@ static int qwen38_gpu_forward_chunk(ds4_qwen38_gpu_state *st,
                 st->attn, st->q_full, st->attn_k_layer[ga],
                 st->attn_v_layer[ga], start_pos, n_tokens, st->ctx_size),
                 "GA attention");
-            qwen38_phase_mark(&g_qwen38_phase.core[1], &phase_t0);
+            qwen38_phase_mark(5);
             QWEN38_CHUNK_CHECK(qwen38_gpu_matvec_rows(
                 st->proj, m, l->attn_output, st->attn, n_tokens), "GA output");
         }
         QWEN38_CHUNK_CHECK(ds4_gpu_add_tensor(
             st->hidden, st->hidden, st->proj,
             n_tokens * QWEN38_N_EMBD), "attention residual");
-        qwen38_phase_mark(&g_qwen38_phase.attn_out[phase_kind], &phase_t0);
+        qwen38_phase_mark(phase_gdn ? 2 : 6);
         QWEN38_CHUNK_CHECK(ds4_gpu_rms_norm_weight_rows_tensor(
             st->xnorm, st->hidden, m->map, m->size,
             l->attn_post_norm->abs_offset, QWEN38_N_EMBD, n_tokens, 1.0e-6f),
             "FFN norm");
+        qwen38_phase_mark(9);
         QWEN38_CHUNK_CHECK(qwen38_gpu_matvec_rows(
             st->ffn_g, m, l->ffn_gate, st->xnorm, n_tokens), "FFN gate");
+        qwen38_phase_mark(10);
         QWEN38_CHUNK_CHECK(qwen38_gpu_matvec_rows(
             st->ffn_u, m, l->ffn_up, st->xnorm, n_tokens), "FFN up");
+        qwen38_phase_mark(11);
+        qwen38_phase_mark(phase_gdn ? 3 : 7);
         QWEN38_CHUNK_CHECK(ds4_gpu_swiglu_tensor(
             st->ffn_m, st->ffn_g, st->ffn_u,
             n_tokens * QWEN38_N_FF, 0.0f, 1.0f), "SwiGLU");
@@ -8883,7 +8913,7 @@ static int qwen38_gpu_forward_chunk(ds4_qwen38_gpu_state *st,
         QWEN38_CHUNK_CHECK(ds4_gpu_add_tensor(
             st->hidden, st->hidden, st->proj,
             n_tokens * QWEN38_N_EMBD), "FFN residual");
-        qwen38_phase_mark(&g_qwen38_phase.ffn[phase_kind], &phase_t0);
+        qwen38_phase_mark(QWEN38_PHASE_HEAD_GROUP);
     }
     QWEN38_CHUNK_CHECK(ds4_gpu_rms_norm_weight_rows_tensor(
         st->out_norm, st->hidden, m->map, m->size,
@@ -8908,8 +8938,9 @@ static int qwen38_gpu_forward_chunk(ds4_qwen38_gpu_state *st,
     QWEN38_CHUNK_CHECK(ds4_gpu_tensor_read(
         st->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)),
         "logit read");
-    qwen38_phase_mark(&g_qwen38_phase.head, &phase_t0);
+    qwen38_phase_mark(QWEN38_PHASE_HEAD_GROUP);
     if (qwen38_phase_enabled()) {
+        qwen38_phase_collect();
         g_qwen38_phase.chunks++;
         qwen38_phase_report(n_tokens);
         memset(&g_qwen38_phase, 0, sizeof(g_qwen38_phase));

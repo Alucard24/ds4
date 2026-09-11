@@ -4635,6 +4635,12 @@ void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
     g_stream_expert_cache_expert_bytes = bytes;
 }
 
+void ds4_gpu_phase_reset(void) { }
+int ds4_gpu_phase_mark(int group) { (void)group; return 0; }
+int ds4_gpu_phase_finish(float *totals, int groups) {
+    (void)totals; (void)groups; return 0;
+}
+
 int ds4_gpu_memory_info(uint64_t *free_bytes, uint64_t *total_bytes) {
     /* Metal sizes from its own allocation budget rather than from a free-VRAM
      * query, and the Qwen3.8 draft head is CUDA-only. */

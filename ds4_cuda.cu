@@ -32896,6 +32896,85 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
     }
 }
 
+/* In-stream phase timing.
+ *
+ * Without a profiler on this platform (nsys/ncu are not installed and nvprof
+ * refuses compute capability 8.0+), phase boundaries were previously marked
+ * with a synchronization, which drains the pipeline and therefore measures
+ * waiting rather than work: the same chunk reported 1793 ms under
+ * synchronization and 386 ms without it.  These helpers record events instead.
+ * Events sit in the stream without forcing a wait, so the elapsed times between
+ * consecutive marks are the true GPU segments while the pipeline keeps running.
+ */
+#define DS4_PHASE_GROUP_MAX 16
+#define DS4_PHASE_MARK_MAX  4096
+
+static cudaEvent_t g_phase_events[DS4_PHASE_MARK_MAX];
+static int         g_phase_groups[DS4_PHASE_MARK_MAX];
+static int         g_phase_count;
+static int         g_phase_created;
+
+extern "C" void ds4_gpu_phase_reset(void) {
+    g_phase_count = 0;
+}
+
+extern "C" int ds4_gpu_phase_mark(int group) {
+    if (group < 0 || group >= DS4_PHASE_GROUP_MAX) return 0;
+    if (g_phase_count >= DS4_PHASE_MARK_MAX) return 0;
+    if (g_phase_count == g_phase_created) {
+        cudaEvent_t ev = NULL;
+        if (cudaEventCreate(&ev) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        g_phase_events[g_phase_created++] = ev;
+    }
+    if (cudaEventRecord(g_phase_events[g_phase_count],
+                        cuda_decode_stream()) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    g_phase_groups[g_phase_count] = group;
+    g_phase_count++;
+    return 1;
+}
+
+/* Accumulate the elapsed time of each mark's segment into `totals`.  A mark's
+ * segment is the interval since the previous mark of any group. */
+extern "C" int ds4_gpu_phase_finish(float *totals, int groups) {
+    if (!totals || groups <= 0 || groups > DS4_PHASE_GROUP_MAX) return 0;
+    for (int i = 0; i < groups; i++) totals[i] = 0.0f;
+    if (g_phase_count < 2) {
+        if (getenv("DS4_QWEN38_PHASE_TRACE")) {
+            fprintf(stderr, "ds4: phase finish with only %d marks\n",
+                    g_phase_count);
+        }
+        g_phase_count = 0;
+        return 1;
+    }
+    /* A single synchronization before reading the deltas: elapsed time needs
+     * both events recorded *and* complete, and one wait per chunk costs
+     * nothing against the pipeline the marks are measuring. */
+    (void)cudaStreamSynchronize(cuda_decode_stream());
+    for (int i = 1; i < g_phase_count; i++) {
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, g_phase_events[i - 1],
+                                 g_phase_events[i]) != cudaSuccess) {
+            (void)cudaGetLastError();
+            continue;
+        }
+        const int g = g_phase_groups[i];
+        if (g >= 0 && g < groups) totals[g] += ms;
+    }
+    if (getenv("DS4_QWEN38_PHASE_TRACE")) {
+        fprintf(stderr, "ds4: phase %d marks, groups", g_phase_count);
+        for (int i = 0; i < groups; i++) fprintf(stderr, " %.2f", totals[i]);
+        fprintf(stderr, " ms\n");
+    }
+    g_phase_count = 0;
+    return 1;
+}
+
 extern "C" int ds4_gpu_memory_info(uint64_t *free_bytes, uint64_t *total_bytes) {
     if (!free_bytes || !total_bytes) return 0;
     *free_bytes = 0;
