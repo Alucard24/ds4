@@ -574,11 +574,22 @@ Four for four in both, same answers. That bounds catastrophic loss, not subtle
 degradation - the 0.33% NLL is the measure for that - but it is the test that
 would have caught a broken quantization.
 
-The price today is prefill speed: the same prompt took 53 s in f16 and 1 min 26 s
-in q8_0, because the q8_0 prefill twin reads the cache directly instead of
-staging a shared tile (at one byte plus a scale per value the copy looked like it
-would cost more in barriers than it saves; at depth that is wrong and the tile is
-worth adding).
+The price today is prefill speed: the same prompt of 19530 tokens took 53 s in
+f16 and 1 min 26 s in q8_0, a factor of about 1.8 that shows up in the prefill
+rate (514 against 282 tokens/s).
+
+Staging a shared tile in the q8_0 prefill twin was the obvious candidate and it
+was tried: 8704 bytes per side against 16384 in f16, and the copy is one
+contiguous run per (key, head) rather than a strided gather. It measured nothing,
+1 min 24 s against 1 min 26 s, and was reverted. The reason is the same one that
+makes the deep decode slow: this attention is bound by the per-key latency chain,
+not by memory traffic, and dequantizing a q8_0 value adds a byte load, a scale
+load, a conversion and a multiply *inside that chain* - against one load and a
+conversion in f16. A tile removes traffic that was never the limit.
+
+So the q8_0 prefill cost is structural, not a missing optimization, and the fix
+for it is the same as for the depth decode: shorten or parallelise the chain,
+which changes the softmax association and needs a re-baseline.
 
 The kernels are duplicated rather than unified because the build uses
 `--use_fast_math`: an earlier attempt threaded a runtime flag through the shared
