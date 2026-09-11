@@ -14859,18 +14859,65 @@ static void *client_main(void *arg) {
         goto done;
     }
 
-    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
+    /* Route normalization, and the probes clients make before they show
+     * anything.
+     *
+     * OpenAI clients are configured either with the service root or with the
+     * /v1 base.  A UI that gets it wrong - base URL without /v1 - posts to
+     * /chat/completions and used to read "unknown endpoint" from a server that
+     * was up and answering, which is exactly how this was found.  The /v1
+     * prefix is optional from here on.  /health, /props and /api/tags are
+     * answered too, in the shapes llama.cpp and Ollama front-ends probe with;
+     * they are small, and a client that cannot discover the server cannot be
+     * pointed at it either. */
+    const char *route = hr.path;
+    if (!strncmp(route, "/v1/", 4u)) route += 3;
+
+    if (!strcmp(hr.method, "GET") && !strcmp(route, "/health")) {
+        (void)http_response(fd, s->enable_cors, 200, "application/json",
+                            "{\"status\":\"ok\"}\n");
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(route, "/props")) {
+        char body[512];
+        snprintf(body, sizeof(body),
+                 "{\"model_path\":\"%s\",\"n_ctx\":%d,"
+                 "\"default_generation_settings\":{\"n_ctx\":%d,"
+                 "\"n_predict\":%d,\"temperature\":0.0,\"top_p\":1.0}}\n",
+                 ds4_engine_model_name(s->engine), s->ctx_size, s->ctx_size,
+                 s->default_tokens);
+        (void)http_response(fd, s->enable_cors, 200, "application/json", body);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(route, "/api/tags")) {
+        char body[512];
+        snprintf(body, sizeof(body),
+                 "{\"models\":[{\"name\":\"%s\",\"model\":\"%s\","
+                 "\"modified_at\":\"\",\"size\":0,\"digest\":\"\","
+                 "\"details\":{\"family\":\"qwen3.8\","
+                 "\"parameter_size\":\"27B\","
+                 "\"quantization_level\":\"IQ3_S\"}}]}\n",
+                 ds4_engine_model_name(s->engine),
+                 ds4_engine_model_name(s->engine));
+        (void)http_response(fd, s->enable_cors, 200, "application/json", body);
+        http_request_free(&hr);
+        goto done;
+    }
+
+    if (!strcmp(hr.method, "GET") && !strcmp(route, "/models")) {
         send_models(s, fd);
         http_request_free(&hr);
         goto done;
     }
-    const char *model_path_prefix = "/v1/models/";
+    const char *model_path_prefix = "/models/";
     const size_t model_path_prefix_len = strlen(model_path_prefix);
     if (!strcmp(hr.method, "GET") &&
-        !strncmp(hr.path, model_path_prefix, model_path_prefix_len) &&
-        server_model_alias_known(hr.path + model_path_prefix_len))
+        !strncmp(route, model_path_prefix, model_path_prefix_len) &&
+        server_model_alias_known(route + model_path_prefix_len))
     {
-        send_model(s, fd, hr.path + model_path_prefix_len);
+        send_model(s, fd, route + model_path_prefix_len);
         http_request_free(&hr);
         goto done;
     }
@@ -14879,16 +14926,16 @@ static void *client_main(void *arg) {
     char err[160];
     bool ok = false;
     const int ctx_size = s->ctx_size;
-    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
+    if (!strcmp(hr.method, "POST") && !strcmp(route, "/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
-    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
+    } else if (!strcmp(hr.method, "POST") && !strcmp(route, "/chat/completions")) {
         ok = parse_chat_request(s->engine, s, hr.body, s->default_tokens,
                                 ctx_size, &req, err, sizeof(err));
-    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/responses")) {
+    } else if (!strcmp(hr.method, "POST") && !strcmp(route, "/responses")) {
         ok = parse_responses_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
-    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/completions")) {
+    } else if (!strcmp(hr.method, "POST") && !strcmp(route, "/completions")) {
         ok = parse_completion_request(s->engine, hr.body, s->default_tokens,
                                       ctx_size, &req, err, sizeof(err));
     } else {
