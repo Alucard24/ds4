@@ -155,6 +155,9 @@ enum ggml_type {
     GGML_TYPE_IQ1_S   = 19,
     GGML_TYPE_IQ4_NL  = 20,
     GGML_TYPE_IQ3_S   = 21,
+    /* Present in the current upstream type list; the ported MMQ tables
+     * reference it even when ds4 never sees this type. */
+    GGML_TYPE_Q2_0    = 42,
     GGML_TYPE_IQ2_S   = 22,
     GGML_TYPE_IQ4_XS  = 23,
     GGML_TYPE_I8      = 24,

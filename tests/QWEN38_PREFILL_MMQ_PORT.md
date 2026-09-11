@@ -1,6 +1,32 @@
 # Qwen3.8 prefill: porting the MMQ kernels to the current upstream design
 
-Status: **diagnosed, not ported.** This document is the work list, the evidence
+Status: **diagnosed; the port compiles and is ready to be wired.**
+
+Compile probe result (this is the question that gated the port): the current
+upstream kernels compile against ds4's existing adapter. `cuda/mmq/new/` holds
+the later revision (13 files, symbols prefixed `ds4n_`, self-contained include
+graph), and `cuda/mmq/ds4_mmq_new_probe.cu` instantiates the dense IQ3_S case
+with `nvcc -gencode arch=compute_120a,code=sm_120a`: 0 errors, 2.5 MB object.
+Only two additions were needed outside that directory:
+
+- `cuda/mmq/ggml-common.h`: the `Q2_0` quant type (upstream added it after
+  these headers were vendored);
+- `cuda/mmq/ds4_ggml_stubs.h`: the matching `GGML_TYPE_Q2_0 = 42` enum value.
+
+What remains, in order:
+
+1. `cuda/mmq/ds4_mmq_new.cu`: an `extern "C"` dense entry mirroring
+   `ds4_mmq_quant_dense_impl` but building `ds4n_mmq_args` from plain pointers
+   and calling `ds4n_mul_mat_q_case<type>`; check which activation quantizer the
+   later revision expects (`quantize_mmq_q8_1_cuda` signature changed) and copy
+   its `quantize.cuh`/`quantize.cu` into `new/` if needed.
+2. Makefile: add the new object to `MMQ_OBJS`.
+3. `ds4_cuda.cu`: route `ds4_gpu_matmul_quant_tensor`'s dense path to the new
+   entry behind `DS4_MMQ_NEW=1`, leaving the old path default until proven.
+4. Measure the single matmul (5120x17408, M=350, IQ3_S): 5.9 ms today, target
+   < 1 ms; then the gates (`test-qwen38-cuda` oracle, NLL 1.81334038, MTP 39/39).
+5. Only then extend to the remaining types and make it the default.
+ This document is the work list, the evidence
 behind it, and the gates that must stay green. It exists so the porting does not
 have to repeat the diagnosis.
 

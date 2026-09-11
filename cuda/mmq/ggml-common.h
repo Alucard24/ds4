@@ -1898,3 +1898,13 @@ GGML_TABLE_END()
 
 #endif // GGML_COMMON_IMPL
 #endif // GGML_COMMON_IMPL
+
+/* Added by the MMQ port: upstream grew a Q2_0 type after these headers were
+ * vendored, and the current MMQ tables reference it. */
+#define QK2_0 64
+#define QR2_0 1
+#define QI2_0 (QK2_0 / 32)
+typedef struct {
+    ggml_half d;              // delta (scale)
+    uint8_t qs[QK2_0 / 4];   // 2 bits per element
+} block_q2_0;

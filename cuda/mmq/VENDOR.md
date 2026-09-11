@@ -147,3 +147,24 @@ Sustained ~2.80x prefill speedup across the swept context range; gen
 within 2.5% of baseline (run-to-run variance).  See `local/docs/`
 (auto-round companion repo) for the full Phase 0-7 execution log,
 parity-test output, and detailed plan.
+
+## Second revision under `new/` (MMQ prefill port)
+
+`cuda/mmq/new/` holds a **later** upstream revision of the same kernels,
+unmodified except for two mechanical edits: every symbol the old tree also
+defines is prefixed with `ds4n_`, and the include graph is self-contained
+inside `new/` so both revisions can be compiled in separate translation units.
+`cuda/mmq/ds4_mmq_new_probe.cu` instantiates the dense IQ3_S case and is the
+compile check.
+
+| Field | Value |
+|---|---|
+| Source | https://github.com/ggml-org/llama.cpp |
+| Commit | `f19e44ea489e` |
+| Files | `mmq.cuh`, `mmq-load-tiles.cuh`, `mmq-vec-dot.cuh`, `mmq-config-*.cuh`, `common.cuh`, `vecdotq.cuh`, `mma.cuh` |
+| Why | the older revision runs the prefill GEMM at 5.7-6.2 TMAC/s where this one reaches ~47 on the same model and card (see `tests/QWEN38_PREFILL_MMQ_PORT.md`) |
+
+Two headers in this directory needed a small addition for the later revision:
+`ggml-common.h` gained the `Q2_0` quant type (upstream added it after these
+headers were vendored) and `ds4_ggml_stubs.h` gained the matching enum value.
+Both are additive and unused by the old tree.
