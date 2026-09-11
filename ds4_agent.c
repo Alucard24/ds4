@@ -1251,6 +1251,12 @@ static const char agent_tools_prompt_after_edit[] =
 
 static const char agent_vision_tool_schema[] =
     "{\"name\":\"view_image\",\"description\":\"Open a local PNG or JPEG as a visual observation.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}";
+/* Frames of one video must arrive together: the engine merges adjacent frames,
+ * so passing them one view_image call at a time would lose the temporal
+ * pairing.  A container is accepted too and decoded with ffmpeg when it is
+ * available. */
+static const char agent_video_tool_schema[] =
+    "{\"name\":\"view_video\",\"description\":\"Open a local video as one visual observation: either a container (decoded with ffmpeg) or 2..128 ordered PNG/JPEG frames.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"frames\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"max_frames\":{\"type\":\"integer\"}},\"required\":[]}}";
 
 static char *agent_build_dsml_tools_prompt(bool edit_upto, bool vision) {
     const char *edit = edit_upto ? agent_tools_prompt_edit_upto
@@ -1259,14 +1265,19 @@ static char *agent_build_dsml_tools_prompt(bool edit_upto, bool vision) {
     size_t b = strlen(edit);
     size_t c = strlen(agent_tools_prompt_after_edit);
     const char *vision_start = "\n{\"type\":\"function\",\"function\":";
-    size_t v = vision ? strlen(vision_start) + strlen(agent_vision_tool_schema) + 2 : 0;
+    size_t v = vision ? strlen(vision_start) + strlen(agent_vision_tool_schema) +
+                             strlen(agent_video_tool_schema) + 6 : 0;
     char *out = xmalloc(a + b + c + v + 1);
     memcpy(out, agent_tools_prompt_intro, a);
     memcpy(out + a, edit, b);
     const char *rules = strstr(agent_tools_prompt_after_edit, "\n# Rules\n");
     size_t schemas = (size_t)(rules - agent_tools_prompt_after_edit);
     memcpy(out + a + b, agent_tools_prompt_after_edit, schemas);
-    if (vision) snprintf(out + a + b + schemas, v + 1, "%s%s}\n", vision_start, agent_vision_tool_schema);
+    if (vision) {
+        snprintf(out + a + b + schemas, v + 1, "%s%s}%s%s}\n", vision_start,
+                 agent_vision_tool_schema, vision_start,
+                 agent_video_tool_schema);
+    }
     memcpy(out + a + b + schemas + v, rules, c - schemas + 1);
     return out;
 }
@@ -1325,7 +1336,8 @@ static char *agent_build_glm_tools_prompt(bool edit_upto, bool vision) {
     const char *edit = edit_upto ? agent_glm_tools_prompt_edit_upto
                                  : agent_glm_tools_prompt_edit_exact;
     size_t a = strlen(agent_glm_tools_prompt_intro);
-    size_t v = vision ? strlen(agent_vision_tool_schema) + 1 : 0;
+    size_t v = vision ? strlen(agent_vision_tool_schema) +
+                            strlen(agent_video_tool_schema) + 2 : 0;
     size_t b = schemas_len + v;
     size_t c = strlen(agent_glm_tools_prompt_after_schemas);
     size_t d = strlen(edit);
@@ -1333,7 +1345,10 @@ static char *agent_build_glm_tools_prompt(bool edit_upto, bool vision) {
     char *out = xmalloc(a + b + c + d + e + 1);
     memcpy(out, agent_glm_tools_prompt_intro, a);
     memcpy(out + a, schemas, schemas_len);
-    if (vision) snprintf(out + a + schemas_len, v + 1, "%s\n", agent_vision_tool_schema);
+    if (vision) {
+        snprintf(out + a + schemas_len, v + 1, "%s\n%s\n",
+                 agent_vision_tool_schema, agent_video_tool_schema);
+    }
     memcpy(out + a + b, agent_glm_tools_prompt_after_schemas, c);
     memcpy(out + a + b + c, edit, d);
     memcpy(out + a + b + c + d, agent_glm_tools_prompt_rules_tail, e + 1);
@@ -9027,6 +9042,78 @@ static void agent_tool_view_image(agent_worker *w,
     agent_tool_observation_puts(obs, meta);
 }
 
+/* view_video: one video as one observation.
+ *
+ * The DSML tool protocol carries flat string arguments, so a frame list arrives
+ * as newline- or comma-separated paths and a container arrives as `path`.
+ * Frames have to be attached together: the engine merges adjacent frames, so
+ * several view_image calls would each produce an independent still. */
+static void agent_tool_view_video(agent_worker *w,
+                                  const agent_tool_call *call,
+                                  agent_tool_observation *obs) {
+    if (!ds4_engine_has_vision(w->engine)) {
+        agent_tool_observation_puts(
+            obs, "Tool error: view_video requires ds4-agent --vision FILE\n");
+        return;
+    }
+    const char *path = agent_tool_arg_value(call, "path");
+    const char *frames_arg = agent_tool_arg_value(call, "frames");
+    ds4_vision_embedding embedding = {0};
+    char err[256] = {0};
+    char shown[PATH_MAX + 80] = {0};
+    bool ok = false;
+    if (frames_arg && frames_arg[0]) {
+        const char *paths[128];
+        size_t count = 0;
+        char *copy = xstrdup(frames_arg);
+        char *save = NULL;
+        for (char *tok = strtok_r(copy, ",\n", &save);
+             tok && count < 128u;
+             tok = strtok_r(NULL, ",\n", &save)) {
+            while (*tok == ' ' || *tok == '\t') tok++;
+            if (*tok) paths[count++] = tok;
+        }
+        if (count < 2u) {
+            agent_tool_observation_puts(
+                obs, "Tool error: view_video needs at least two frame paths\n");
+            free(copy);
+            return;
+        }
+        ok = ds4_engine_vision_encode_frame_files(w->engine, paths, count,
+                                                  &embedding, err, sizeof(err));
+        snprintf(shown, sizeof(shown), "\n[tool:view_video] %zu frames\n",
+                 count);
+        free(copy);
+    } else if (path && path[0]) {
+        uint32_t wanted = (uint32_t)agent_parse_int_default(
+            agent_tool_arg_value(call, "max_frames"), 32, 2, 128);
+        ok = ds4_engine_vision_encode_video_file(w->engine, path, wanted,
+                                                 &embedding, err, sizeof(err));
+        snprintf(shown, sizeof(shown), "\n[tool:view_video] %s\n", path);
+    } else {
+        agent_tool_observation_puts(
+            obs, "Tool error: view_video requires path or frames\n");
+        return;
+    }
+    if (!ok) {
+        agent_tool_observation_puts(obs, "Tool error: view_video failed: ");
+        agent_tool_observation_puts(obs, err[0] ? err : "unable to decode video");
+        agent_tool_observation_puts(obs, "\n");
+        return;
+    }
+    agent_publish(w, shown, strlen(shown));
+    agent_tool_observation_add_image(obs, &embedding);
+    char meta[224];
+    snprintf(meta, sizeof(meta),
+             "\nVideo observation attached (%ux%u, %u visual tokens, %u "
+             "temporal groups).\n",
+             obs->images[obs->image_count - 1].width,
+             obs->images[obs->image_count - 1].height,
+             obs->images[obs->image_count - 1].token_count,
+             obs->images[obs->image_count - 1].grid_time);
+    agent_tool_observation_puts(obs, meta);
+}
+
 /* Execute one parsed DSML tool call and return the text that will be appended as
  * the tool-role result.  UI visualization already happened while streaming; this
  * function is only about side effects and the model-visible observation. */
@@ -9102,6 +9189,10 @@ static agent_tool_observation agent_execute_tool_observation(
         agent_tool_observation_puts(&obs, hdr);
         if (calls->v[i].name && !strcmp(calls->v[i].name, "view_image")) {
             agent_tool_view_image(w, &calls->v[i], &obs);
+            continue;
+        }
+        if (calls->v[i].name && !strcmp(calls->v[i].name, "view_video")) {
+            agent_tool_view_video(w, &calls->v[i], &obs);
             continue;
         }
         char *res = agent_execute_tool_call(w, &calls->v[i]);

@@ -437,10 +437,14 @@ static char *json_minify_raw_value(const char *json) {
 
 #define SERVER_IMAGE_MARKER_BYTES 64
 
+/* One media input.  An image carries a single frame; a video carries the
+ * ordered frames its client sent, because the engine's video path merges
+ * adjacent frames and must see one sequence rather than separate images. */
 typedef struct {
     char marker[SERVER_IMAGE_MARKER_BYTES];
-    uint8_t *encoded;
-    size_t encoded_len;
+    uint8_t **frames;
+    size_t *frame_lens;
+    size_t frame_count;
 } server_image_input;
 
 typedef struct {
@@ -451,9 +455,47 @@ typedef struct {
 
 static void server_image_inputs_free(server_image_inputs *images) {
     if (!images) return;
-    for (size_t i = 0; i < images->len; i++) free(images->v[i].encoded);
+    for (size_t i = 0; i < images->len; i++) {
+        server_image_input *input = &images->v[i];
+        for (size_t f = 0; f < input->frame_count; f++)
+            free(input->frames[f]);
+        free(input->frames);
+        free(input->frame_lens);
+    }
     free(images->v);
     memset(images, 0, sizeof(*images));
+}
+
+/* Marker generation, shared by the image and video pushes. */
+static void server_image_marker_new(char marker[SERVER_IMAGE_MARKER_BYTES]) {
+    unsigned char nonce[12];
+    if (!random_bytes(nonce, sizeof(nonce))) {
+        uint64_t fallback = (uint64_t)time(NULL) ^
+                            ((uint64_t)getpid() << 32) ^
+                            (uint64_t)(uintptr_t)marker;
+        memcpy(nonce, &fallback, sizeof(fallback));
+        memset(nonce + sizeof(fallback), 0, sizeof(nonce) - sizeof(fallback));
+    }
+    static const char hex[] = "0123456789abcdef";
+    size_t pos = (size_t)snprintf(marker, SERVER_IMAGE_MARKER_BYTES,
+                                  "\036" "DS4_IMAGE_");
+    for (size_t i = 0; i < sizeof(nonce) && pos + 2 < SERVER_IMAGE_MARKER_BYTES;
+         i++) {
+        marker[pos++] = hex[nonce[i] >> 4];
+        marker[pos++] = hex[nonce[i] & 15];
+    }
+    marker[pos++] = '\x1f';
+    marker[pos] = '\0';
+}
+
+static void server_image_inputs_append(server_image_inputs *images,
+                                       server_image_input *input) {
+    if (images->len == images->cap) {
+        size_t cap = images->cap ? images->cap * 2 : 2;
+        images->v = xrealloc(images->v, cap * sizeof(images->v[0]));
+        images->cap = cap;
+    }
+    images->v[images->len++] = *input;
 }
 
 static int base64_value(unsigned char c) {
@@ -508,32 +550,57 @@ static bool server_image_inputs_push_base64(server_image_inputs *images,
                                             char marker[SERVER_IMAGE_MARKER_BYTES]) {
     if (!server_image_media_type(media_type)) return false;
     server_image_input image = {0};
-    if (!server_decode_base64(base64, &image.encoded, &image.encoded_len))
+    image.frames = xmalloc(sizeof(image.frames[0]));
+    image.frame_lens = xmalloc(sizeof(image.frame_lens[0]));
+    if (!server_decode_base64(base64, &image.frames[0], &image.frame_lens[0])) {
+        free(image.frames);
+        free(image.frame_lens);
         return false;
-    unsigned char nonce[12];
-    if (!random_bytes(nonce, sizeof(nonce))) {
-        uint64_t fallback = (uint64_t)time(NULL) ^
-                            ((uint64_t)getpid() << 32) ^
-                            (uint64_t)(uintptr_t)images;
-        memcpy(nonce, &fallback, sizeof(fallback));
-        memset(nonce + sizeof(fallback), 0, sizeof(nonce) - sizeof(fallback));
     }
-    static const char hex[] = "0123456789abcdef";
-    size_t pos = (size_t)snprintf(image.marker, sizeof(image.marker),
-                                  "\036" "DS4_IMAGE_");
-    for (size_t i = 0; i < sizeof(nonce) && pos + 2 < sizeof(image.marker); i++) {
-        image.marker[pos++] = hex[nonce[i] >> 4];
-        image.marker[pos++] = hex[nonce[i] & 15];
-    }
-    image.marker[pos++] = '\x1f';
-    image.marker[pos] = '\0';
-    if (images->len == images->cap) {
-        size_t cap = images->cap ? images->cap * 2 : 2;
-        images->v = xrealloc(images->v, cap * sizeof(images->v[0]));
-        images->cap = cap;
-    }
-    images->v[images->len++] = image;
+    image.frame_count = 1;
+    server_image_marker_new(image.marker);
+    server_image_inputs_append(images, &image);
     snprintf(marker, SERVER_IMAGE_MARKER_BYTES, "%s", image.marker);
+    return true;
+}
+
+/* Push an ordered frame list as one video input.
+ *
+ * Deliberately data URIs only: a request must never name a path on the host,
+ * which would turn the endpoint into a file-read primitive. */
+static bool server_image_inputs_push_video(
+        server_image_inputs *images,
+        const char *const *data_uris,
+        size_t frame_count,
+        char marker[SERVER_IMAGE_MARKER_BYTES]) {
+    static const char png[] = "data:image/png;base64,";
+    static const char jpeg[] = "data:image/jpeg;base64,";
+    static const char jpg[] = "data:image/jpg;base64,";
+    if (!data_uris || frame_count < 2u || frame_count > 128u) return false;
+    server_image_input video = {0};
+    video.frames = xmalloc(frame_count * sizeof(video.frames[0]));
+    video.frame_lens = xmalloc(frame_count * sizeof(video.frame_lens[0]));
+    for (size_t i = 0; i < frame_count; i++) {
+        const char *uri = data_uris[i];
+        const char *payload = NULL;
+        if (uri && !strncmp(uri, png, sizeof(png) - 1u))
+            payload = uri + sizeof(png) - 1u;
+        else if (uri && !strncmp(uri, jpeg, sizeof(jpeg) - 1u))
+            payload = uri + sizeof(jpeg) - 1u;
+        else if (uri && !strncmp(uri, jpg, sizeof(jpg) - 1u))
+            payload = uri + sizeof(jpg) - 1u;
+        if (!payload || !server_decode_base64(payload, &video.frames[i],
+                                              &video.frame_lens[i])) {
+            for (size_t f = 0; f < i; f++) free(video.frames[f]);
+            free(video.frames);
+            free(video.frame_lens);
+            return false;
+        }
+        video.frame_count = i + 1u;
+    }
+    server_image_marker_new(video.marker);
+    server_image_inputs_append(images, &video);
+    snprintf(marker, SERVER_IMAGE_MARKER_BYTES, "%s", video.marker);
     return true;
 }
 
@@ -1852,6 +1919,62 @@ bad:
     return false;
 }
 
+/* Parse a JSON array of data URI strings, used by the video content parts.
+ * The array is owned by the caller (strings plus the pointer array). */
+typedef struct {
+    char **v;
+    size_t len;
+    size_t cap;
+} server_uri_list;
+
+static void server_uri_list_free(server_uri_list *list) {
+    if (!list) return;
+    for (size_t i = 0; i < list->len; i++) free(list->v[i]);
+    free(list->v);
+    memset(list, 0, sizeof(*list));
+}
+
+static bool server_uri_list_push(server_uri_list *list, char *owned) {
+    if (list->len == list->cap) {
+        size_t cap = list->cap ? list->cap * 2u : 4u;
+        list->v = xrealloc(list->v, cap * sizeof(list->v[0]));
+        list->cap = cap;
+    }
+    list->v[list->len++] = owned;
+    return true;
+}
+
+static bool parse_data_uri_array(const char **p, server_uri_list *out) {
+    if (!p || !out) return false;
+    json_ws(p);
+    if (!json_lit(p, "[")) return false;
+    json_ws(p);
+    if (**p == ']') {
+        (*p)++;
+        return true;
+    }
+    for (;;) {
+        char *uri = NULL;
+        json_ws(p);
+        if (**p != '"' || !json_string(p, &uri)) {
+            free(uri);
+            return false;
+        }
+        server_uri_list_push(out, uri);
+        if (out->len > 128u) return false;
+        json_ws(p);
+        if (**p == ',') {
+            (*p)++;
+            continue;
+        }
+        if (**p == ']') {
+            (*p)++;
+            return true;
+        }
+        return false;
+    }
+}
+
 static bool parse_image_url_value(const char **p, char **url) {
     json_ws(p);
     if (**p == '"') return json_string(p, url);
@@ -1895,6 +2018,7 @@ static bool parse_openai_content_object(const char **p, chat_msg *msg) {
     char *type = NULL;
     char *text = NULL;
     char *image_url = NULL;
+    server_uri_list frames = {0};
     json_ws(p);
     while (**p && **p != '}') {
         char *key = NULL;
@@ -1910,6 +2034,10 @@ static bool parse_openai_content_object(const char **p, chat_msg *msg) {
             ok = json_string_replace(p, &type);
         else if (!strcmp(key, "text"))
             ok = json_content_replace(p, &text);
+        else if (!strcmp(key, "frames"))
+            ok = parse_data_uri_array(p, &frames);
+        else if (!strcmp(key, "video_frames"))
+            ok = parse_data_uri_array(p, &frames);
         else if (!strcmp(key, "image_url")) {
             free(image_url);
             image_url = NULL;
@@ -1925,7 +2053,15 @@ static bool parse_openai_content_object(const char **p, chat_msg *msg) {
     if (**p != '}') goto bad;
     (*p)++;
 
-    if (type && (!strcmp(type, "image_url") || !strcmp(type, "input_image"))) {
+    if (type && !strcmp(type, "video") && frames.len) {
+        char marker[SERVER_IMAGE_MARKER_BYTES];
+        if (!server_image_inputs_push_video(
+                &msg->images, (const char *const *)frames.v, frames.len,
+                marker))
+            goto bad;
+        append_owned_text(&msg->content, marker);
+    } else if (type && (!strcmp(type, "image_url") ||
+                        !strcmp(type, "input_image"))) {
         char marker[SERVER_IMAGE_MARKER_BYTES];
         if (!server_image_inputs_push_data_uri(&msg->images, image_url, marker))
             goto bad;
@@ -1936,11 +2072,13 @@ static bool parse_openai_content_object(const char **p, chat_msg *msg) {
     free(type);
     free(text);
     free(image_url);
+    server_uri_list_free(&frames);
     return true;
 bad:
     free(type);
     free(text);
     free(image_url);
+    server_uri_list_free(&frames);
     return false;
 }
 
@@ -9852,10 +9990,14 @@ static void server_image_cache_clear(server_image_cache *cache) {
 static bool server_image_cache_get(server_image_cache *cache,
                                    const server_image_input *input,
                                    ds4_vision_embedding *out) {
+    /* Only single-frame inputs are cached: a video's identity is its whole
+     * frame sequence, and the prompt-level cache covers reuse. */
+    if (input->frame_count != 1u) return false;
     for (size_t i = 0; i < SERVER_IMAGE_CACHE_ENTRIES; i++) {
         server_image_cache_entry *entry = &cache->entries[i];
-        if (!entry->encoded || entry->encoded_len != input->encoded_len ||
-            memcmp(entry->encoded, input->encoded, input->encoded_len)) continue;
+        if (!entry->encoded || entry->encoded_len != input->frame_lens[0] ||
+            memcmp(entry->encoded, input->frames[0], input->frame_lens[0]))
+            continue;
         float *data = malloc(entry->data_bytes);
         if (!data) return false;
         memcpy(data, entry->embedding.data, entry->data_bytes);
@@ -9874,11 +10016,11 @@ static void server_image_cache_put(server_image_cache *cache,
                                    const ds4_vision_embedding *embedding,
                                    uint32_t dim, size_t budget) {
     if (!embedding->data || !dim || !embedding->token_count ||
-        !input->encoded_len ||
+        input->frame_count != 1u || !input->frame_lens[0] ||
         embedding->token_count > budget / sizeof(float) / dim) return;
     size_t bytes = (size_t)embedding->token_count * dim * sizeof(float);
-    if (input->encoded_len > budget - bytes) return;
-    size_t total = input->encoded_len + bytes;
+    if (input->frame_lens[0] > budget - bytes) return;
+    size_t total = input->frame_lens[0] + bytes;
     server_image_cache_entry *dest;
     for (;;) {
         dest = &cache->entries[0];
@@ -9895,17 +10037,17 @@ static void server_image_cache_put(server_image_cache *cache,
         }
         server_image_cache_remove(cache, dest);
     }
-    uint8_t *encoded = malloc(input->encoded_len);
+    uint8_t *encoded = malloc(input->frame_lens[0]);
     float *data = malloc((size_t)bytes);
     if (!encoded || !data) {
         free(encoded);
         free(data);
         return;
     }
-    memcpy(encoded, input->encoded, input->encoded_len);
+    memcpy(encoded, input->frames[0], input->frame_lens[0]);
     memcpy(data, embedding->data, (size_t)bytes);
     *dest = (server_image_cache_entry) {
-        .encoded = encoded, .encoded_len = input->encoded_len,
+        .encoded = encoded, .encoded_len = input->frame_lens[0],
         .embedding = *embedding, .data_bytes = (size_t)bytes,
         .used = ++cache->clock,
     };
@@ -9970,9 +10112,14 @@ static bool server_encode_image(server *s, const server_image_input *input,
         server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding cache hit");
         return true;
     }
-    if (!ds4_engine_vision_encode_memory(s->engine, input->encoded,
-                                         input->encoded_len, out, err, errlen))
-        return false;
+    const bool encoded_ok = input->frame_count > 1u
+        ? ds4_engine_vision_encode_frame_memory(
+              s->engine, (const uint8_t *const *)input->frames,
+              input->frame_lens, input->frame_count, out, err, errlen)
+        : ds4_engine_vision_encode_memory(s->engine, input->frames[0],
+                                          input->frame_lens[0], out, err,
+                                          errlen);
+    if (!encoded_ok) return false;
     server_image_cache_put(&s->image_cache, input, out,
                             4096, /* Both supported vision encoders emit 4096-wide rows. */
                             SERVER_IMAGE_CACHE_BYTES);
@@ -20954,10 +21101,64 @@ static void test_openai_inline_image_content(void) {
     TEST_ASSERT(msgs.v[0].images.len == 1);
     TEST_ASSERT(strstr(msgs.v[0].content, "describe ") == msgs.v[0].content);
     TEST_ASSERT(strstr(msgs.v[0].content, " please") != NULL);
-    TEST_ASSERT(msgs.v[0].images.v[0].encoded_len >= 8);
-    TEST_ASSERT(!memcmp(msgs.v[0].images.v[0].encoded, "\x89PNG\r\n\x1a\n", 8));
+    TEST_ASSERT(msgs.v[0].images.v[0].frame_count == 1);
+    TEST_ASSERT(msgs.v[0].images.v[0].frame_lens[0] >= 8);
+    TEST_ASSERT(!memcmp(msgs.v[0].images.v[0].frames[0], "\x89PNG\r\n\x1a\n", 8));
     chat_msgs_free(&msgs);
     buf_free(&json);
+}
+
+/* A video arrives as an ordered frame list and must become one media input, so
+ * the engine sees one sequence to merge instead of separate images. */
+static void test_openai_video_content(void) {
+    buf json = {0};
+    buf_puts(&json,
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"text\","
+        "\"text\":\"describe \"},{\"type\":\"video\",\"frames\":[");
+    for (int i = 0; i < 3; i++) {
+        if (i) buf_puts(&json, ",");
+        buf_puts(&json, "\"data:image/png;base64,");
+        buf_puts(&json, test_inline_png_base64);
+        buf_puts(&json, "\"");
+    }
+    buf_puts(&json, "]}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 1);
+    TEST_ASSERT(msgs.v[0].images.len == 1);
+    TEST_ASSERT(msgs.v[0].images.v[0].frame_count == 3);
+    TEST_ASSERT(!memcmp(msgs.v[0].images.v[0].frames[1], "\x89PNG\r\n\x1a\n", 8));
+    /* The marker stands in for the whole sequence, so the render inserts one
+     * span for the video rather than one per frame. */
+    TEST_ASSERT(strstr(msgs.v[0].content, "DS4_IMAGE_") != NULL);
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+
+    /* Malformed media fails the request instead of silently dropping it: a
+     * single frame is not a video, and a path must never be accepted (that
+     * would make the endpoint read host files on request). */
+    buf one = {0};
+    buf_puts(&one,
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"video\","
+        "\"frames\":[\"data:image/png;base64,");
+    buf_puts(&one, test_inline_png_base64);
+    buf_puts(&one, "\"]}]}]");
+    const char *q = one.ptr;
+    chat_msgs one_msgs = {0};
+    TEST_ASSERT(!parse_messages(&q, &one_msgs));
+    chat_msgs_free(&one_msgs);
+    buf_free(&one);
+
+    buf path = {0};
+    buf_puts(&path,
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"video\","
+        "\"frames\":[\"/tmp/a.png\",\"/tmp/b.png\"]}]}]");
+    const char *r = path.ptr;
+    chat_msgs path_msgs = {0};
+    TEST_ASSERT(!parse_messages(&r, &path_msgs));
+    chat_msgs_free(&path_msgs);
+    buf_free(&path);
 }
 
 static void test_http_image_paths_and_urls_are_rejected(void) {
@@ -21103,7 +21304,11 @@ static void test_server_image_embedding_cache(void) {
     server_image_cache cache = {0};
     uint8_t key = 1;
     float data[2] = {1.25f, -2.5f};
-    server_image_input input = {.encoded = &key, .encoded_len = 1};
+    uint8_t *frame = &key;
+    size_t frame_len = 1;
+    server_image_input input = {
+        .frames = &frame, .frame_lens = &frame_len, .frame_count = 1,
+    };
     ds4_vision_embedding src = {.data = data, .token_count = 1,
                                .width = 42, .fingerprint = {7}};
     ds4_vision_embedding out = {0};
@@ -21247,6 +21452,7 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_canonical_with_tools_preserves_reasoning();
     test_thinking_canonical_non_thinking_mode_noop();
     test_openai_inline_image_content();
+    test_openai_video_content();
     test_http_image_paths_and_urls_are_rejected();
     test_anthropic_inline_image_content();
     test_responses_inline_image_content();
