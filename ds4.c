@@ -58427,18 +58427,15 @@ static int session_qwen38_validate_vision_identities(
 
 static int ds4_session_save_qwen38_payload(ds4_session *s, FILE *fp,
                                             char *err, size_t errlen) {
-    /* A q8_0 KV cache has a different layout and the payload header does not
-     * record it yet, so a file written now would be reloaded as f16 by a later
-     * run and silently decode garbage.  Refusing is the only honest answer
-     * until the header carries the format.  The CPU build has no quantized KV,
-     * so for it the question does not arise. */
+    /* The KV cache layout depends on the format, so the payload records it: the
+     * element size stays in the low 16 bits of its header field and the format
+     * rides above it.  A file written before this carries zero up there, which
+     * is f16, the release path, unchanged. */
+    const uint32_t kv_format_bits =
 #ifndef DS4_NO_GPU
-    if (ds4_gpu_qwen38_kv_quant_is_q8()) {
-        payload_set_err(err, errlen,
-                        "the Qwen3.8 KV disk payload does not record the KV "
-                        "format yet, so a q8_0 cache cannot be written");
-        return 1;
-    }
+        (uint32_t)ds4_gpu_qwen38_kv_quant_is_q8() << 16;
+#else
+        0u;
 #endif
     if (s->checkpoint_image_count > UINT32_MAX) {
         payload_set_err(err, errlen, "too many Qwen image identities to save");
@@ -58481,7 +58478,7 @@ static int ds4_session_save_qwen38_payload(ds4_session *s, FILE *fp,
         DS4_SESSION_PAYLOAD_VERSION,
         (uint32_t)s->ctx_size,
         s->prefill_cap,
-        kv_element_bytes,
+        kv_element_bytes | kv_format_bits,
         rope_pos,
         image_count,
         saved_tokens,
@@ -58560,18 +58557,27 @@ static int ds4_session_load_qwen38_payload(ds4_session *s, FILE *fp,
                                             const uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS],
                                             uint64_t *remaining,
                                             char *err, size_t errlen) {
-    /* The mirror of the guard above: a file on disk was written by an f16 run
-     * at best, and this session cannot tell. */
+    /* The mirror of the save side: the element size is in the low bits and the
+     * KV format above them, and a file written by the other format is refused
+     * rather than decoded with the wrong stride. */
+    const uint32_t kv_file_format = h[4] >> 16;
 #ifndef DS4_NO_GPU
-    if (ds4_gpu_qwen38_kv_quant_is_q8()) {
+    const uint32_t kv_session_format =
+        (uint32_t)ds4_gpu_qwen38_kv_quant_is_q8();
+#else
+    const uint32_t kv_session_format = 0u;
+#endif
+    if (kv_file_format != kv_session_format) {
         payload_set_err(err, errlen,
-                        "the Qwen3.8 KV disk payload does not record the KV "
-                        "format yet, so a q8_0 session cannot load one");
+                        kv_file_format ?
+                        "this Qwen3.8 KV cache was written with a q8_0 KV "
+                        "cache and this session runs f16" :
+                        "this Qwen3.8 KV cache was written with an f16 KV "
+                        "cache and this session runs q8_0");
         return 1;
     }
-#endif
     const uint32_t saved_ctx = h[2];
-    const uint32_t kv_element_bytes = h[4];
+    const uint32_t kv_element_bytes = h[4] & 0xffffu;
     const uint32_t rope_pos = h[5];
     const uint32_t image_count = h[6];
     const uint32_t saved_tokens = h[7];
