@@ -1,6 +1,47 @@
 # Qwen3.8 prefill: porting the MMQ kernels to the current upstream design
 
-Status: **diagnosed; the port compiles and is ready to be wired.**
+Status: **diagnosed; the port is done and the hypothesis it tested is REFUTED.**
+
+Result of running the ported revision against the vendored one, same model, same
+chunk (350 tokens), phase timing per matmul, 64 layers each:
+
+| | FFN gate | FFN up |
+|---|---|---|
+| vendored revision | 343.4 ms | 314.2 ms |
+| ported later revision (`DS4_MMQ_NEW=1`) | 350.9 ms | 319.7 ms |
+
+So the later revision is *not* faster here: the ~5.7-6.2 TMAC/s is what this
+kernel family does on this machine, and the prefill gap is not a stale kernel.
+The wiring was therefore removed from the release path (no measured win), while
+the ported tree stays as a compilable, validated second implementation:
+
+```sh
+# compile check (no build wiring)
+/opt/cuda/bin/nvcc -O3 -std=c++17 -gencode arch=compute_120a,code=sm_120a   -Icuda/mmq -Icuda/mmq/new -I. -c -o /tmp/x.o cuda/mmq/ds4_mmq_new_probe.cu
+```
+
+Other hypotheses tested and refuted since, all on the same shape:
+
+- **cold weight upload**: chunks 2 and 3 of a 1200-token prompt are *slower*
+  than chunk 1 (427 and 450 ms vs 369 ms for the gate matmul), so residency is
+  not the limiter and the per-matmul time is steady state;
+- **llama.cpp using cuBLAS for large batches**: `ggml_cuda_should_use_mmq()`
+  returns true whenever Turing MMA is available, which is the case on sm_120,
+  so llama.cpp runs the same MMQ kernels;
+- the tile sweep, the D2R path, pool caching and matmul duplication, as
+  recorded above.
+
+What is left, and why it needs a profiler: the kernel is neither
+compute-bound (2-3 TMAC/s against ~88 TMAC/s of int8 tensor peak) nor
+bandwidth-bound (20 GB/s of weight traffic against 460 available), which points
+at occupancy or launch configuration of the *adapted* build rather than at the
+kernel source. `nsys`/`ncu` are not installed and `nvprof` refuses compute
+capability 8.0+, so the next step is either installing one of them or
+instrumenting the launch (grid, block, shared bytes, achieved occupancy via
+cudaOccupancyMaxActiveBlocksPerMultiprocessor) and comparing against
+llama.cpp's own numbers.
+
+Superseded text follows, kept because it documents the porting surface.
 
 Compile probe result (this is the question that gated the port): the current
 upstream kernels compile against ds4's existing adapter. `cuda/mmq/new/` holds

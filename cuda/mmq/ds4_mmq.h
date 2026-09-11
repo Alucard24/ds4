@@ -171,6 +171,19 @@ int ds4_mmq_quant_dense(
     int           K,
     cudaStream_t  stream);
 
+// Dense MMQ entry from the ported later upstream revision (cuda/mmq/new/).
+// Same convention as ds4_mmq_quant_dense; returns non-zero for a type this
+// entry does not implement, so callers can fall back.
+int ds4_mmq_quant_dense_new(
+    const void  * W,
+    uint32_t      weight_type,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
 int ds4_mmq_quant_dense_vec(
     const void  * W,
     uint32_t      weight_type,
