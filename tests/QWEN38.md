@@ -251,6 +251,30 @@ four to four and a half - and took the 2000-token prefill from 789 to 1180
 tok/s. Decode is untouched: at one query there is nothing to share a tile with,
 so that path keeps the old kernel shape and the launcher picks by token count.
 
+What is left outside the instrumented windows in a chunk - about 113 ms of a
+   380 ms chunk - looked like host cost and turned out not to be. Two hypotheses
+   were tested and refuted. Batching the token embedding (a first draft of the
+   chunk made one host call per token, 512 of them) into a single call changed
+   the outside-window time from 786 to 778 ms and was reverted. And halving the
+   chunk size, which doubles the number of chunks and therefore doubles the
+   number of host calls per prompt without changing any per-token work, costs
+   nothing measurable:
+
+     chunk 512 -> 1139 tok/s      128 -> 1053 tok/s
+     chunk 256 -> 1143 tok/s       64 ->  862 tok/s
+
+   Since there are about a thousand host-issued operations per chunk whatever
+   the chunk size, that flat 512/256 pair bounds the per-call cost at a few
+   microseconds. What the outside-window time actually is, then, is the long
+   tail of small GPU operations no window covers - norms, residual adds, rope,
+   the gating, the convolution, the cache writes - and that tail is exactly what
+   starves when the host is busy: with a qemu VM holding 97% of a core those
+   segments stretched from 113 ms to 786 ms while the big GDN and GA kernels
+   stayed put.
+   The lever for that is fewer host-issued operations per chunk, i.e. CUDA
+   graphs over the layer loop, which is a project and not an afternoon - an
+   earlier attempt at graphs for the FFN was measured and reverted.
+
 Two experiments toward this measured nothing and are worth recording, because
 together they are what identified the real limit. Removing an eight-fold
 redundancy in the score computation (all eight warps of a block were computing
