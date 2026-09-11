@@ -1,6 +1,12 @@
 #ifndef DS4_H
 #define DS4_H
 
+/* -ctk / -ctv: the attention KV cache type, by the names llama.cpp uses.
+ * Returns 0 for an unknown name (q4_0 is not implemented yet) and writes the
+ * boolean into *q8_out. */
+int ds4_kv_type_from_name(const char *name, int *q8_out);
+
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -149,6 +155,10 @@ typedef struct {
     bool quality;
     bool glm_mtp;
     bool glm_mtp_timing;
+    /* -ctk / -ctv: attention KV cache type, 0 for f16 (the default) and 1 for
+     * q8_0.  K and V must match; a mixed pair is refused at open. */
+    int ctk_q8;
+    int ctv_q8;
     bool dspark;
     bool dspark_strict;
     bool dspark_exact_sampling;

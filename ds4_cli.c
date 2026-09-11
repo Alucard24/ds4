@@ -2091,6 +2091,18 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.vision_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.glm_mtp = true;
+        } else if (!strcmp(arg, "-ctk") || !strcmp(arg, "--cache-type-k")) {
+            if (!ds4_kv_type_from_name(need_arg(&i, argc, argv, arg),
+                                       &c.engine.ctk_q8)) {
+                fprintf(stderr, "ds4: %s accepts f16 or q8_0\n", arg);
+                exit(1);
+            }
+        } else if (!strcmp(arg, "-ctv") || !strcmp(arg, "--cache-type-v")) {
+            if (!ds4_kv_type_from_name(need_arg(&i, argc, argv, arg),
+                                       &c.engine.ctv_q8)) {
+                fprintf(stderr, "ds4: %s accepts f16 or q8_0\n", arg);
+                exit(1);
+            }
         } else if (!strcmp(arg, "--mtp-model")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {

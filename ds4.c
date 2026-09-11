@@ -6554,6 +6554,16 @@ static void config_validate_glm53_model(const ds4_model *m) {
     config_validate_glm53_layer_types(m);
 }
 
+/* -ctk / -ctv accept the names llama.cpp uses.  Only the two the kernel twins
+ * implement are taken; everything else fails here rather than at the first
+ * token. */
+int ds4_kv_type_from_name(const char *name, int *q8_out) {
+    if (!name || !q8_out) return 0;
+    if (!strcmp(name, "f16") || !strcmp(name, "fp16")) { *q8_out = 0; return 1; }
+    if (!strcmp(name, "q8_0")) { *q8_out = 1; return 1; }
+    return 0;
+}
+
 static void config_validate_qwen38_model(const ds4_model *m) {
     g_ds4_shape = DS4_SHAPE_QWEN38;
 
@@ -7841,12 +7851,12 @@ static int qwen38_gpu_state_init(ds4_qwen38_gpu_state *st, uint32_t ctx_size) {
     do { if (!qwen38_gpu_alloc_tensor(&st->name, (count), #name)) goto fail; } while (0)
     QWEN38_GPU_ALLOC(ssm_state, 48ull * 48 * 128 * 128);
     QWEN38_GPU_ALLOC(conv_state, 48ull * 3 * QWEN38_CONV_DIM);
-    /* KV format for the GA layers: f16 (the release path) unless DS4_KV_Q8 is
-     * set, in which case the q8_0 twins are used and the caches are sized
-     * 1088 bytes per position per layer against 2048.  The switch lives here
-     * rather than in a frontend while the feature is being measured; -ctk/-ctv
-     * are the user-facing form. */
-    const int kv_q8 = getenv("DS4_KV_Q8") != NULL ? 1 : 0;
+    /* KV format for the GA layers: f16 unless the caller asked for q8_0 with
+     * -ctk/-ctv, in which case the q8_0 twins run and the caches are sized 1088
+     * bytes per position per layer against 2048.  DS4_KV_Q8=1 is the hook the
+     * test binaries use, which cannot pass engine options. */
+    const int kv_q8 = ds4_gpu_qwen38_kv_quant_is_q8() ||
+                      getenv("DS4_KV_Q8") != NULL;
     ds4_gpu_qwen38_set_kv_quant(kv_q8);
     const uint64_t kv_pos_bytes = kv_q8 ? 1088ull : 2048ull;
     if (!qwen38_gpu_alloc_bytes(&st->attn_k,
@@ -66925,6 +66935,22 @@ static int ds4_engine_open_internal(ds4_engine **out,
         /* --mtp is not in this list: it selects the draft head the model itself
          * carries (64 + nextn blocks) and is bound below, on this path.  The
          * rest of the list is unsupported for this family. */
+        if (opt->ctk_q8 != opt->ctv_q8) {
+            fprintf(stderr,
+                    "ds4: -ctk and -ctv must name the same type for Qwen3.8; "
+                    "K and V share one layout and one pair of kernels\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        ds4_gpu_qwen38_set_kv_quant((opt->ctk_q8 || opt->ctv_q8) ? 1 : 0);
+        if ((opt->ctk_q8 || opt->ctv_q8) &&
+            getenv("DS4_KV_Q8") == NULL) {
+            fprintf(stderr,
+                    "ds4: Qwen3.8 q8_0 KV cache is enabled (%s); its NLL is "
+                    "1.81927471 against 1.81334038 for the default f16\n",
+                    "q8_0");
+        }
         if (load_slice || opt->distributed.role != DS4_DISTRIBUTED_NONE ||
             opt->tp.role != DS4_TP_NONE ||
             opt->dspark || opt->directional_steering_file) {

@@ -149,6 +149,10 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
     if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
         opt(fp, c, "--vision FILE", "Vision encoder GGUF for the selected model.");
+        opt(fp, c, "-ctk, -ctv TYPE",
+            "Attention KV cache type: f16 (default) or q8_0.  q8_0 halves the "
+            "cache, which raises the context that fits, at a small cost in "
+            "quality: NLL 1.81927471 against 1.81334038.  K and V must match.");
     }
 #ifdef DS4_ROCM_BUILD
     opt(fp, c, "--metal | --rocm | --cpu", "Select the backend explicitly.");
