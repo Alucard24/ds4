@@ -19,7 +19,8 @@ set -e
 
 M=${DS4_QWEN_MODEL_DIR:-/home/diegom/AI-Projects/llama.cpp/build/bin/models/Qwen3.8-27B}
 PORT=${DS4_PORT:-8080}
-PROFILE=${1:-fast}
+PROFILE=${1:-merged}
+
 
 cd "$(dirname "$0")"
 
@@ -27,10 +28,16 @@ cd "$(dirname "$0")"
 [ -f "$M/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf" ] || { echo "model not found under $M" >&2; exit 1; }
 
 case "$PROFILE" in
-fast)
-    # The trunk plus the NVFP4 draft head: this is the combination measured to
-    # load and serve on this card (the draft head costs 1.09 GiB, so the context
-    # comes down to 16384 to leave the driver its 2 GiB).
+merged)
+    exec ./ds4-server \
+        -m "$M/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf" \
+        --ctx 24576 --host 127.0.0.1 --port "$PORT" \
+        --vision "$M/mmproj-Qwen3.8-27B-BF16.gguf" \
+        --mtp --mtp-draft 4 \
+        --kv-disk-dir "$HOME/.ds4/server-kv" --kv-disk-space-mb 8192 \
+        --trace /tmp/ds4-server.trace
+    ;;
+sidecar)
     exec ./ds4-server \
         -m "$M/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf" \
         --ctx 16384 --host 127.0.0.1 --port "$PORT" \
