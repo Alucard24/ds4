@@ -455,6 +455,41 @@ It also gives the quantized path a real footing: the CPU has no quantized KV, so
 the one validated here, and the quantized rates sit 0.009 (q8_0) and 0.25 (q4_0)
 away from it on the same prefill.
 
+The attention's remaining 48 ms per deep chunk is its dot product: measured in
+isolation (a standalone reproduction of the release body, same geometry), the
+body costs 0.246 ns per (key, row) and the scalar dot plus its butterfly
+reduction is **0.1357 ns** of that.  The same dot as tensor cores - one warp on
+16 query rows, HMMA m16n8k16, the Q fragment held in registers across the whole
+key range - costs **0.0191 ns**: **7.1x cheaper**.
+
+| QK^T form | ns per (key, row) |
+|---|---|
+| scalar: 8 LDS.U16 + 8 conversions + 8 FMA + 5-shuffle butterfly | 0.1357 |
+| HMMA m16n8k16, Q in registers | **0.0191** |
+
+Extrapolated with the rest of the body unchanged, that is 0.246 -> 0.13 ns, about
+**1.9x on the attention core, +7% on the prefill** - and the prefill is the only
+place it shows, because the decode path keeps its own kernel and the KV contents
+are written by the prepare kernel, so the NLL gate is untouched by construction.
+
+Two obstacles the spike made explicit, both structural and neither fatal:
+
+1. **The accumulator does not fit.** In the MMA layout a warp computing 16 rows
+   against 256 output dimensions holds 128 f32 accumulators per thread, plus 64
+   registers of Q fragment.  The output therefore has to be split across warps.
+2. **The output cannot be split by dimension alone**, because a score needs all
+   256 key dimensions: the warp that computes the scores must be the one that
+   owns them, so the split has to be by *keys* into the PV, with the P tile
+   staged in shared memory - the FA-2 shape.  One warp does QK plus the online
+   softmax, writes P (16x8 f16, 256 bytes) to shared, and two to four warps each
+   run the PV for their slice of the 256 output dimensions with their own
+   accumulators, rescaling on the max and denominator the first warp broadcasts.
+
+That is a kernel rewrite of a few hundred lines, not a change to the existing
+one, and the numbers above are what it is worth: recorded in `TODO-4c19d8` with
+the fragment layouts and the two decisions, so it starts from a measurement
+instead of an estimate.
+
 A final experiment split Q8_1 activation quantization from MMVQ so the Qwen
 attention and FFN projections could share one quantized row. Three 538-token
 runs produced 798.1/798.4/787.3 warm prefill tok/s and
