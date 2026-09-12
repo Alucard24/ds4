@@ -14873,6 +14873,97 @@ static void *client_main(void *arg) {
     const char *route = hr.path;
     if (!strncmp(route, "/v1/", 4u)) route += 3;
 
+/* Landing page for the root path.  A browser pointed at the address this server
+ * was started with used to answer `unknown endpoint` in JSON, which reads as a
+ * broken server to anyone who did not arrive with curl; the endpoint list is
+ * worth a page.  Nothing dynamic is embedded -- the model name and the context
+ * size come from /props at load time -- so there is no escaping to get wrong
+ * here.  Single quotes only in the markup, so the C literal needs no escapes. */
+static const char ds4_server_index_html[] =
+"<!DOCTYPE html>\n"
+"<html lang='en'><head><meta charset='utf-8'>\n"
+"<meta name='viewport' content='width=device-width, initial-scale=1'>\n"
+"<title>ds4-server</title>\n"
+"<style>\n"
+" body{font:15px/1.55 system-ui,sans-serif;margin:0;background:#101216;color:#e8eaf0}\n"
+" main{max-width:44rem;margin:0 auto;padding:2rem 1rem 4rem}\n"
+" h1{font-size:1.35rem;margin:0 0 .2rem}\n"
+" h2{font-size:1.05rem;margin:2rem 0 .6rem;color:#cfd4e0}\n"
+" .sub{color:#98a0b0}\n"
+" textarea{width:100%;box-sizing:border-box;background:#171a20;color:#e8eaf0;\n"
+" border:1px solid #2b303a;border-radius:8px;padding:.6rem;font:inherit}\n"
+" button{margin-top:.6rem;padding:.55rem 1.1rem;border:0;border-radius:8px;\n"
+" background:#3b6ef6;color:#fff;font:inherit;cursor:pointer}\n"
+" button:disabled{opacity:.5;cursor:default}\n"
+" pre{background:#171a20;border:1px solid #2b303a;border-radius:8px;padding:.75rem;\n"
+" overflow-x:auto;white-space:pre-wrap;font-size:13px}\n"
+" .row{display:flex;gap:.8rem;padding:.25rem 0;align-items:baseline}\n"
+" .row span{min-width:11rem;color:#98a0b0}\n"
+" code{font-family:ui-monospace,monospace;font-size:13px;color:#cfe0ff}\n"
+"</style></head><body><main>\n"
+"<h1>ds4-server</h1>\n"
+"<div class='sub'>OpenAI-compatible endpoint for <b id='model'>loading</b>,\n"
+" context <span id='ctx'>&mdash;</span>.</div>\n"
+"<h2>Chat</h2>\n"
+"<textarea id='prompt' rows='3'>Write one sentence about the sea.</textarea>\n"
+"<button id='send'>Send</button>\n"
+"<pre id='out' hidden></pre>\n"
+"<h2>Endpoints</h2>\n"
+"<div class='row'><span>Chat completions</span><code>POST /v1/chat/completions</code></div>\n"
+"<div class='row'><span>Anthropic messages</span><code>POST /v1/messages</code></div>\n"
+"<div class='row'><span>Responses</span><code>POST /v1/responses</code></div>\n"
+"<div class='row'><span>Completions</span><code>POST /v1/completions</code></div>\n"
+"<div class='row'><span>Models</span><code>GET /v1/models</code></div>\n"
+"<div class='row'><span>Props</span><code>GET /props</code></div>\n"
+"<div class='row'><span>Health</span><code>GET /health</code></div>\n"
+"<h2>curl</h2><pre id='curl'></pre>\n"
+"<script>\n"
+"const g = id => document.getElementById(id);\n"
+"const q = String.fromCharCode(39);\n"
+"g('curl').textContent = 'curl -s http://' + location.host +\n"
+"  '/v1/chat/completions -H ' + q + 'Content-Type: application/json' + q +\n"
+"  ' -d ' + q + '{' + q + 'messages' + q + ':[' + q + 'role' + q + ':' + q +\n"
+"  'user' + q + ',' + q + 'content' + q + ':' + q + 'hi' + q + '}]}' + q;\n"
+"fetch('/props').then(r => r.json()).then(p => {\n"
+"  g('model').textContent = p.model_path || 'unknown';\n"
+"  g('ctx').textContent = p.n_ctx ? p.n_ctx + ' tokens' : 'unknown';\n"
+"}).catch(() => { g('model').textContent = 'unknown'; });\n"
+"g('send').onclick = async () => {\n"
+"  const b = g('send');\n"
+"  b.disabled = true;\n"
+"  g('out').hidden = false;\n"
+"  g('out').textContent = 'Thinking...';\n"
+"  try {\n"
+"    const r = await fetch('/v1/chat/completions', {method: 'POST',\n"
+"      headers: {'Content-Type': 'application/json'},\n"
+"      body: JSON.stringify({messages: [{role: 'user', content: g('prompt').value}],\n"
+"                            stream: false})});\n"
+"    const t = await r.text();\n"
+"    let shown = t;\n"
+"    try {\n"
+"      const j = JSON.parse(t);\n"
+"      const m = j.choices && j.choices[0] && j.choices[0].message;\n"
+"      if (m) {\n"
+"        // This model thinks before it answers, and a short budget can be spent\n"
+"        // entirely on the thinking: show both, and never an empty box.\n"
+"        shown = (m.reasoning_content ? m.reasoning_content + '\\n\\n---\\n\\n' : '') +\n"
+"                (m.content || (m.reasoning_content ? '' : t));\n"
+"      }\n"
+"    } catch (e) {}\n"
+"    g('out').textContent = shown;\n"
+"  } catch (e) { g('out').textContent = String(e); }\n"
+"  b.disabled = false;\n"
+"};\n"
+"</script></main></body></html>\n";
+
+    if (!strcmp(hr.method, "GET") &&
+        (!strcmp(hr.path, "/") || !strcmp(hr.path, "/ui") ||
+         !strcmp(hr.path, "/index.html"))) {
+        (void)http_response(fd, s->enable_cors, 200,
+                            "text/html; charset=utf-8", ds4_server_index_html);
+        http_request_free(&hr);
+        goto done;
+    }
     if (!strcmp(hr.method, "GET") && !strcmp(route, "/health")) {
         (void)http_response(fd, s->enable_cors, 200, "application/json",
                             "{\"status\":\"ok\"}\n");

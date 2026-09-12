@@ -29,12 +29,17 @@ cd "$(dirname "$0")"
 
 case "$PROFILE" in
 merged)
+    # The draft head does not fit next to a 32768 context on a 16 GiB card: the
+    # engine says so and skips it, so this profile is long context without
+    # drafting.  For MTP use ctx 24576 or the KV type switch, -ctk q8_0 -ctv q8_0.
+    #
+    # This comment sits above the command, not inside it: in sh a comment line
+    # after a trailing backslash ends the command, so the options below would
+    # silently vanish and the server would come up on the default port 8000 while
+    # this script told you 8080.  That is what "the browser says error" was.
+    printf '%s\n' "ds4-server (merged, ctx 32768, MTP off) on http://127.0.0.1:$PORT" >&2
     exec ./ds4-server \
         -m "$M/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf" \
-        # The draft head does not fit next to a 32768 context on a 16 GiB
-        # card: the engine says so and skips it, so this profile is long
-        # context without drafting.  For MTP use ctx 24576 or the KV type
-        # switch, -ctk q8_0 -ctv q8_0.
         --ctx 32768 --host 127.0.0.1 --port "$PORT" \
         --vision "$M/mmproj-Qwen3.8-27B-BF16.gguf" \
         --mtp --mtp-draft 4 \
@@ -42,6 +47,7 @@ merged)
         --trace /tmp/ds4-server.trace
     ;;
 sidecar)
+    printf '%s\n' "ds4-server (sidecar, ctx 16384) on http://127.0.0.1:$PORT" >&2
     exec ./ds4-server \
         -m "$M/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf" \
         --ctx 16384 --host 127.0.0.1 --port "$PORT" \
@@ -51,6 +57,7 @@ sidecar)
         --trace /tmp/ds4-server.trace
     ;;
 long)
+    printf '%s\n' "ds4-server (long, ctx 32768, no draft head) on http://127.0.0.1:$PORT" >&2
     exec ./ds4-server \
         -m "$M/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf" \
         --ctx 32768 --host 127.0.0.1 --port "$PORT" \
