@@ -37,20 +37,30 @@ make tests/test_qwen38_session_cuda CUDA_ARCH=sm_120
 DS4_TEST_QWEN38_CUDA=1 ./tests/test_qwen38_session_cuda "$MODEL" "$PROMPT"
 
 echo "===== the same gate with the q8_0 KV cache ====="
-# DS4_KV_Q8 is the hook the test binaries use, since they take no engine
-# options.  What is asserted is the number itself, which is the thing that would
-# move if the q8_0 path regressed.  Note what this test can and cannot say: over
-# 16 tokens the two formats are 1.80954673 against 1.80900178, which is inside
-# its noise - the format comparison is the recall test, where both answer four
+# DS4_KV_Q8 and DS4_KV_Q4 are the hooks the test binaries use, since they take no
+# engine options.  What is asserted is the number itself, which is the thing that
+# would move if a quantized path regressed.  Note what this test can and cannot
+# say: over 16 tokens the three formats are 1.80954673, 1.80900178 and 1.82242633,
+# and the difference between the first two is inside its noise - the format
+# comparison that means something is the recall test, where all three answer four
 # for four with identical text.
+# Two explicit invocations, not one clever loop: setting an environment variable
+# to the empty string still defines it, so a conditional assignment turned both
+# hooks on at once and q4_0's number was reported for q8_0.
 nll_q8=$(DS4_KV_Q8=1 DS4_TEST_QWEN38_CUDA=1 ./tests/test_qwen38_session_cuda "$MODEL" "$PROMPT" 2>&1 | grep '^MEAN_NLL' || true)
-case "$nll_q8" in
-  "MEAN_NLL 1.80900178 TOKENS 16")
-    echo "q8_0 KV NLL as recorded: $nll_q8" ;;
-  *)
+if [ "$nll_q8" = "MEAN_NLL 1.80900178 TOKENS 16" ]; then
+    echo "q8_0 KV NLL as recorded: $nll_q8"
+else
     echo "q8_0 KV NLL changed from the recorded 1.80900178: $nll_q8"
-    exit 1 ;;
-esac
+    exit 1
+fi
+nll_q4=$(DS4_KV_Q4=1 DS4_TEST_QWEN38_CUDA=1 ./tests/test_qwen38_session_cuda "$MODEL" "$PROMPT" 2>&1 | grep '^MEAN_NLL' || true)
+if [ "$nll_q4" = "MEAN_NLL 1.82242633 TOKENS 16" ]; then
+    echo "q4_0 KV NLL as recorded: $nll_q4"
+else
+    echo "q4_0 KV NLL changed from the recorded 1.82242633: $nll_q4"
+    exit 1
+fi
 
 echo "===== tokenizer vectors ====="
 make test-tokenizer-vectors 2>/dev/null || echo "(tokenizer vectors target not present; covered by run_qwen38_cpu.sh)"

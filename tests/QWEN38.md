@@ -630,6 +630,8 @@ without the split and to q8_0.
                                                  against 1.81334038 before it)
   trunk NLL, q8_0 KV               1.80900178   (16 tokens: inside this test's
                                                  noise against f16, see below)
+  trunk NLL, q4_0 KV               1.82242633   (+0.7%: the first format whose
+                                                 difference is outside the noise)
 
 Four hypotheses have been measured and dropped on the way: the per-key load
 latency (a shared tile gives 3.95 against 4.43 tok/s), the partials in scratch

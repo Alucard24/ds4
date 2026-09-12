@@ -167,10 +167,17 @@ V, which is 64 KiB per token in f16, so a 16 GiB card runs out of context at
 scale - 1088 bytes per position, 34 KiB per token - and roughly doubles the
 context that fits:
 
-| KV | bytes/token | context that fits | MEAN_NLL |
-|---|---|---|---|
-| `f16` (default) | 64 KiB | 32768 measured | **1.81334038** |
-| `q8_0` | 34 KiB | **~66k** (65536 loads) | **1.81927471** (+0.33%) |
+| KV | bytes/token | context that fits | MEAN_NLL | recall at 19.5k |
+|---|---|---|---|---|
+| `f16` (default) | 64 KiB | 32768 measured | **1.80954673** | 4/4 |
+| `q8_0` | 34 KiB | ~66k (65536 loads) | **1.80900178** | 4/4, identical |
+| `q4_0` | 18 KiB | **131072 loads** | **1.82242633** (+0.7%) | **4/4, identical** |
+
+The NLL figures are with the split-KV decode, which re-associates the softmax and
+is why they differ from the 1.81334038 this document used to quote.  Over 16
+tokens f16 and q8_0 differ by less than that test can resolve; **q4_0 is the first
+whose difference is outside the noise**, and the instrument that decides between
+them is the recall test, where all three answer four for four with identical text.
 
 Writing neither flag is exactly the previous behaviour: f16 stays the release
 path and its gate is unchanged. The names are llama.cpp's, so the values are the
@@ -202,9 +209,10 @@ Three things to know before choosing it:
 - **K and V must name the same type.** They share one layout and one pair of
   kernels; a mixed pair is refused at startup rather than stored as one.
 
-`q4_0` is refused at parse time until its kernel twin exists. Its 576 bytes per
-position (18.4 KiB per token) would allow about 125k tokens, so 131072 stays out
-of reach even then without giving up the vision encoder.
+`q4_0` reaches **131072**: 576 bytes per position is 18.4 KiB per token, and a
+server at that context measured 30.3 tok/s of decode at 19.5k with the recall
+intact.  The engine prints the format it chose at startup and records it in the
+disk KV payload, so a cache written by one format is never read by another.
 
 The kernels are duplicated rather than unified on purpose: the build uses
 `--use_fast_math`, so a refactor that is only "semantically" equivalent can move

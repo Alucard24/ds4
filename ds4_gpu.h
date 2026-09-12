@@ -551,6 +551,8 @@ int ds4_gpu_embed_tokens_quant_tensor(
  * costs 1088 bytes per position per layer against 2048.  Set once when the
  * engine opens, before any session allocates its caches. */
 void ds4_gpu_qwen38_set_kv_quant(int q8);
+void ds4_gpu_qwen38_set_kv_fmt(int fmt);
+int  ds4_gpu_qwen38_kv_fmt(void);
 int ds4_gpu_qwen38_kv_quant_is_q8(void);
 
 int ds4_gpu_indexer_score_one_tensor(

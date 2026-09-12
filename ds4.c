@@ -6561,6 +6561,7 @@ int ds4_kv_type_from_name(const char *name, int *q8_out) {
     if (!name || !q8_out) return 0;
     if (!strcmp(name, "f16") || !strcmp(name, "fp16")) { *q8_out = 0; return 1; }
     if (!strcmp(name, "q8_0")) { *q8_out = 1; return 1; }
+    if (!strcmp(name, "q4_0")) { *q8_out = 2; return 1; }
     return 0;
 }
 
@@ -7855,10 +7856,15 @@ static int qwen38_gpu_state_init(ds4_qwen38_gpu_state *st, uint32_t ctx_size) {
      * -ctk/-ctv, in which case the q8_0 twins run and the caches are sized 1088
      * bytes per position per layer against 2048.  DS4_KV_Q8=1 is the hook the
      * test binaries use, which cannot pass engine options. */
-    const int kv_q8 = ds4_gpu_qwen38_kv_quant_is_q8() ||
-                      getenv("DS4_KV_Q8") != NULL;
-    ds4_gpu_qwen38_set_kv_quant(kv_q8);
-    const uint64_t kv_pos_bytes = kv_q8 ? 1088ull : 2048ull;
+    /* The format, not a boolean: 0 is f16, 1 is q8_0, 2 is q4_0.  DS4_KV_Q8
+     * and DS4_KV_Q4 stay as hooks for the test binaries, which take no engine
+     * options. */
+    int kv_fmt = ds4_gpu_qwen38_kv_fmt();
+    if (getenv("DS4_KV_Q8") != NULL) kv_fmt = 1;
+    if (getenv("DS4_KV_Q4") != NULL) kv_fmt = 2;
+    ds4_gpu_qwen38_set_kv_fmt(kv_fmt);
+    const uint64_t kv_pos_bytes = kv_fmt == 2 ? 576ull :
+                                  (kv_fmt == 1 ? 1088ull : 2048ull);
     if (!qwen38_gpu_alloc_bytes(&st->attn_k,
             16ull * ctx_size * kv_pos_bytes, "attn_k")) goto fail;
     if (!qwen38_gpu_alloc_bytes(&st->attn_v,
@@ -58433,7 +58439,7 @@ static int ds4_session_save_qwen38_payload(ds4_session *s, FILE *fp,
      * is f16, the release path, unchanged. */
     const uint32_t kv_format_bits =
 #ifndef DS4_NO_GPU
-        (uint32_t)ds4_gpu_qwen38_kv_quant_is_q8() << 16;
+        (uint32_t)ds4_gpu_qwen38_kv_fmt() << 16;
 #else
         0u;
 #endif
@@ -58563,7 +58569,7 @@ static int ds4_session_load_qwen38_payload(ds4_session *s, FILE *fp,
     const uint32_t kv_file_format = h[4] >> 16;
 #ifndef DS4_NO_GPU
     const uint32_t kv_session_format =
-        (uint32_t)ds4_gpu_qwen38_kv_quant_is_q8();
+        (uint32_t)ds4_gpu_qwen38_kv_fmt();
 #else
     const uint32_t kv_session_format = 0u;
 #endif
@@ -66955,14 +66961,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
 #ifndef DS4_NO_GPU
-        ds4_gpu_qwen38_set_kv_quant((opt->ctk_q8 || opt->ctv_q8) ? 1 : 0);
+        ds4_gpu_qwen38_set_kv_fmt(opt->ctk_q8);
 #endif
-        if ((opt->ctk_q8 || opt->ctv_q8) &&
-            getenv("DS4_KV_Q8") == NULL) {
+        if (opt->ctk_q8 != 0) {
             fprintf(stderr,
-                    "ds4: Qwen3.8 q8_0 KV cache is enabled (%s); its NLL is "
-                    "1.81927471 against 1.81334038 for the default f16\n",
-                    "q8_0");
+                    "ds4: Qwen3.8 %s KV cache is enabled: %u bytes per position "
+                    "per layer against 2048 for f16, so more context fits\n",
+                    opt->ctk_q8 == 2 ? "q4_0" : "q8_0",
+                    opt->ctk_q8 == 2 ? 576u : 1088u);
         }
         if (load_slice || opt->distributed.role != DS4_DISTRIBUTED_NONE ||
             opt->tp.role != DS4_TP_NONE ||
