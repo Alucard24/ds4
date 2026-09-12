@@ -28050,6 +28050,167 @@ extern "C" int ds4_gpu_qwen38_kv_quant_is_q8(void) {
     return g_qwen38_kv_q8;
 }
 
+/* Split-KV decode attention.
+ *
+ * One block per head walks the whole key range today, so 24 blocks of 8 warps
+ * spread over 70 SMs leave the machine idle and the cost is the serial chain:
+ * measured on the f16 path, decode is linear in the context at about 9 us per
+ * 1000 keys per token, a straight line through the origin, with 2.7 warps per SM
+ * working out of the 48 to 64 an SM can hold.  So the range is cut into parts,
+ * each block leaves a partial online-softmax state, and a small kernel combines
+ * them.  That changes the order the softmax is accumulated in, which is a
+ * deliberate re-baseline of the trunk NLL.
+ *
+ * The format is an explicit parameter rather than a global: this file has been
+ * bitten three times by --use_fast_math changing an untouched branch when a
+ * shared helper grew a runtime test.
+ */
+#define QWEN38_GA_SPLIT_PARTS 8
+#define QWEN38_GA_SPLIT_STRIDE 258u   /* max, denominator, 256 accumulators */
+
+__global__ static void qwen38_ga_split_kernel(
+        float *partial, const float *q_full, const unsigned char *k_cache,
+        const unsigned char *v_cache, uint32_t start_pos, uint32_t parts,
+        int q8) {
+    constexpr uint32_t queries_per_kv =
+        QWEN38_CUDA_GA_HEADS / QWEN38_CUDA_GA_HEADS_KV;
+    const uint32_t head = blockIdx.x;
+    const uint32_t part = blockIdx.z;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    if (head >= QWEN38_CUDA_GA_HEADS || tid >= QWEN38_CUDA_GA_HEAD_DIM) return;
+    const uint32_t kv_head = head / queries_per_kv;
+    const uint32_t total = start_pos + 1u;
+    const uint32_t chunk = (total + parts - 1u) / parts;
+    const uint32_t first = part * chunk;
+    uint32_t last = first + chunk;
+    if (first >= total) {
+        /* An empty part still writes its slot.  The combine reads every part,
+         * and leaving it untouched made the trunk NLL 3.7748674 against
+         * 1.81334038 - the maximum of whatever was in the scratch. */
+        float *slot = partial +
+            ((uint64_t)part * QWEN38_CUDA_GA_HEADS + head) *
+            QWEN38_GA_SPLIT_STRIDE;
+        if (tid == 0u) {
+            slot[0] = -INFINITY;
+            slot[1] = 0.0f;
+        }
+        slot[2u + tid] = 0.0f;
+        return;
+    }
+    if (last > total) last = total;
+    const float *q = q_full + (uint64_t)head * 2u * QWEN38_CUDA_GA_HEAD_DIM;
+    float acc = 0.0f;
+    float denominator = 0.0f;
+    float maximum = -INFINITY;
+    for (uint32_t token = first; token < last; token++) {
+        const uint64_t base = (uint64_t)token * QWEN38_CUDA_GA_HEADS_KV *
+                QWEN38_CUDA_GA_HEAD_DIM +
+            (uint64_t)kv_head * QWEN38_CUDA_GA_HEAD_DIM;
+        float p0, p1, p2, p3;
+        if (q8) {
+            p0 = q[lane] * qwen38_kv_q8_read(k_cache, base + lane);
+            p0 += q[lane + 128u] * qwen38_kv_q8_read(k_cache, base + lane + 128u);
+            p1 = q[lane + 64u] * qwen38_kv_q8_read(k_cache, base + lane + 64u);
+            p1 += q[lane + 192u] * qwen38_kv_q8_read(k_cache, base + lane + 192u);
+            p2 = q[lane + 32u] * qwen38_kv_q8_read(k_cache, base + lane + 32u);
+            p2 += q[lane + 160u] * qwen38_kv_q8_read(k_cache, base + lane + 160u);
+            p3 = q[lane + 96u] * qwen38_kv_q8_read(k_cache, base + lane + 96u);
+            p3 += q[lane + 224u] * qwen38_kv_q8_read(k_cache, base + lane + 224u);
+        } else {
+            const __half *kh = (const __half *)k_cache;
+            p0 = q[lane] * __half2float(kh[base + lane]);
+            p0 += q[lane + 128u] * __half2float(kh[base + lane + 128u]);
+            p1 = q[lane + 64u] * __half2float(kh[base + lane + 64u]);
+            p1 += q[lane + 192u] * __half2float(kh[base + lane + 192u]);
+            p2 = q[lane + 32u] * __half2float(kh[base + lane + 32u]);
+            p2 += q[lane + 160u] * __half2float(kh[base + lane + 160u]);
+            p3 = q[lane + 96u] * __half2float(kh[base + lane + 96u]);
+            p3 += q[lane + 224u] * __half2float(kh[base + lane + 224u]);
+        }
+        p2 += p3;
+        p0 += p1;
+        p0 += p2;
+        const float dot = warp_sum_f32(p0);
+        float old_scale = 0.0f;
+        float probability = 0.0f;
+        if (lane == 0u) {
+            const float score = dot * 0.0625f;
+            const float next_max = fmaxf(maximum, score);
+            old_scale = isfinite(maximum) ? expf(maximum - next_max) : 0.0f;
+            probability = expf(score - next_max);
+            denominator = denominator * old_scale + probability;
+            maximum = next_max;
+        }
+        old_scale = __shfl_sync(0xffffffffu, old_scale, 0);
+        probability = __shfl_sync(0xffffffffu, probability, 0);
+        acc = acc * old_scale +
+            probability * (q8 ? qwen38_kv_q8_read(v_cache, base + tid)
+                              : __half2float(((const __half *)v_cache)[base + tid]));
+    }
+    float *out = partial + ((uint64_t)part * QWEN38_CUDA_GA_HEADS + head) *
+        QWEN38_GA_SPLIT_STRIDE;
+    if (tid == 0u) {
+        out[0] = maximum;
+        out[1] = denominator;
+    }
+    out[2u + tid] = acc;
+}
+
+/* Combine the partials for one head: rescale each part by exp(max_part -
+ * max_all), sum, and apply the gate to the normalized output. */
+__global__ static void qwen38_ga_split_combine_kernel(
+        float *out, const float *partial, const float *q_full,
+        uint32_t parts) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (head >= QWEN38_CUDA_GA_HEADS || tid >= QWEN38_CUDA_GA_HEAD_DIM) return;
+    const float *base = partial + (uint64_t)head * QWEN38_GA_SPLIT_STRIDE;
+    float maximum = -INFINITY;
+    for (uint32_t p = 0; p < parts; p++) {
+        const float m = base[(uint64_t)p * QWEN38_CUDA_GA_HEADS *
+                             QWEN38_GA_SPLIT_STRIDE];
+        maximum = fmaxf(maximum, m);
+    }
+    float denominator = 0.0f;
+    float acc = 0.0f;
+    for (uint32_t p = 0; p < parts; p++) {
+        const float *part = base + (uint64_t)p * QWEN38_CUDA_GA_HEADS *
+            QWEN38_GA_SPLIT_STRIDE;
+        const float scale = expf(part[0] - maximum);
+        denominator += part[1] * scale;
+        acc += part[2u + tid] * scale;
+    }
+    const float gate = q_full[(uint64_t)head * 2u * QWEN38_CUDA_GA_HEAD_DIM +
+                              QWEN38_CUDA_GA_HEAD_DIM + tid];
+    out[(uint64_t)head * QWEN38_CUDA_GA_HEAD_DIM + tid] =
+        acc / denominator * (1.0f / (1.0f + expf(-gate)));
+}
+
+/* Scratch for the partials, one allocation for the process: parts x heads x
+ * stride floats, 198 KiB at eight parts. */
+static float *g_qwen38_split_scratch;
+static uint32_t g_qwen38_split_scratch_parts;
+
+static float *qwen38_split_scratch(uint32_t parts, cudaStream_t stream) {
+    const uint64_t want = (uint64_t)parts * QWEN38_CUDA_GA_HEADS *
+                          QWEN38_GA_SPLIT_STRIDE * sizeof(float);
+    if (g_qwen38_split_scratch && g_qwen38_split_scratch_parts >= parts) {
+        return g_qwen38_split_scratch;
+    }
+    if (g_qwen38_split_scratch) {
+        (void)cudaFree(g_qwen38_split_scratch);
+        g_qwen38_split_scratch = NULL;
+    }
+    if (cudaMalloc((void **)&g_qwen38_split_scratch, want) != cudaSuccess) {
+        g_qwen38_split_scratch = NULL;
+        return NULL;
+    }
+    g_qwen38_split_scratch_parts = parts;
+    (void)stream;
+    return g_qwen38_split_scratch;
+}
+
 extern "C" int ds4_gpu_qwen38_ga_prepare_chunk(
         ds4_gpu_tensor *q_full, ds4_gpu_tensor *k_cache,
         ds4_gpu_tensor *v_cache, ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
@@ -28115,6 +28276,30 @@ extern "C" int ds4_gpu_qwen38_ga_chunk(
             (g_qwen38_kv_q8 ? QWEN38_KV_Q8_POS_BYTES : 2048u) ||
         v_cache->bytes < (uint64_t)ctx_size *
             (g_qwen38_kv_q8 ? QWEN38_KV_Q8_POS_BYTES : 2048u)) return 0;
+    /* Split-KV, behind DS4_GA_SPLIT while it is measured.  The release path stays
+     * the single-row kernel until the gain and the NLL drift are both known: a
+     * diagnostic that measures is allowed, unexplained drift is not. */
+    if (n_tokens == 1u && getenv("DS4_GA_SPLIT") != NULL) {
+        float *scratch = qwen38_split_scratch(QWEN38_GA_SPLIT_PARTS,
+                                             cuda_decode_stream());
+        if (!scratch) {
+            fprintf(stderr, "ds4: Qwen GA split decode has no scratch\n");
+            return 0;
+        }
+        const dim3 split_grid(QWEN38_CUDA_GA_HEADS, 1u,
+                              QWEN38_GA_SPLIT_PARTS);
+        qwen38_ga_split_kernel<<<split_grid,256,0,cuda_decode_stream()>>>(
+            scratch, (const float *)q_full->ptr,
+            (const unsigned char *)k_cache->ptr,
+            (const unsigned char *)v_cache->ptr, start_pos,
+            QWEN38_GA_SPLIT_PARTS, g_qwen38_kv_q8);
+        const dim3 combine_grid(QWEN38_CUDA_GA_HEADS, 1u, 1u);
+        qwen38_ga_split_combine_kernel<<<combine_grid,256,0,
+                                         cuda_decode_stream()>>>(
+            (float *)out->ptr, scratch, (const float *)q_full->ptr,
+            QWEN38_GA_SPLIT_PARTS);
+        return cuda_ok(cudaGetLastError(), "Qwen GA split decode launch");
+    }
     /* The single-row shape is used for decode at every depth.  Staging the keys
      * and values in shared memory does not help it: measured on a 24k context,
      * the tiled kernel gives 3.95 tok/s against 4.43 for this one, because the
