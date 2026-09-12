@@ -318,6 +318,48 @@ decode picked up the shorter chain as well (43.1 tok/s greedy, 55.6 with MTP). T
 The MTP speculative round now reaches 1.30x on this prompt (41.4 -> 53.7 tok/s)
 with the stream identical to one-token greedy.
 
+The deep-context prefill attention was the next item.  Two wrong models came
+first and are worth recording: splitting each row's key range in the style of the
+decode split, which measured nothing (the prefill already has 464 rows of
+parallelism, so cutting the keys duplicates partial softmax states instead of
+shortening a chain), and an occupancy theory, killed by rebuilding at tile sizes
+8, 16 and 32, which all gave the same 86 ms.  What settled it was an ablation
+mask compiled into the kernel - staging only, then the K dot, the warp
+reduction, the softmax and the V accumulate subtracted one at a time - together
+with a standalone reproduction of the same loop body: the body runs at
+0.246 ns per (row, head, key) and the kernel at 0.275, so the kernel was already
+at the hardware's issue limit for its own instruction stream, and that stream was
+112 instructions per key for 34 of arithmetic.  (`redux.sync.add.f32`, the
+hardware float reduction that would have collapsed the five-shuffle tree, exists
+only on the datacenter Blackwell parts, not on sm_120.)  Three changes followed,
+each verified bit-identical against the recorded logprobs of a 2000-token prompt
+(max delta 0.000000) and against the gate:
+
+  - the tile copy became 16 bytes per thread per pass (`uint4`) instead of 64
+two-byte loads with dependent two-byte shared stores, which the disassembly
+showed were neither vectorised nor overlapped: the copy alone was 44 ms of the
+deepest chunk's 121;
+  - the online softmax moved off lane 0 onto every lane, and the warp reduction
+became a butterfly so that no broadcast is needed: same tree, same order, same
+bits, but no divergence handling (BSSY/BSYNC, WARPSYNC) and no shuffles;
+  - two adjacent query rows now share one warp and ride the same key and value
+registers, so the eight shared loads, eight half-to-float conversions and the
+address arithmetic per tensor are paid once for both rows.  Adjacent rows differ
+by one position, so the loop walks the union of their ranges and masks the extra
+key with -infinity, and the running state starts from a finite floor so that
+expf(-inf - -inf) cannot be reached before a row has started.
+
+GA attention core per prefill chunk (512/512/512/464 rows, phase events, ms):
+
+    69.6 / 208.0 / 344.9 / 470.1   before the shared tile
+    18.7 /  53.4 /  87.7 / 109.2   after the shared tile
+     8.9 /  23.8 /  38.3 /  47.7   after the three changes above
+
+The deepest chunk went from 313.2 to 251.0 ms and the 2000-token prompt from 1123
+to 1222 tok/s (llama.cpp: 1353).  What is left in a chunk is no longer attention:
+the GDN recurrence is 73.4 ms, the output head 58.0, the projections 53.9 and the
+GA attention 47.7.
+
 A final experiment split Q8_1 activation quantization from MMVQ so the Qwen
 attention and FFN projections could share one quantized row. Three 538-token
 runs produced 798.1/798.4/787.3 warm prefill tok/s and
