@@ -601,3 +601,48 @@ of kernels - and q4_0 is refused until its twin exists. The disk KV payload
 refuses to write or read while it does not record the format, because a q8_0
 cache reloaded as f16 would decode garbage. `DS4_KV_Q8=1` is the hook the test
 binaries use, since they take no engine options.
+
+## Deep decode: split-KV, measured and behind a switch
+
+A decode token at a 21.510-token context took 190 ms, of which 195-202 of a 217 ms
+token at 24k is the GA attention: one block per head walking the whole key range,
+12.5 ms per layer, about 730 cycles per key with only 24 to 48 warps of work on 70
+SMs. Cutting that range into N parts, each block leaving a partial online-softmax
+state for a small combine kernel, measures:
+
+| N | tok/s | ms/token | gain |
+|---|---|---|---|
+| 1 (baseline) | 5.25 | 190 | 1.0x |
+| 2 | 9.13 | 109.5 | 1.74x |
+| 4 | 15.86 | 63.0 | 3.02x |
+| 8 | 23.97 | 41.7 | 4.57x |
+| 16 | 27.84 | 35.9 | 5.3x |
+| 64 | 30.36 | 32.9 | 5.8x |
+| 128 | 30.45 | 32.8 | 5.8x |
+
+So **5.8x**, saturating around 32-36 ms per token, against 38.8 tok/s for llama.cpp
+at the same depth on the same file. Recall does not suffer: four access codes at
+2/25/50/75% of a 19530-token prompt come back four for four, identical to f16
+without the split and to q8_0.
+
+  trunk NLL, release path          1.81334038   (session gate passes)
+  trunk NLL, split-KV              1.80954673   (the softmax association changes)
+  trunk NLL, q8_0 KV               1.81927471
+
+Four hypotheses have been measured and dropped on the way: the per-key load
+latency (a shared tile gives 3.95 against 4.43 tok/s), the partials in scratch
+(N=1 costs 189 ms against 190 for the single-row shape, so scratch and combine
+are free), bandwidth (45 GB/s against the ~900 the card has), and the instruction
+count (removing the eight-fold score redundancy changes nothing: 27.84 against
+28.02 at N=16). **About 30 ms per token of the remaining 33 is unexplained**, and
+that is the next thing to measure rather than guess.
+
+Writing the de-duplicated kernel found a silent bug in the version being
+measured: it guarded with tid >= 128 while the block has 256 threads, so it
+accumulated only half of the 256 output dimensions and left the rest of the
+scratch holding the previous token's partials - attention-shaped numbers, so the
+NLL read a plausible 1.80977761. Only the layout change, which moved a number
+that had to stay still, exposed it.
+
+Selection is DS4_GA_SPLIT=1 with DS4_GA_SPLIT_PARTS=N, a diagnostic and not a
+supported mode: the release path is the single-row kernel, unchanged.

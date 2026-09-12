@@ -31,7 +31,11 @@ case "$PROFILE" in
 merged)
     exec ./ds4-server \
         -m "$M/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf" \
-        --ctx 24576 --host 127.0.0.1 --port "$PORT" \
+        # The draft head does not fit next to a 32768 context on a 16 GiB
+        # card: the engine says so and skips it, so this profile is long
+        # context without drafting.  For MTP use ctx 24576 or the KV type
+        # switch, -ctk q8_0 -ctv q8_0.
+        --ctx 32768 --host 127.0.0.1 --port "$PORT" \
         --vision "$M/mmproj-Qwen3.8-27B-BF16.gguf" \
         --mtp --mtp-draft 4 \
         --kv-disk-dir "$HOME/.ds4/server-kv" --kv-disk-space-mb 8192 \

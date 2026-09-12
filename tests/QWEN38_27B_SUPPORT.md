@@ -210,3 +210,23 @@ The kernels are duplicated rather than unified on purpose: the build uses
 `--use_fast_math`, so a refactor that is only "semantically" equivalent can move
 the release path's numbers, and one did. `DS4_KV_Q8=1` selects the same format
 for the test binaries, which take no engine options.
+
+### Deep decode, and what is not a supported mode yet
+
+Decode slows down with depth: 12.95 tok/s at 7.1k of context, 7.51 at 14.3k, 5.25
+at 21.5k. The cost is linear in the context and it is the attention - a decode
+token at 24k spends 195-202 ms of its 217 in it, one block per head walking the
+whole key range. A split-KV variant (the key range cut into parts, combined with a
+second kernel) measures **5.8x** at 21.5k, saturating at 30.4 tok/s, with recall
+unchanged.
+
+It is **not** a supported mode while two things are open: about 30 ms per token of
+the remaining 33 are unexplained, and promoting it moves the trunk NLL to
+1.80954673 (the softmax association changes). It is reachable with
+`DS4_GA_SPLIT=1 DS4_GA_SPLIT_PARTS=N` for measurement only.
+
+Also worth knowing: **MTP drafting only pays at short contexts.** At 24k it buys
+about 3% (4.56 against 4.43 tok/s) because each draft walks the same long key
+range, while at short contexts it is worth +30% (64.9 against 42.8 tok/s). So use
+`--mtp` for chat and leave it out for long documents; the flags give both profiles
+already.
