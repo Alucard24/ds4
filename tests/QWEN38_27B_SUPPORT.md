@@ -212,8 +212,12 @@ subtle degradation - the NLL figure is the measure for that.
 
 Three things to know before choosing it:
 
-- **Prefill is now within 4% of f16**: 1269 tok/s (`q8_0`) and 1266 (`q4_0`)
-  against 1324 on the same prompt, where it used to be 941 and 893.  The
+- **Prefill is the same as f16**: 1415 tok/s (`q8_0`) and 1398 (`q4_0`) against
+  1423 on the same prompt, where it used to be 941 and 893.  A quantized chunk
+  widens its key range to f16 once per layer and then runs the f16 attention kernel,
+  so the format costs nothing in the prefill; the widening rounds the dequantized
+  values to f16, an extra ~1e-3 on them, which is visible in the prefill's logits
+  and not in the recall (four for four at 19.9k with `q4_0`).  The
   quantized prefill twin now has the same shape as the f16 one - a shared tile,
   two query rows per warp, the softmax off lane 0 - and, in the step that
   mattered, its tile holds **dequantized floats** instead of the cache's bytes:

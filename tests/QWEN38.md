@@ -434,11 +434,11 @@ score.  The finder was a new diagnostic, `DS4_QWEN38_GA_DUMP`, which prints the
 first GA layer's attention rows: it turned "1-5 logits off" into "NaN in most
 dimensions, row 0 identical".
 
-The quantized twin got the same treatment and it **lost**, which is worth
-recording because the reason is structural rather than a mistake: q8_0's attention
-core went from 72.6 to **122.6 ms** (q4_0 72.7 to 112.1) with the tensor-core body
-and a tile of f16 - half the shared a float tile needs, and lossless, since q8_0
-and q4_0 are eight and four bits of code behind an f16 scale.  Reverted.
+The quantized twin got the same treatment and the naive form of it **lost**, which
+is worth recording because the reason is structural: q8_0's attention core went from
+72.6 to **122.6 ms** (q4_0 72.7 to 112.1) when the dequantization was moved into
+each row block's staging, even with a tile of f16 - half the shared a float tile
+needs.  Reverted.
 
 The FA-2 body is so cheap that the *staging* becomes the wall: dequantizing a value
 costs four to six instructions, a 32-key tile is 16384 of them, and 160 threads
@@ -450,9 +450,24 @@ not make it faster; it exposed what was always underneath.
 And it is paid **twenty-nine times over**: every row block of a head re-stages and
 re-dequantizes the same keys.  So the fix is not a faster dequantization but a
 single one - dequantize the chunk's key range once into a scratch buffer, per layer,
-and let every block read f16 from there.  That is a new kernel and a buffer of the
-chunk's key range (40 MiB at 19.5k, transient and reused per layer, so it fits), and
-it would pay the dequantization once instead of twenty-nine times.
+and let every block read f16 from there.  That is a small kernel plus a transient
+buffer (4 KiB per position per layer: 78 MiB at 19.5k, 512 MiB at 131k) reused layer
+by layer, and it was done: a widening kernel writes an f16 mirror of the cache with
+the cache's own layout, so **the f16 prefill kernel reads it unchanged** and no
+quantized attention kernel exists any more.
+
+    quantized attention core   73.0 / 73.4 ms -> 27.9 / 28.0
+    f16 attention core         28.1 ms  (unchanged)
+    prefill q8_0 / q4_0        1297 / 1272 -> 1415 / 1398 tok/s
+
+The quantized prefill attention is now the same number as the f16 one: the format
+costs nothing in the prefill any more.  One correction to the reasoning above: the
+widening is **not** lossless.  Eight bits of code behind an f16 scale do not fit in
+eleven bits of mantissa once multiplied, so rounding the product to f16 is a
+fresh ~1e-3 relative error on the values - which shows up exactly where it should,
+in the prefill gate's deltas against f16, which moved from 0.0117 to 0.0422 (q8_0)
+and from 0.3198 to 0.3252 (q4_0).  Both stay far inside the gate's limits (0.50 and
+0.80), and the recall at 19.9k with q4_0 answers four for four.
 
 The prefill's host launch path was investigated as a project of its own
 (`TODO-7e760186`: a CUDA graph over the layer loop) and the premise did not
