@@ -249,8 +249,25 @@ cannot avoid - 8.5 are the attention, and 2.4 everything else. The trunk NLL mov
 with it, from 1.81334038 to 1.80954673, because combining partial softmax states
 re-associates the sum.
 
-Also worth knowing: **MTP drafting only pays at short contexts.** At 24k it buys
-about 3% (4.56 against 4.43 tok/s) because each draft walks the same long key
-range, while at short contexts it is worth +30% (64.9 against 42.8 tok/s). So use
-`--mtp` for chat and leave it out for long documents; the flags give both profiles
-already.
+Also worth knowing: **MTP drafting is close to free at short contexts and nearly
+absurd at depth.** Measured after the split-KV decode, so the attention is no
+longer what limits the verify pass:
+
+| context | decode without | decode with | prefill without | prefill with |
+|---|---|---|---|---|
+| ~2k | 42.8 tok/s | **64.9 tok/s** (+52%) | - | - |
+| ~16k | 44.3 tok/s | **46.2 tok/s** (+4.5%) | 1033 tok/s | **802 tok/s** (-22%) |
+| ~20k (ctx 24576) | 41.8 tok/s | 37.2 tok/s (-11%) | 854 tok/s | 645 tok/s |
+
+The last row is not a drafting result, it is a residency one: at ctx 24576 the
+draft head does not fit next to the KV any more, the engine says so ("sidecar
+0.79 GiB + 0.17 GiB state … exceeds the resident budget … 16k measured safe"),
+and everything slows down, prefill included - the prefill never touches the draft
+head, so what is being paid there is the weight cache thinning out around it.
+
+The reason depth costs drafting so much is the verify pass: one trunk pass over
+four drafted tokens pays the 10.95 GiB of weights once - which is the whole point
+- but pays the attention four times, and at 16k the attention is a third of a
+token. So `--mtp` is for chat, which is what the default `run-qwen-server.sh`
+profile is for (ctx 16384 with the draft head, the largest context where it
+fits); use the `long` profile for documents.
