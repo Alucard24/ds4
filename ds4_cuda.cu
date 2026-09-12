@@ -27760,6 +27760,38 @@ __device__ static __forceinline__ void qwen38_ga_softmax_step(
     *probability = __shfl_sync(0xffffffffu, prob, 0);
 }
 
+/* Butterfly form of the warp sum: every lane ends with the total instead of
+ * lane 0 alone.  The tree is the same one -- pairs at distance 16, then 8, 4,
+ * 2, 1, summed in that order -- so the value is bit-identical to warp_sum_f32;
+ * what changes is that nobody has to broadcast it afterwards.
+ *
+ * The prefill body is issue-bound, not latency-bound: measured against a
+ * standalone reproduction of the same body, the search loop runs at 0.275 ns
+ * per (row, head, key) against 0.246 for the body alone, so the only lever
+ * left is the length of the instruction stream.  A divergent lane-0 softmax
+ * with two broadcasts was 27 of its 112 instructions. */
+__device__ static __forceinline__ float qwen38_ga_warp_sum_all(float v) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        v += __shfl_xor_sync(0xffffffffu, v, off);
+    return v;
+}
+
+/* Same arithmetic as qwen38_ga_softmax_step, computed on every lane instead of
+ * on lane 0 and broadcast: no divergence, no convergence barriers, no shuffles.
+ * Every input is identical across the warp, so every output is too. */
+__device__ static __forceinline__ void qwen38_ga_softmax_uniform(
+        float dot, float *maximum, float *denominator,
+        float *old_scale, float *probability) {
+    const float score = dot * 0.0625f;
+    const float next_max = fmaxf(*maximum, score);
+    const float rescale = expf(*maximum - next_max);
+    *old_scale = isfinite(*maximum) ? rescale : 0.0f;
+    *probability = expf(score - next_max);
+    *denominator = *denominator * *old_scale + *probability;
+    *maximum = next_max;
+}
+
 __device__ static __forceinline__ void qwen38_ga_accumulate(
         const __half *v, uint64_t base, uint32_t lane,
         float old_scale, float probability, float *accum) {
@@ -27838,22 +27870,44 @@ __global__ static void qwen38_ga_decode_kernel(
     const float q224 = owns_row ? q[lane + 224u] : 0.0f;
     float denominator = 0.0f;
     float maximum = -INFINITY;
-    __shared__ __half k_tile[QWEN38_CUDA_GA_TILE * QWEN38_CUDA_GA_HEAD_DIM];
-    __shared__ __half v_tile[QWEN38_CUDA_GA_TILE * QWEN38_CUDA_GA_HEAD_DIM];
+    __shared__ __align__(16) __half k_tile[QWEN38_CUDA_GA_TILE * QWEN38_CUDA_GA_HEAD_DIM];
+    __shared__ __align__(16) __half v_tile[QWEN38_CUDA_GA_TILE * QWEN38_CUDA_GA_HEAD_DIM];
     const uint32_t block_last = start_pos + block_row0 + block_rows - 1u;
     for (uint32_t tile0 = 0; tile0 <= block_last; tile0 += QWEN38_CUDA_GA_TILE) {
         const uint32_t tile_n =
             block_last - tile0 + 1u < QWEN38_CUDA_GA_TILE ?
             block_last - tile0 + 1u : QWEN38_CUDA_GA_TILE;
         __syncthreads();
-        for (uint32_t key = 0; key < tile_n; key++) {
-            const uint64_t src = (uint64_t)(tile0 + key) *
-                    QWEN38_CUDA_GA_HEADS_KV * QWEN38_CUDA_GA_HEAD_DIM +
-                (uint64_t)kv_head * QWEN38_CUDA_GA_HEAD_DIM;
-            for (uint32_t dim = threadIdx.x; dim < QWEN38_CUDA_GA_HEAD_DIM;
-                    dim += blockDim.x) {
-                k_tile[key * QWEN38_CUDA_GA_HEAD_DIM + dim] = k_cache[src + dim];
-                v_tile[key * QWEN38_CUDA_GA_HEAD_DIM + dim] = v_cache[src + dim];
+        /* Tile copy, sixteen bytes at a time.  A 256-thread block moves eight
+         * keys per pass (thirty-two uint4 per key per tensor), so a 32-key tile
+         * costs four load/store pairs per thread instead of sixty-four 16-bit
+         * ones.  The old form was the single largest item in the chunk: measured
+         * with a loop-empty ablation it was 44 ms of 121 on the deepest prefill
+         * chunk, because each 16-bit store waited on its own global load and the
+         * loop left no room to overlap them.  The bytes land in the same shared
+         * addresses, so the compute below reads exactly what it read before.
+         *
+         * Alignment: the KV tensors are views into one cudaMalloc'd buffer at
+         * multiples of the per-position stride (2048 bytes in f16), and every
+         * key starts at a 512-byte boundary inside the tensor, so both sides of
+         * this copy are 16-byte aligned by construction. */
+        {
+            const uint32_t per_pass = blockDim.x >> 5u;
+            const uint32_t key_in_pass = threadIdx.x >> 5u;
+            const uint32_t chunk = (threadIdx.x & 31u) * 8u;
+            for (uint32_t key = 0; key < tile_n; key += per_pass) {
+                const uint32_t kk = key + key_in_pass;
+                if (kk < tile_n) {
+                    const uint64_t src = (uint64_t)(tile0 + kk) *
+                            QWEN38_CUDA_GA_HEADS_KV * QWEN38_CUDA_GA_HEAD_DIM +
+                        (uint64_t)kv_head * QWEN38_CUDA_GA_HEAD_DIM + chunk;
+                    const uint64_t dst =
+                        (uint64_t)kk * QWEN38_CUDA_GA_HEAD_DIM + chunk;
+                    const uint4 k_vec = *(const uint4 *)(k_cache + src);
+                    const uint4 v_vec = *(const uint4 *)(v_cache + src);
+                    *(uint4 *)(k_tile + dst) = k_vec;
+                    *(uint4 *)(v_tile + dst) = v_vec;
+                }
             }
         }
         __syncthreads();
@@ -27864,9 +27918,10 @@ __global__ static void qwen38_ga_decode_kernel(
                 const uint64_t base = (uint64_t)token * QWEN38_CUDA_GA_HEAD_DIM;
                 float old_scale = 0.0f;
                 float probability = 0.0f;
-                const float dot = warp_sum_f32(qwen38_ga_score_part(k_tile,
-                    base, lane, q0, q32, q64, q96, q128, q160, q192, q224));
-                qwen38_ga_softmax_step(dot, lane, &maximum, &denominator,
+                const float dot = qwen38_ga_warp_sum_all(
+                    qwen38_ga_score_part(k_tile,
+                        base, lane, q0, q32, q64, q96, q128, q160, q192, q224));
+                qwen38_ga_softmax_uniform(dot, &maximum, &denominator,
                     &old_scale, &probability);
                 qwen38_ga_accumulate(v_tile, base, lane, old_scale,
                     probability, accum);
@@ -27874,7 +27929,6 @@ __global__ static void qwen38_ga_decode_kernel(
         }
     }
     if (!owns_row) return;
-    denominator = __shfl_sync(0xffffffffu, denominator, 0);
 #pragma unroll
     for (uint32_t j = 0; j < 8u; j++) {
         out[(uint64_t)row * QWEN38_CUDA_VALUE_DIM +
