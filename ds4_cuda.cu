@@ -28187,8 +28187,22 @@ __global__ static void qwen38_ga_split_combine_kernel(
         acc / denominator * (1.0f / (1.0f + expf(-gate)));
 }
 
-/* Scratch for the partials, one allocation for the process: parts x heads x
- * stride floats, 198 KiB at eight parts. */
+/* How many parts the split uses.  Read once: the point of varying it is to find
+ * where the parallelism stops paying, which the two-parameter model says is
+ * around 28 ms of traffic and overhead that no N removes. */
+static uint32_t qwen38_split_parts(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_GA_SPLIT_PARTS");
+        long v = env ? strtol(env, NULL, 10) : (long)QWEN38_GA_SPLIT_PARTS;
+        if (v < 1) v = 1;
+        if (v > 32) v = 32;
+        cached = (int)v;
+    }
+    return (uint32_t)cached;
+}
+
+
 static float *g_qwen38_split_scratch;
 static uint32_t g_qwen38_split_scratch_parts;
 
@@ -28280,24 +28294,22 @@ extern "C" int ds4_gpu_qwen38_ga_chunk(
      * the single-row kernel until the gain and the NLL drift are both known: a
      * diagnostic that measures is allowed, unexplained drift is not. */
     if (n_tokens == 1u && getenv("DS4_GA_SPLIT") != NULL) {
-        float *scratch = qwen38_split_scratch(QWEN38_GA_SPLIT_PARTS,
-                                             cuda_decode_stream());
+        const uint32_t parts = qwen38_split_parts();
+        float *scratch = qwen38_split_scratch(parts, cuda_decode_stream());
         if (!scratch) {
             fprintf(stderr, "ds4: Qwen GA split decode has no scratch\n");
             return 0;
         }
-        const dim3 split_grid(QWEN38_CUDA_GA_HEADS, 1u,
-                              QWEN38_GA_SPLIT_PARTS);
+        const dim3 split_grid(QWEN38_CUDA_GA_HEADS, 1u, parts);
         qwen38_ga_split_kernel<<<split_grid,256,0,cuda_decode_stream()>>>(
             scratch, (const float *)q_full->ptr,
             (const unsigned char *)k_cache->ptr,
             (const unsigned char *)v_cache->ptr, start_pos,
-            QWEN38_GA_SPLIT_PARTS, g_qwen38_kv_q8);
+            parts, g_qwen38_kv_q8);
         const dim3 combine_grid(QWEN38_CUDA_GA_HEADS, 1u, 1u);
         qwen38_ga_split_combine_kernel<<<combine_grid,256,0,
                                          cuda_decode_stream()>>>(
-            (float *)out->ptr, scratch, (const float *)q_full->ptr,
-            QWEN38_GA_SPLIT_PARTS);
+            (float *)out->ptr, scratch, (const float *)q_full->ptr, parts);
         return cuda_ok(cudaGetLastError(), "Qwen GA split decode launch");
     }
     /* The single-row shape is used for decode at every depth.  Staging the keys
