@@ -395,6 +395,39 @@ unchanged at 18.0-18.2 ms with 2.4 ms outside the windows.  The largest single
 item in a deep chunk is now the output head at 57.7 ms, ahead of the GDN at 48.8,
 the projections at 54.2 together and the GA attention at 47.8.
 
+The prefill's host launch path was investigated as a project of its own
+(`TODO-7e760186`: a CUDA graph over the layer loop) and the premise did not
+survive measurement, so it was closed.  What was found, in order:
+
+- `QWEN38PHASE-WALL`'s `outside_windows` is 111-119 ms of a ~342 ms chunk, and it
+  is **not** host idle time.  Moving the FFN's phase mark from mid-block to the
+  end of the block (a throwaway diagnostic) moved 57 ms between buckets without
+  changing the total, and the same is true of the output head's bucket, so what
+  lives in that 111 ms is the *unmarked* small work: norms, residuals, rope, the
+  convolution, the KV writes.
+- Host CPU contention does not move the prefill at all.  The engine is CPU-heavy
+  - 3.76 s of CPU over a 3.87 s wall, 97% of a core - but that work overlaps the
+  GPU.  The A/B, with the process pinned to one core:
+
+  | load on that core | chunk wall | GPU windows | outside |
+  |---|---|---|---|
+  | none | 341.8 | 230.0 | 111.8 |
+  | one spinner | 346.1 | 227.1 | 119.0 |
+  | two spinners (33% of a core) | 344.7 | 231.9 | 112.8 |
+
+  Two spinners on the engine's own core is *harsher* than the VM's 97% of a core
+  that the project was motivated by, and the number does not move: the host
+  launch cost is not on the critical path here.  A graph removes exactly that
+  cost, which is why the project has nothing to take.
+- The phase instrumentation itself costs 1.5% (1320/1321 tok/s with it,
+  1337/1344 without), so it is not what the numbers above are measuring.
+
+The one thing left unexplained is the 786 ms `outside_windows` recorded in the
+original session under VM load.  It is not reproducible with CPU contention - the
+harsher version of it above leaves the number where it was - so if it was real it
+was something else: the VM sharing the GPU, a driver or kernel state, or a
+different kind of load.  Recorded so that nobody re-derives it from scratch.
+
 A final experiment split Q8_1 activation quantization from MMVQ so the Qwen
 attention and FFN projections could share one quantized row. Three 538-token
 runs produced 798.1/798.4/787.3 warm prefill tok/s and
