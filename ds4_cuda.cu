@@ -28256,6 +28256,72 @@ __device__ static __forceinline__ void qwen38_ga_accumulate_q8(
     }
 }
 
+/* Reads from the shared tile rather than from the cache: the tile holds the
+ * bytes of one kv_head for the keys in flight, laid out one 272-byte slot per
+ * position (the q8_0 slot; q4_0 uses the first 144 of it), so the position
+ * stride is a constant and only the block offset depends on the format.  The
+ * arithmetic is the same expression the global readers use - same scale, same
+ * byte, same order - so a value read here is the value read there. */
+__device__ static __forceinline__ float qwen38_kv_tile_read(
+        const unsigned char *tile, uint64_t pos, uint32_t d, int kv_fmt) {
+    if (kv_fmt == 2) {
+        const unsigned char *blk = tile +
+            pos * QWEN38_KV_Q8_HEAD_BYTES + (uint64_t)(d >> 5) * 18u;
+        const uint32_t q =
+            (blk[2u + ((d & 31u) >> 1)] >> ((d & 1u) * 4u)) & 15u;
+        return __half2float(*(const __half *)blk) * (float)((int)q - 8);
+    }
+    {
+        const unsigned char *blk = tile +
+            pos * QWEN38_KV_Q8_HEAD_BYTES + (uint64_t)(d >> 5) * 34u;
+        return __half2float(*(const __half *)blk) *
+            (float)((const int8_t *)blk)[2u + (d & 31u)];
+    }
+}
+
+__device__ static __forceinline__ float qwen38_ga_score_part_tile(
+        const unsigned char *k, uint32_t key, uint32_t lane, int kv_fmt,
+        float q0, float q32, float q64, float q96,
+        float q128, float q160, float q192, float q224) {
+    float p0 = q0 * qwen38_kv_tile_read(k, key, lane, kv_fmt);
+    p0 += q128 * qwen38_kv_tile_read(k, key, lane + 128u, kv_fmt);
+    float p1 = q64 * qwen38_kv_tile_read(k, key, lane + 64u, kv_fmt);
+    p1 += q192 * qwen38_kv_tile_read(k, key, lane + 192u, kv_fmt);
+    p0 += p1;
+    float p2 = q32 * qwen38_kv_tile_read(k, key, lane + 32u, kv_fmt);
+    p2 += q160 * qwen38_kv_tile_read(k, key, lane + 160u, kv_fmt);
+    float p3 = q96 * qwen38_kv_tile_read(k, key, lane + 96u, kv_fmt);
+    p3 += q224 * qwen38_kv_tile_read(k, key, lane + 224u, kv_fmt);
+    p2 += p3;
+    p0 += p2;
+    return p0;
+}
+
+__device__ static __forceinline__ void qwen38_ga_accumulate_tile(
+        const unsigned char *v, uint32_t key, uint32_t lane, int kv_fmt,
+        float old_scale, float probability, float *accum) {
+#pragma unroll
+    for (uint32_t j = 0; j < 8u; j++) {
+        accum[j] = accum[j] * old_scale +
+            probability * qwen38_kv_tile_read(v, key, lane + 32u * j, kv_fmt);
+    }
+}
+
+/* Prefill shape of the quantized KV attention: the tiled, two-rows-per-warp
+ * structure of the f16 kernel, reading the cache's own bytes out of shared
+ * memory.
+ *
+ * This kernel used to read the cache from global memory for every (row, key)
+ * pair, so the eight rows of a block re-read the same values eight times, and it
+ * had none of the three shape changes the f16 kernel got.  Measured on the
+ * deepest prefill chunk it was 143.5 ms in q8_0 and 126.1 in q4_0 against 47.6
+ * for f16, and the tile is what pays: 32 keys of one kv_head is 8.7 KiB per
+ * tensor in q8_0 and 4.6 KiB in q4_0 against 32 KiB in f16, so this kernel has
+ * more of the SM left over than the f16 one.
+ *
+ * Alignment: one position of one head is 272 bytes in q8_0 and 144 in q4_0 and
+ * one position of all four heads is 1088 and 576 - all multiples of sixteen - so
+ * every uint4 in the staging copy is aligned by construction. */
 __global__ static void qwen38_ga_decode_kernel_q8(
         float *out, const float *q_full, const unsigned char *k_cache,
         const unsigned char *v_cache, uint32_t start_pos, uint32_t n_tokens,
@@ -28265,55 +28331,112 @@ __global__ static void qwen38_ga_decode_kernel_q8(
     const uint32_t head = blockIdx.x;
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
-    const uint32_t block_row0 = blockIdx.y * 8u;
-    const uint32_t block_rows = n_tokens - block_row0 < 8u ?
-        n_tokens - block_row0 : 8u;
-    const bool owns_row = warp < block_rows;
-    const uint32_t row = owns_row ? block_row0 + warp : 0u;
+    const uint32_t block_row0 = blockIdx.y * 16u;
+    const uint32_t row_a = block_row0 + warp * 2u;
+    const uint32_t row_b = row_a + 1u;
+    /* A warp that owns no row still reaches every barrier in the tile loop: the
+     * loop bound has to be uniform across the block. */
+    const bool owns_row = row_a < n_tokens;
+    const bool owns_row2 = row_b < n_tokens;
     const uint32_t kv_head = head / queries_per_kv;
-    const uint32_t pos = start_pos + row;
-    const float *q = q_full + (uint64_t)row * 12288u +
+    const uint32_t pos_a = start_pos + row_a;
+    const uint32_t pos_b = start_pos + row_b;
+    const float *q = q_full + (uint64_t)row_a * 12288u +
+        (uint64_t)head * 2u * QWEN38_CUDA_GA_HEAD_DIM;
+    const float *q2 = q_full + (uint64_t)(owns_row2 ? row_b : 0u) * 12288u +
         (uint64_t)head * 2u * QWEN38_CUDA_GA_HEAD_DIM;
     float accum[8];
+    float accum2[8];
     float gates[8];
+    float gates2[8];
+    float qa[8];
+    float qb[8];
 #pragma unroll
     for (uint32_t j = 0; j < 8u; j++) {
         accum[j] = 0.0f;
+        accum2[j] = 0.0f;
+        qa[j] = owns_row ? q[lane + 32u * j] : 0.0f;
+        qb[j] = owns_row2 ? q2[lane + 32u * j] : 0.0f;
         gates[j] = owns_row ? q[QWEN38_CUDA_GA_HEAD_DIM + lane + 32u * j] : 0.0f;
+        gates2[j] =
+            owns_row2 ? q2[QWEN38_CUDA_GA_HEAD_DIM + lane + 32u * j] : 0.0f;
     }
-    const float q0 = owns_row ? q[lane] : 0.0f;
-    const float q32 = owns_row ? q[lane + 32u] : 0.0f;
-    const float q64 = owns_row ? q[lane + 64u] : 0.0f;
-    const float q96 = owns_row ? q[lane + 96u] : 0.0f;
-    const float q128 = owns_row ? q[lane + 128u] : 0.0f;
-    const float q160 = owns_row ? q[lane + 160u] : 0.0f;
-    const float q192 = owns_row ? q[lane + 192u] : 0.0f;
-    const float q224 = owns_row ? q[lane + 224u] : 0.0f;
     float denominator = 0.0f;
-    float maximum = -INFINITY;
-    if (owns_row) {
-        for (uint32_t token = 0; token <= pos; token++) {
-            const uint64_t base = (uint64_t)token * QWEN38_CUDA_GA_HEADS_KV *
-                    QWEN38_CUDA_GA_HEAD_DIM +
-                (uint64_t)kv_head * QWEN38_CUDA_GA_HEAD_DIM;
-            float old_scale = 0.0f;
-            float probability = 0.0f;
-            const float dot = warp_sum_f32(qwen38_ga_score_part_q8(k_cache,
-                base, lane, kv_fmt, q0, q32, q64, q96, q128, q160, q192,
-                q224));
-            qwen38_ga_softmax_step(dot, lane, &maximum, &denominator,
-                &old_scale, &probability);
-            qwen38_ga_accumulate_q8(v_cache, base, lane, kv_fmt, old_scale,
-                probability, accum);
+    float denominator2 = 0.0f;
+    float maximum = QWEN38_GA_SCORE_FLOOR;
+    float maximum2 = QWEN38_GA_SCORE_FLOOR;
+    __shared__ __align__(16) unsigned char
+        k_tile[QWEN38_CUDA_GA_TILE * QWEN38_KV_Q8_HEAD_BYTES];
+    __shared__ __align__(16) unsigned char
+        v_tile[QWEN38_CUDA_GA_TILE * QWEN38_KV_Q8_HEAD_BYTES];
+    const uint32_t block_last = start_pos +
+        (block_row0 + 15u < n_tokens ? block_row0 + 15u : n_tokens - 1u);
+    const uint32_t head_bytes = (kv_fmt == 2) ? QWEN38_KV_Q4_HEAD_BYTES
+                                              : QWEN38_KV_Q8_HEAD_BYTES;
+    const uint32_t pos_bytes = (kv_fmt == 2) ? QWEN38_KV_Q4_POS_BYTES
+                                             : QWEN38_KV_Q8_POS_BYTES;
+    const uint32_t chunks = head_bytes >> 4u;
+    for (uint32_t tile0 = 0; tile0 <= block_last; tile0 += QWEN38_CUDA_GA_TILE) {
+        const uint32_t tile_n =
+            block_last - tile0 + 1u < QWEN38_CUDA_GA_TILE ?
+            block_last - tile0 + 1u : QWEN38_CUDA_GA_TILE;
+        __syncthreads();
+        /* Sixteen bytes at a time: 17 chunks per position in q8_0 and 9 in q4_0,
+         * all of them aligned. */
+        for (uint32_t i = threadIdx.x; i < tile_n * chunks; i += blockDim.x) {
+            const uint32_t key = i / chunks;
+            const uint32_t chunk = i - key * chunks;
+            const uint64_t src = (uint64_t)(tile0 + key) * pos_bytes +
+                (uint64_t)kv_head * head_bytes + (uint64_t)chunk * 16u;
+            const uint64_t dst = (uint64_t)key * QWEN38_KV_Q8_HEAD_BYTES +
+                (uint64_t)chunk * 16u;
+            *(uint4 *)(k_tile + dst) = *(const uint4 *)(k_cache + src);
+            *(uint4 *)(v_tile + dst) = *(const uint4 *)(v_cache + src);
+        }
+        __syncthreads();
+        {
+            const uint32_t avail_a = (owns_row && pos_a >= tile0) ?
+                (pos_a - tile0 + 1u < tile_n ? pos_a - tile0 + 1u : tile_n) : 0u;
+            const uint32_t avail_b = (owns_row2 && pos_b >= tile0) ?
+                (pos_b - tile0 + 1u < tile_n ? pos_b - tile0 + 1u : tile_n) : 0u;
+            const uint32_t avail = avail_a > avail_b ? avail_a : avail_b;
+            for (uint32_t token = 0; token < avail; token++) {
+                float dot = qwen38_warp_sum_all(qwen38_ga_score_part_tile(
+                    k_tile, token, lane, kv_fmt, qa[0], qa[1], qa[2], qa[3],
+                    qa[4], qa[5], qa[6], qa[7]));
+                float dot2 = qwen38_warp_sum_all(qwen38_ga_score_part_tile(
+                    k_tile, token, lane, kv_fmt, qb[0], qb[1], qb[2], qb[3],
+                    qb[4], qb[5], qb[6], qb[7]));
+                if (token >= avail_a) dot = -INFINITY;
+                if (token >= avail_b) dot2 = -INFINITY;
+                float old_scale = 0.0f;
+                float probability = 0.0f;
+                float old_scale2 = 0.0f;
+                float probability2 = 0.0f;
+                qwen38_ga_softmax_uniform(dot, &maximum, &denominator,
+                    &old_scale, &probability);
+                qwen38_ga_softmax_uniform(dot2, &maximum2, &denominator2,
+                    &old_scale2, &probability2);
+                qwen38_ga_accumulate_tile(v_tile, token, lane, kv_fmt,
+                    old_scale, probability, accum);
+                qwen38_ga_accumulate_tile(v_tile, token, lane, kv_fmt,
+                    old_scale2, probability2, accum2);
+            }
         }
     }
     if (!owns_row) return;
-    denominator = __shfl_sync(0xffffffffu, denominator, 0);
 #pragma unroll
     for (uint32_t j = 0; j < 8u; j++) {
-        out[(uint64_t)row * QWEN38_CUDA_VALUE_DIM +
-            (uint64_t)head * QWEN38_CUDA_GA_HEAD_DIM + lane + 32u * j] =
+        const uint32_t dim = lane + 32u * j;
+        out[(uint64_t)row_a * QWEN38_CUDA_VALUE_DIM +
+            (uint64_t)head * QWEN38_CUDA_GA_HEAD_DIM + dim] =
             accum[j] / denominator * (1.0f / (1.0f + expf(-gates[j])));
+        if (owns_row2) {
+            out[(uint64_t)row_b * QWEN38_CUDA_VALUE_DIM +
+                (uint64_t)head * QWEN38_CUDA_GA_HEAD_DIM + dim] =
+                accum2[j] / denominator2 *
+                (1.0f / (1.0f + expf(-gates2[j])));
+        }
     }
 }
 

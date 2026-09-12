@@ -656,17 +656,42 @@ f16 and 1 min 26 s in q8_0, a factor of about 1.8 that shows up in the prefill
 rate (514 against 282 tokens/s).
 
 Staging a shared tile in the q8_0 prefill twin was the obvious candidate and it
-was tried: 8704 bytes per side against 16384 in f16, and the copy is one
+was tried early, on its own: 8704 bytes per side against 16384 in f16, one
 contiguous run per (key, head) rather than a strided gather. It measured nothing,
-1 min 24 s against 1 min 26 s, and was reverted. The reason is the same one that
-makes the deep decode slow: this attention is bound by the per-key latency chain,
-not by memory traffic, and dequantizing a q8_0 value adds a byte load, a scale
-load, a conversion and a multiply *inside that chain* - against one load and a
-conversion in f16. A tile removes traffic that was never the limit.
+1 min 24 s against 1 min 26 s, and was reverted. That result was correct and the
+conclusion drawn from it was incomplete: the tile removes traffic, and traffic
+was not the limit *while the per-key chain was still long*, because dequantizing
+a q8_0 value adds a byte load, a scale load, a conversion and a multiply inside
+that chain against one load and a conversion in f16. Once the chain itself got
+shorter - two query rows sharing one dequantization, and the online softmax off
+lane 0 and onto every lane - the traffic the tile removes became visible, and the
+tile came back as part of the same rewrite.
 
-So the q8_0 prefill cost is structural, not a missing optimization, and the fix
-for it is the same as for the depth decode: shorten or parallelise the chain,
-which changes the softmax association and needs a re-baseline.
+Measured on the deepest prefill chunk of a 2000-token prompt, GA attention core
+in ms, before and after:
+
+| KV | before | after | prefill before | prefill after |
+|---|---|---|---|---|
+| f16 | 47.6 | 47.6 | 1314 | 1314 t/s |
+| q8_0 | **252.3** | **153.5** | 941 | **1094 t/s** |
+| q4_0 | **223.4** | **167.8** | 893 | **1098 t/s** |
+
+So the quantized prefill attention was 5.3x the f16 one and is now 3.2x, and the
+prefill rate gained 16% (q8_0) and 23% (q4_0). What is left is the dequantization
+arithmetic itself, which is per value and inside the key loop; that part is
+structural and unchanged.
+
+One bug is worth recording because of where it hid. When the f16 kernel moved to
+two rows per warp, the shared grid became `(n+15)/16` while the quantized twin
+kept `blockIdx.y * 8`: it computed **half the rows** and nothing noticed, because
+the gates are decode gates - the session test evaluates the prompt one token at a
+time and never runs the chunk kernel - and on the test prompt the greedy
+continuation is identical either way. The regression now has a prefill gate: the
+same prompt in all three formats, compared to f16 rather than to a fixed number
+so it survives numerics-neutral work, with the tolerances calibrated on both
+sides (correct kernel 0.10 and 0.23, half-rows kernel 5.37 and 5.39). It was
+verified to fail on the broken build, because a test that cannot fail measures
+nothing.
 
 The kernels are duplicated rather than unified because the build uses
 `--use_fast_math`: an earlier attempt threaded a runtime flag through the shared

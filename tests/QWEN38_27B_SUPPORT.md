@@ -179,6 +179,14 @@ tokens f16 and q8_0 differ by less than that test can resolve; **q4_0 is the fir
 whose difference is outside the noise**, and the instrument that decides between
 them is the recall test, where all three answer four for four with identical text.
 
+The NLL gate is a decode gate - the session test evaluates the prompt one token at
+a time and never runs the chunk kernel a real request's prefill uses.  The
+regression now checks the prefill too, by running the same prompt in all three
+formats and comparing the first-token logit to f16 instead of to a fixed number,
+with tolerances calibrated on both sides.  It exists because a mismatch between
+the f16 and quantized chunk kernels' row indexing left half the rows stale and no
+gate above noticed.
+
 Writing neither flag is exactly the previous behaviour: f16 stays the release
 path and its gate is unchanged. The names are llama.cpp's, so the values are the
 ones that command line already has.
@@ -198,10 +206,16 @@ subtle degradation - the NLL figure is the measure for that.
 
 Three things to know before choosing it:
 
-- **Prefill is about 1.8x slower**: 282 tok/s against 514 on the same prompt.
-  The attention is bound by the per-key latency chain, and dequantizing a q8_0
-  value costs a byte load, a scale load, a conversion and a multiply inside that
-  chain. A shared-memory tile was tried for this and measured nothing.
+- **Prefill is about 1.2x slower**: 1094 tok/s (`q8_0`) and 1098 (`q4_0`) against
+  1314 on the same prompt, where it used to be 941 and 893 against 1314.  The
+  dequantization is inside the per-key chain and that part is structural; what
+  changed is that the quantized prefill twin now has the same shape as the f16
+  one - a shared tile of the cache's own bytes, sixteen-byte staging, two query
+  rows per warp and the softmax off lane 0 - which moved its attention core from
+  252 to 154 ms (`q8_0`) and from 223 to 168 (`q4_0`) on the deepest chunk.  A
+  shared-memory tile alone had been tried earlier and measured nothing: it
+  removes traffic, and traffic was not the limit while each row still walked the
+  key chain on its own.
 - **The disk KV cache refuses to write or read in a quantized session.** The
   payload header does not record the format yet, and a q8_0 cache reloaded as
   f16 would decode garbage. The server reports the checkpoint as failed and
