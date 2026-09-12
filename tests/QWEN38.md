@@ -434,6 +434,26 @@ score.  The finder was a new diagnostic, `DS4_QWEN38_GA_DUMP`, which prints the
 first GA layer's attention rows: it turned "1-5 logits off" into "NaN in most
 dimensions, row 0 identical".
 
+The quantized twin got the same treatment and it **lost**, which is worth
+recording because the reason is structural rather than a mistake: q8_0's attention
+core went from 72.6 to **122.6 ms** (q4_0 72.7 to 112.1) with the tensor-core body
+and a tile of f16 - half the shared a float tile needs, and lossless, since q8_0
+and q4_0 are eight and four bits of code behind an f16 scale.  Reverted.
+
+The FA-2 body is so cheap that the *staging* becomes the wall: dequantizing a value
+costs four to six instructions, a 32-key tile is 16384 of them, and 160 threads
+means about **600 instructions per thread per tile** against a body of 240 (QK) and
+154 (PV).  In the scalar kernel the body was around 4600 instructions per warp per
+tile, so the dequantization hid inside it.  Making the body twenty times cheaper did
+not make it faster; it exposed what was always underneath.
+
+And it is paid **twenty-nine times over**: every row block of a head re-stages and
+re-dequantizes the same keys.  So the fix is not a faster dequantization but a
+single one - dequantize the chunk's key range once into a scratch buffer, per layer,
+and let every block read f16 from there.  That is a new kernel and a buffer of the
+chunk's key range (40 MiB at 19.5k, transient and reused per layer, so it fits), and
+it would pay the dequantization once instead of twenty-nine times.
+
 The prefill's host launch path was investigated as a project of its own
 (`TODO-7e760186`: a CUDA graph over the layer loop) and the premise did not
 survive measurement, so it was closed.  What was found, in order:
