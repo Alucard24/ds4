@@ -490,6 +490,29 @@ one, and the numbers above are what it is worth: recorded in `TODO-52b82ef4` wit
 the fragment layouts and the two decisions, so it starts from a measurement
 instead of an estimate.
 
+The full FA-2 shape was then written and measured: **1.56x faster** (GA core
+30.3/30.4/30.4 ms against 47.3/47.4/47.4, chunk 209 against 226) with the budget
+respected - 79 registers against the scalar kernel's 79, 33.9 KiB shared, three
+blocks per SM - which is what the staged attempt had failed to do.  Structurally
+it works: five warps, one doing QK with HMMA m16n8k16 and the online softmax, four
+doing the PV for 64 output dimensions each, the k loop outer and the n loop inner
+so only four registers of the Q fragment are live at a time.
+
+It is **not numerically right** and was not promoted: the first-token logits sit
+1 to 5 away from the scalar kernel's, in a way that does not grow with prompt
+length (5.7 at 16 tokens, 0.8 at 96), which is the signature of a near miss in a
+fragment layout rather than of a wrong idea.  Seven bugs were found and fixed on
+the way - the B fragment's key index and its packed pair in both the QK and the
+PV, reads past the chunk in the query fragment, a `__syncthreads` inside a branch
+(only one warp reached it), the missing attention scale, and a shared denominator
+that was not rescaled with the register one.  What is left is the one thing that
+was never checked: **the spike's fragment layouts were verified to build and to
+time, never to compute the right numbers**, and a mirrored layout produces exactly
+this symptom - scores that are correlated with the right ones but not equal.
+
+So the first step next time is a numerical unit test of the two MMAs against a
+scalar product, not another kernel.
+
 The obvious shortcut was tried first - keep the whole kernel, add a ninth warp for
 the MMAs, hand the scores over through shared memory - and it is a **measured
 loss**: 57.6/57.8 ms against 47.8/48.2 for the scalar kernel on the deepest chunk,
