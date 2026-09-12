@@ -395,6 +395,45 @@ unchanged at 18.0-18.2 ms with 2.4 ms outside the windows.  The largest single
 item in a deep chunk is now the output head at 57.7 ms, ahead of the GDN at 48.8,
 the projections at 54.2 together and the GA attention at 47.8.
 
+The attention's dot product went to the tensor cores.  The last untouched item of
+the prefill, worth 48 of the chunk's 227 ms, is the QK^T: measured in isolation the
+body costs 0.246 ns per (key, row) and the scalar dot plus its butterfly is 0.1357
+of it, against **0.0191** for the same dot as HMMA m16n8k16 - 7.1x cheaper.
+
+The shape that takes it is flash-attention-2, after a first attempt failed for a
+reason worth keeping: keeping the whole kernel and adding a ninth warp for the MMAs
+spent the register budget (126 registers, 43 KiB shared, one resident block per SM
+instead of three) and measured 20% *slower*.  Register allocation is uniform across
+a kernel's warps, so the score warp's half fragment and the staged query cost every
+warp.  The working shape is five warps per block - one on QK with the online
+softmax, four on the PV for 64 output dimensions each - with the k loop outside the
+n loop so only four registers of the Q fragment are live at a time, and 79 registers
+against the scalar kernel's 79.
+
+    GA attention core   47.6-48.9 -> 28.1-31.4 ms
+    chunk total        229-230 -> 209-215 ms
+    prefill end to end 1296 -> 1332 tok/s
+
+The remaining 48 ms of attention cost is the number the tensor cores buy, and it is
+a **declared numerics change**: the query and P are rounded to f16, which moves the
+first-token logit by at most 0.17 against the scalar kernel where `-ctk q4_0`
+already accepts 0.25.  Verified rather than assumed: the recall at 19583 tokens with
+four access codes answers four for four, the decode NLL gate is untouched at
+1.80954673 (the decode has its own kernel and the KV is written by the prepare
+kernel), and the prefill gate across the three formats still passes with deltas of
+0.0117 (q8_0) and 0.3198 (q4_0).
+
+Two bugs of the first FA-2 are worth remembering because of how they hid.  The PV
+always runs over 32 keys, so the tile's tail past the last valid one had to be
+zeroed: a masked key contributes 0 * V, and with uninitialized shared memory that is
+0 * NaN, which is why the first tile produced NaNs and why the error *fell* with
+prompt length (5.7 logits at 16 tokens, 0.9 at 96).  And the k16 A fragment had its
+two row pairs swapped - PTX wants (row+8, col) before (row, col+8) - which moves
+half of the k extent to the wrong row group and costs about half the dot in the
+score.  The finder was a new diagnostic, `DS4_QWEN38_GA_DUMP`, which prints the
+first GA layer's attention rows: it turned "1-5 logits off" into "NaN in most
+dimensions, row 0 identical".
+
 The prefill's host launch path was investigated as a project of its own
 (`TODO-7e760186`: a CUDA graph over the layer loop) and the premise did not
 survive measurement, so it was closed.  What was found, in order:

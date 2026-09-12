@@ -179,6 +179,12 @@ tokens f16 and q8_0 differ by less than that test can resolve; **q4_0 is the fir
 whose difference is outside the noise**, and the instrument that decides between
 them is the recall test, where all three answer four for four with identical text.
 
+The f16 prefill runs its attention on tensor cores (flash-attention-2 shape): the
+query and the attention weights are rounded to f16, which moves the first-token
+logit by at most 0.17 where `-ctk q4_0` already accepts 0.25, and buys 1.6x on the
+attention and about 3% of prefill.  The recall at 19583 tokens is unaffected: four
+for four.  The decode path is a different kernel and is untouched.
+
 The NLL gate is a decode gate - the session test evaluates the prompt one token at
 a time and never runs the chunk kernel a real request's prefill uses.  The
 regression now checks the prefill too, by running the same prompt in all three
