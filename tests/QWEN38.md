@@ -486,7 +486,7 @@ Two obstacles the spike made explicit, both structural and neither fatal:
    accumulators, rescaling on the max and denominator the first warp broadcasts.
 
 That is a kernel rewrite of a few hundred lines, not a change to the existing
-one, and the numbers above are what it is worth: recorded in `TODO-4c19d8` with
+one, and the numbers above are what it is worth: recorded in `TODO-52b82ef4` with
 the fragment layouts and the two decisions, so it starts from a measurement
 instead of an estimate.
 
