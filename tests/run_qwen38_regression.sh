@@ -103,6 +103,39 @@ awk -v a="$l_f16" -v b="$l_q8" -v c="$l_q4" 'BEGIN {
     }
 }'
 
+echo "===== recall at depth, the quality gate for the prefill ====="
+# The prefill's attention moved to tensor cores (f16 Q and P) and its only
+# *quality* gate is this one: four access codes at 2%, 25%, 50% and 75% of a
+# ~19.5k-token document, asked for at the end and answered by greedy decode.
+# Generated here in shell so no 78 KiB fixture has to be committed; 378 lines of
+# this filler is about 19.5k tokens, and a wrong count shows up as a refusal to
+# start rather than as a silent pass.
+NEEDLE=/tmp/ds4-regression-needle.txt
+awk -v lines=378 '
+BEGIN {
+    filler = "The maintenance log for the northern relay station records routine checks, weather observations and equipment notes in the order they were written, each entry dated and signed by the operator on duty that day.";
+    codes[1] = "PASS-A-4821"; codes[2] = "PASS-B-1397"; codes[3] = "PASS-C-7342"; codes[4] = "PASS-D-9615";
+    at[1] = int(lines * 0.02); at[2] = int(lines * 0.25); at[3] = int(lines * 0.50); at[4] = int(lines * 0.75);
+    for (i = 0; i < lines; i++) {
+        for (c = 1; c <= 4; c++) if (i == at[c]) printf("Access code %s.\n", codes[c]);
+        print filler;
+    }
+    print "";
+    print "Question: list the four access codes in this document, in the order they appear, separated by spaces.";
+    print "Answer:";
+}' > "$NEEDLE"
+recall=$(./ds4 -m "$MODEL" -c 24576 --raw --temp 0 -p "$(cat "$NEEDLE")" -n 200 2>/dev/null || true)
+hits=0
+for code in PASS-A-4821 PASS-B-1397 PASS-C-7342 PASS-D-9615; do
+    case "$recall" in *"$code"*) hits=$((hits + 1)) ;; esac
+done
+if [ "$hits" = "4" ]; then
+    echo "recall at ~19.5k: 4/4 codes"
+else
+    echo "recall at ~19.5k: $hits/4 codes (expected A-4821 B-1397 C-7342 D-9615)"
+    exit 1
+fi
+
 echo "===== tokenizer vectors ====="
 make test-tokenizer-vectors 2>/dev/null || echo "(tokenizer vectors target not present; covered by run_qwen38_cpu.sh)"
 
