@@ -28065,7 +28065,7 @@ extern "C" int ds4_gpu_qwen38_kv_quant_is_q8(void) {
  * bitten three times by --use_fast_math changing an untouched branch when a
  * shared helper grew a runtime test.
  */
-#define QWEN38_GA_SPLIT_PARTS 8
+#define QWEN38_GA_SPLIT_PARTS 64
 #define QWEN38_GA_SPLIT_STRIDE 258u   /* max, denominator, 256 accumulators */
 
 __global__ static void qwen38_ga_split_kernel(
@@ -28213,19 +28213,12 @@ __global__ static void qwen38_ga_split_combine_kernel(
         acc / denominator * (1.0f / (1.0f + expf(-gate)));
 }
 
-/* How many parts the split uses.  Read once: the point of varying it is to find
- * where the parallelism stops paying, which the two-parameter model says is
- * around 28 ms of traffic and overhead that no N removes. */
+/* How many parts the decode splits its key range into.  Measured at 21.510
+ * tokens: 5.25 tok/s without, 23.97 at 8, 30.36 at 64, 30.45 at 128 - so 64 is
+ * where it stops paying.  At 4k it is 46.7 against 20.7 for the single-row
+ * shape, so it is not a deep-context special case either. */
 static uint32_t qwen38_split_parts(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *env = getenv("DS4_GA_SPLIT_PARTS");
-        long v = env ? strtol(env, NULL, 10) : (long)QWEN38_GA_SPLIT_PARTS;
-        if (v < 1) v = 1;
-        if (v > 32) v = 32;
-        cached = (int)v;
-    }
-    return (uint32_t)cached;
+    return QWEN38_GA_SPLIT_PARTS;
 }
 
 
@@ -28316,10 +28309,14 @@ extern "C" int ds4_gpu_qwen38_ga_chunk(
             (g_qwen38_kv_q8 ? QWEN38_KV_Q8_POS_BYTES : 2048u) ||
         v_cache->bytes < (uint64_t)ctx_size *
             (g_qwen38_kv_q8 ? QWEN38_KV_Q8_POS_BYTES : 2048u)) return 0;
-    /* Split-KV, behind DS4_GA_SPLIT while it is measured.  The release path stays
-     * the single-row kernel until the gain and the NLL drift are both known: a
-     * diagnostic that measures is allowed, unexplained drift is not. */
-    if (n_tokens == 1u && getenv("DS4_GA_SPLIT") != NULL) {
+    /* Split-KV is the decode path.  It replaces the single-row shape, which
+     * walked the whole key range in one block per head: measured at 21.510
+     * tokens that cost 5.25 tok/s against 30.4 here, and at 4k it was 20.7
+     * against 46.7, so it is better at every depth and not a special case.
+     * The two shapes do not produce identical floats - combining partial
+     * softmax states re-associates the sum, which is the re-baselined NLL
+     * 1.80954673 against 1.81334038 - so this is one path, not a switch. */
+    if (n_tokens == 1u) {
         const uint32_t parts = qwen38_split_parts();
         float *scratch = qwen38_split_scratch(parts, cuda_decode_stream());
         if (!scratch) {

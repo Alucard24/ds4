@@ -220,10 +220,12 @@ whole key range. A split-KV variant (the key range cut into parts, combined with
 second kernel) measures **5.8x** at 21.5k, saturating at 30.4 tok/s, with recall
 unchanged.
 
-It is **not** a supported mode while two things are open: about 30 ms per token of
-the remaining 33 are unexplained, and promoting it moves the trunk NLL to
-1.80954673 (the softmax association changes). It is reachable with
-`DS4_GA_SPLIT=1 DS4_GA_SPLIT_PARTS=N` for measurement only.
+It is **the decode path now** (64 parts), and the remaining cost is understood:
+of the 28 ms a token takes at 19.5k, 16.3 are the q/k/v projections - that is the
+10.95 GiB of weights streamed once per token, about 640 GB/s, which a single token
+cannot avoid - 8.5 are the attention, and 2.4 everything else. The trunk NLL moved
+with it, from 1.81334038 to 1.80954673, because combining partial softmax states
+re-associates the sum.
 
 Also worth knowing: **MTP drafting only pays at short contexts.** At 24k it buys
 about 3% (4.56 against 4.43 tok/s) because each draft walks the same long key

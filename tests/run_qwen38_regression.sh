@@ -38,15 +38,17 @@ DS4_TEST_QWEN38_CUDA=1 ./tests/test_qwen38_session_cuda "$MODEL" "$PROMPT"
 
 echo "===== the same gate with the q8_0 KV cache ====="
 # DS4_KV_Q8 is the hook the test binaries use, since they take no engine
-# options.  Its NLL is its own documented baseline: the reference comparison
-# fails on purpose (the drift is the feature), so what is asserted here is the
-# number itself, which is the thing that would move if the q8_0 path regressed.
+# options.  What is asserted is the number itself, which is the thing that would
+# move if the q8_0 path regressed.  Note what this test can and cannot say: over
+# 16 tokens the two formats are 1.80954673 against 1.80900178, which is inside
+# its noise - the format comparison is the recall test, where both answer four
+# for four with identical text.
 nll_q8=$(DS4_KV_Q8=1 DS4_TEST_QWEN38_CUDA=1 ./tests/test_qwen38_session_cuda "$MODEL" "$PROMPT" 2>&1 | grep '^MEAN_NLL' || true)
 case "$nll_q8" in
-  "MEAN_NLL 1.81927471 TOKENS 16")
+  "MEAN_NLL 1.80900178 TOKENS 16")
     echo "q8_0 KV NLL as recorded: $nll_q8" ;;
   *)
-    echo "q8_0 KV NLL changed from the recorded 1.81927471: $nll_q8"
+    echo "q8_0 KV NLL changed from the recorded 1.80900178: $nll_q8"
     exit 1 ;;
 esac
 

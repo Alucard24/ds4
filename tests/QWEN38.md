@@ -625,9 +625,11 @@ at the same depth on the same file. Recall does not suffer: four access codes at
 2/25/50/75% of a 19530-token prompt come back four for four, identical to f16
 without the split and to q8_0.
 
-  trunk NLL, release path          1.81334038   (session gate passes)
-  trunk NLL, split-KV              1.80954673   (the softmax association changes)
-  trunk NLL, q8_0 KV               1.81927471
+  trunk NLL, decode with split-KV  1.80954673   (the release path: this is the
+                                                 association the engine now uses,
+                                                 against 1.81334038 before it)
+  trunk NLL, q8_0 KV               1.80900178   (16 tokens: inside this test's
+                                                 noise against f16, see below)
 
 Four hypotheses have been measured and dropped on the way: the per-key load
 latency (a shared tile gives 3.95 against 4.43 tok/s), the partials in scratch
@@ -644,5 +646,7 @@ scratch holding the previous token's partials - attention-shaped numbers, so the
 NLL read a plausible 1.80977761. Only the layout change, which moved a number
 that had to stay still, exposed it.
 
-Selection is DS4_GA_SPLIT=1 with DS4_GA_SPLIT_PARTS=N, a diagnostic and not a
-supported mode: the release path is the single-row kernel, unchanged.
+It is the decode path now, at 64 parts, and not a switch: two shapes that
+disagree in the last bits cannot both be "the" engine. The single-row shape it
+replaced was better only before it was made correct - at 4k it measured 20.7
+tok/s against 46.7 for the split, at 21.5k 5.25 against 30.4.

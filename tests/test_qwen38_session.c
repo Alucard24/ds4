@@ -125,7 +125,7 @@ int main(int argc, char **argv) {
     if (use_cuda && !strcmp(argv[2],
             "The capital of France is Paris. The largest ocean on Earth is "
             "the Pacific Ocean.")) {
-        require(fabs(mean_nll - 1.81334038) <= 1.0e-5,
+        require(fabs(mean_nll - 1.80954673) <= 1.0e-5,
                 "CUDA reference NLL drift");
     }
     const int nv = 248320;
