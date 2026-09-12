@@ -672,14 +672,20 @@ in ms, before and after:
 
 | KV | before | after | prefill before | prefill after |
 |---|---|---|---|---|
-| f16 | 47.6 | 47.6 | 1314 | 1314 t/s |
-| q8_0 | **252.3** | **153.5** | 941 | **1094 t/s** |
-| q4_0 | **223.4** | **167.8** | 893 | **1098 t/s** |
+| f16 | 47.6 | 47.9 | 1314 | 1324 t/s |
+| q8_0 | **252.3** | **74.1** | 941 | **1269 t/s** |
+| q4_0 | **223.4** | **72.6** | 893 | **1266 t/s** |
 
-So the quantized prefill attention was 5.3x the f16 one and is now 3.2x, and the
-prefill rate gained 16% (q8_0) and 23% (q4_0). What is left is the dequantization
-arithmetic itself, which is per value and inside the key loop; that part is
-structural and unchanged.
+So the quantized prefill attention was 5.3x the f16 one and is now 1.5x, and the
+prefill rate gained 35% (q8_0) and 42% (q4_0) to within 4% of the f16 one.  The
+last step was the interesting one: the dequantization itself was per value *inside
+the key loop*, which is why the tile alone had never helped.  The tile now holds
+**dequantized floats**, written once by the staging pass and read by the same
+readers the f16 kernel uses, so the dequantization is paid once per value instead
+of once per (value, row).  Sixteen keys of dequantized floats are 32 KiB for both
+tensors, the same shared budget the f16 kernel uses.  The expression is unchanged
+- scale times code - so the emitted values are unchanged too, bit for bit (max
+logit delta 0.000000 over the same prefill, gate 1.80954673 on the f16 trunk).
 
 One bug is worth recording because of where it hid. When the f16 kernel moved to
 two rows per warp, the shared grid became `(n+15)/16` while the quantized twin

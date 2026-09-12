@@ -206,16 +206,15 @@ subtle degradation - the NLL figure is the measure for that.
 
 Three things to know before choosing it:
 
-- **Prefill is about 1.2x slower**: 1094 tok/s (`q8_0`) and 1098 (`q4_0`) against
-  1314 on the same prompt, where it used to be 941 and 893 against 1314.  The
-  dequantization is inside the per-key chain and that part is structural; what
-  changed is that the quantized prefill twin now has the same shape as the f16
-  one - a shared tile of the cache's own bytes, sixteen-byte staging, two query
-  rows per warp and the softmax off lane 0 - which moved its attention core from
-  252 to 154 ms (`q8_0`) and from 223 to 168 (`q4_0`) on the deepest chunk.  A
-  shared-memory tile alone had been tried earlier and measured nothing: it
-  removes traffic, and traffic was not the limit while each row still walked the
-  key chain on its own.
+- **Prefill is now within 4% of f16**: 1269 tok/s (`q8_0`) and 1266 (`q4_0`)
+  against 1324 on the same prompt, where it used to be 941 and 893.  The
+  quantized prefill twin now has the same shape as the f16 one - a shared tile,
+  two query rows per warp, the softmax off lane 0 - and, in the step that
+  mattered, its tile holds **dequantized floats** instead of the cache's bytes:
+  the dequantization is then paid once per value by the staging instead of once
+  per value *and row* inside the key loop, which is what had made a tile look
+  useless the first time it was tried.  Its attention core went from 252 ms to 74
+  (`q8_0`) and 223 to 73 (`q4_0`) on the deepest chunk, against f16's 48.
 - **The disk KV cache refuses to write or read in a quantized session.** The
   payload header does not record the format yet, and a q8_0 cache reloaded as
   f16 would decode garbage. The server reports the checkpoint as failed and

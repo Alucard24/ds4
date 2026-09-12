@@ -27678,6 +27678,10 @@ __device__ static __forceinline__ void qwen38_kv_q8_store(
 #define QWEN38_KV_Q4_POS_BYTES   576u
 #define QWEN38_KV_Q4_HEAD_BYTES  144u
 
+/* Keys per tile in the quantized prefill kernel: its tile holds dequantized
+ * floats, so half as many keys fit in the same 32 KiB the f16 kernel uses. */
+#define QWEN38_GA_TILE_Q (QWEN38_CUDA_GA_TILE / 2u)
+
 __device__ static __forceinline__ float qwen38_kv_q4_read(
         const unsigned char *cache, uint64_t idx) {
     const uint64_t pos = idx >> 10;
@@ -28279,6 +28283,39 @@ __device__ static __forceinline__ float qwen38_kv_tile_read(
     }
 }
 
+/* The tile holds dequantized floats, so the key loop reads them exactly the way
+ * the f16 kernel reads its halves and the dequantization is paid once per value
+ * instead of once per (value, row).  The expression is the same one the byte
+ * readers used - scale times code - so the values are the values they always
+ * produced. */
+__device__ static __forceinline__ float qwen38_ga_score_part_f32(
+        const float *k, uint64_t base, uint32_t lane,
+        float q0, float q32, float q64, float q96,
+        float q128, float q160, float q192, float q224) {
+    float p0 = q0 * k[base + lane];
+    p0 += q128 * k[base + lane + 128u];
+    float p1 = q64 * k[base + lane + 64u];
+    p1 += q192 * k[base + lane + 192u];
+    p0 += p1;
+    float p2 = q32 * k[base + lane + 32u];
+    p2 += q160 * k[base + lane + 160u];
+    float p3 = q96 * k[base + lane + 96u];
+    p3 += q224 * k[base + lane + 224u];
+    p2 += p3;
+    p0 += p2;
+    return p0;
+}
+
+__device__ static __forceinline__ void qwen38_ga_accumulate_f32(
+        const float *v, uint64_t base, uint32_t lane,
+        float old_scale, float probability, float *accum) {
+#pragma unroll
+    for (uint32_t j = 0; j < 8u; j++) {
+        accum[j] = accum[j] * old_scale +
+            probability * v[base + lane + 32u * j];
+    }
+}
+
 __device__ static __forceinline__ float qwen38_ga_score_part_tile(
         const unsigned char *k, uint32_t key, uint32_t lane, int kv_fmt,
         float q0, float q32, float q64, float q96,
@@ -28365,33 +28402,30 @@ __global__ static void qwen38_ga_decode_kernel_q8(
     float denominator2 = 0.0f;
     float maximum = QWEN38_GA_SCORE_FLOOR;
     float maximum2 = QWEN38_GA_SCORE_FLOOR;
-    __shared__ __align__(16) unsigned char
-        k_tile[QWEN38_CUDA_GA_TILE * QWEN38_KV_Q8_HEAD_BYTES];
-    __shared__ __align__(16) unsigned char
-        v_tile[QWEN38_CUDA_GA_TILE * QWEN38_KV_Q8_HEAD_BYTES];
+    /* Half the keys of the f16 kernel's tile, because a dequantized float tile
+     * is twice the size of one of halves: 16 keys x 256 values x 4 bytes is
+     * 16 KiB per tensor, 32 KiB for both, which is what the f16 kernel uses. */
+    __shared__ float k_tile[QWEN38_GA_TILE_Q * QWEN38_CUDA_GA_HEAD_DIM];
+    __shared__ float v_tile[QWEN38_GA_TILE_Q * QWEN38_CUDA_GA_HEAD_DIM];
     const uint32_t block_last = start_pos +
         (block_row0 + 15u < n_tokens ? block_row0 + 15u : n_tokens - 1u);
-    const uint32_t head_bytes = (kv_fmt == 2) ? QWEN38_KV_Q4_HEAD_BYTES
-                                              : QWEN38_KV_Q8_HEAD_BYTES;
-    const uint32_t pos_bytes = (kv_fmt == 2) ? QWEN38_KV_Q4_POS_BYTES
-                                             : QWEN38_KV_Q8_POS_BYTES;
-    const uint32_t chunks = head_bytes >> 4u;
-    for (uint32_t tile0 = 0; tile0 <= block_last; tile0 += QWEN38_CUDA_GA_TILE) {
+    for (uint32_t tile0 = 0; tile0 <= block_last; tile0 += QWEN38_GA_TILE_Q) {
         const uint32_t tile_n =
-            block_last - tile0 + 1u < QWEN38_CUDA_GA_TILE ?
-            block_last - tile0 + 1u : QWEN38_CUDA_GA_TILE;
+            block_last - tile0 + 1u < QWEN38_GA_TILE_Q ?
+            block_last - tile0 + 1u : QWEN38_GA_TILE_Q;
         __syncthreads();
-        /* Sixteen bytes at a time: 17 chunks per position in q8_0 and 9 in q4_0,
-         * all of them aligned. */
-        for (uint32_t i = threadIdx.x; i < tile_n * chunks; i += blockDim.x) {
-            const uint32_t key = i / chunks;
-            const uint32_t chunk = i - key * chunks;
-            const uint64_t src = (uint64_t)(tile0 + key) * pos_bytes +
-                (uint64_t)kv_head * head_bytes + (uint64_t)chunk * 16u;
-            const uint64_t dst = (uint64_t)key * QWEN38_KV_Q8_HEAD_BYTES +
-                (uint64_t)chunk * 16u;
-            *(uint4 *)(k_tile + dst) = *(const uint4 *)(k_cache + src);
-            *(uint4 *)(v_tile + dst) = *(const uint4 *)(v_cache + src);
+        /* Dequantize once, here, instead of once per key per row: the readers
+         * below are then the f16 kernel's readers with floats.  Budget one
+         * thread per value. */
+        for (uint32_t i = threadIdx.x; i < tile_n * QWEN38_CUDA_GA_HEAD_DIM;
+                i += blockDim.x) {
+            const uint32_t key = i / QWEN38_CUDA_GA_HEAD_DIM;
+            const uint32_t dim = i - key * QWEN38_CUDA_GA_HEAD_DIM;
+            const uint64_t at = (uint64_t)(tile0 + key) *
+                    QWEN38_CUDA_GA_HEADS_KV * QWEN38_CUDA_GA_HEAD_DIM +
+                (uint64_t)kv_head * QWEN38_CUDA_GA_HEAD_DIM + dim;
+            k_tile[i] = qwen38_kv_read_fmt(k_cache, at, kv_fmt);
+            v_tile[i] = qwen38_kv_read_fmt(v_cache, at, kv_fmt);
         }
         __syncthreads();
         {
@@ -28401,11 +28435,13 @@ __global__ static void qwen38_ga_decode_kernel_q8(
                 (pos_b - tile0 + 1u < tile_n ? pos_b - tile0 + 1u : tile_n) : 0u;
             const uint32_t avail = avail_a > avail_b ? avail_a : avail_b;
             for (uint32_t token = 0; token < avail; token++) {
-                float dot = qwen38_warp_sum_all(qwen38_ga_score_part_tile(
-                    k_tile, token, lane, kv_fmt, qa[0], qa[1], qa[2], qa[3],
+                const uint64_t tbase =
+                    (uint64_t)token * QWEN38_CUDA_GA_HEAD_DIM;
+                float dot = qwen38_warp_sum_all(qwen38_ga_score_part_f32(
+                    k_tile, tbase, lane, qa[0], qa[1], qa[2], qa[3],
                     qa[4], qa[5], qa[6], qa[7]));
-                float dot2 = qwen38_warp_sum_all(qwen38_ga_score_part_tile(
-                    k_tile, token, lane, kv_fmt, qb[0], qb[1], qb[2], qb[3],
+                float dot2 = qwen38_warp_sum_all(qwen38_ga_score_part_f32(
+                    k_tile, tbase, lane, qb[0], qb[1], qb[2], qb[3],
                     qb[4], qb[5], qb[6], qb[7]));
                 if (token >= avail_a) dot = -INFINITY;
                 if (token >= avail_b) dot2 = -INFINITY;
@@ -28417,9 +28453,9 @@ __global__ static void qwen38_ga_decode_kernel_q8(
                     &old_scale, &probability);
                 qwen38_ga_softmax_uniform(dot2, &maximum2, &denominator2,
                     &old_scale2, &probability2);
-                qwen38_ga_accumulate_tile(v_tile, token, lane, kv_fmt,
+                qwen38_ga_accumulate_f32(v_tile, tbase, lane,
                     old_scale, probability, accum);
-                qwen38_ga_accumulate_tile(v_tile, token, lane, kv_fmt,
+                qwen38_ga_accumulate_f32(v_tile, tbase, lane,
                     old_scale2, probability2, accum2);
             }
         }
