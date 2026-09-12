@@ -490,6 +490,32 @@ one, and the numbers above are what it is worth: recorded in `TODO-52b82ef4` wit
 the fragment layouts and the two decisions, so it starts from a measurement
 instead of an estimate.
 
+The obvious shortcut was tried first - keep the whole kernel, add a ninth warp for
+the MMAs, hand the scores over through shared memory - and it is a **measured
+loss**: 57.6/57.8 ms against 47.8/48.2 for the scalar kernel on the deepest chunk,
+20% slower, and reverted.  The reason is not the tensor cores, which do what the
+spike said; it is what the shortcut does to the rest of the kernel:
+
+| kernel | registers | shared | blocks per SM |
+|---|---|---|---|
+| scalar (release) | 79 | 32 KiB | **3** |
+| staged MMA | **126** | **43 KiB** | **1** |
+
+Register allocation is uniform across a kernel, so the score warp's 16x8 half
+fragment plus the staged query and the score board cut the resident blocks from
+three to one: a third of the latency hiding, which eats a dot that got seven times
+cheaper.  The spike's extrapolation was optimistic for exactly this reason - it
+measured the dot in a latency-dominated configuration of one warp per block and
+said nothing about the register and shared budget the real shape has to live in.
+
+So the viable form is the full FA-2 after all, with the output split across warps
+so that no warp holds a 16x256 accumulator, and with the register count as a
+first-class constraint rather than a consequence: under about 64 registers to keep
+three blocks resident.  Anything that keeps the 16-row score fragment in one warp's
+registers will land where this did.  There was also a real bug in the attempt worth
+recording: the staged query is read by the score warp before the key loop, so it
+needs a barrier right after the staging, and there was none.
+
 A final experiment split Q8_1 activation quantization from MMVQ so the Qwen
 attention and FFN projections could share one quantized row. Three 538-token
 runs produced 798.1/798.4/787.3 warm prefill tok/s and
