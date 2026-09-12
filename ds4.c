@@ -8970,6 +8970,23 @@ static int qwen38_gpu_forward_chunk(ds4_qwen38_gpu_state *st,
                 st->attn, st->q_full, st->attn_k_layer[ga],
                 st->attn_v_layer[ga], start_pos, n_tokens, st->ctx_size),
                 "GA attention");
+            /* Diagnostic: the first GA layer's attention output, for comparing
+             * the scalar and tensor-core kernels row by row.  Rows 0, 1 and the
+             * last, first sixteen dimensions each. */
+            if (getenv("DS4_QWEN38_GA_DUMP") && ga == 0 && start_pos == 0) {
+                float probe[16];
+                const uint32_t rows[3] = {0u, 1u, n_tokens - 1u};
+                for (uint32_t i = 0; i < 3u; i++) {
+                    if (!ds4_gpu_tensor_read(st->attn,
+                            (uint64_t)rows[i] * 6144u * 4u, probe,
+                            sizeof(probe)))
+                        fprintf(stderr, "GA_DUMP read failed\n");
+                    fprintf(stderr, "GA_DUMP row %u:", rows[i]);
+                    for (uint32_t j = 0; j < 16u; j++)
+                        fprintf(stderr, " %.6f", probe[j]);
+                    fprintf(stderr, "\n");
+                }
+            }
             qwen38_phase_mark(5);
             QWEN38_CHUNK_CHECK(qwen38_gpu_matvec_rows(
                 st->proj, m, l->attn_output, st->attn, n_tokens), "GA output");
