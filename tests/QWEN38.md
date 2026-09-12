@@ -428,6 +428,33 @@ harsher version of it above leaves the number where it was - so if it was real i
 was something else: the VM sharing the GPU, a driver or kernel state, or a
 different kind of load.  Recorded so that nobody re-derives it from scratch.
 
+The prefill chunk kernel was finally checked against the **CPU reference**, which
+is the one comparison that had never been made: the gates above are decode gates,
+and the prefill fingerprints compare the GPU against its own past.  Building the
+CPU side in a separate worktree (`git worktree add /tmp/ds4-cpu HEAD`, then
+`make cpu` there) keeps the CUDA build untouched, and the two binaries take the
+same prompt through `--dump-logprobs`.
+
+    prompt      cpu                                 gpu                                 argmax   logit deltas
+    16 tokens   561, 78802, 15822, 303              561, 78802, 15822, 303               same     0.014 - 0.038
+    96 tokens   561 (18.739616)                     561 (18.846823)                      same     0.020 - 0.107
+
+The second prompt is the interesting one: 96 tokens is one chunk and three 32-key
+tiles, so it covers the tile loop, the staging that repeats per tile, and the
+per-row masking that the two-rows-per-warp form introduced - which is exactly
+where a mistake would live.  Same argmax, and differences of the order a
+64-layer model accumulates between two implementations.
+
+This is a deliberate check, not a regression step: the CPU prefill replays tokens
+and runs at about 0.1 tok/s (96 tokens took 12 minutes of wall and 105 of CPU),
+so a gate that runs it would dominate the suite.  The 16-token version is about
+two minutes and can be repeated when the chunk kernel changes.
+
+It also gives the quantized path a real footing: the CPU has no quantized KV, so
+`-ctk`/`-ctv` can only be compared against the f16 GPU - but that f16 GPU is now
+the one validated here, and the quantized rates sit 0.009 (q8_0) and 0.25 (q4_0)
+away from it on the same prefill.
+
 A final experiment split Q8_1 activation quantization from MMVQ so the Qwen
 attention and FFN projections could share one quantized row. Three 538-token
 runs produced 798.1/798.4/787.3 warm prefill tok/s and
