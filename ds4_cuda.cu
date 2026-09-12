@@ -592,6 +592,36 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     return g_cuda_tmp;
 }
 
+/* Scratch for the GDN per-token scalars: four floats per (token, head), which
+ * is 356 KiB at the largest chunk.  Grown on demand and never shrunk. */
+static float *g_qwen38_gdn_scalars;
+static uint64_t g_qwen38_gdn_scalars_bytes;
+
+static float *qwen38_gdn_scalars_scratch(uint64_t count) {
+    const uint64_t bytes = count * sizeof(float);
+    if (bytes <= g_qwen38_gdn_scalars_bytes) return g_qwen38_gdn_scalars;
+    if (g_qwen38_gdn_scalars) {
+        if (!cuda_ok(cudaDeviceSynchronize(), "synchronize GDN scalar growth")) {
+            return nullptr;
+        }
+        ds4_gpu_decode_graphs_invalidate();
+        (void)cudaFree(g_qwen38_gdn_scalars);
+        g_qwen38_gdn_scalars = nullptr;
+        g_qwen38_gdn_scalars_bytes = 0;
+    }
+    void *ptr = nullptr;
+    if (cudaMalloc(&ptr, (size_t)bytes) != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA temp alloc failed for %s (%.2f MiB): %s\n",
+                "Qwen GDN scalars", (double)bytes / 1048576.0,
+                cudaGetErrorString(cudaGetLastError()));
+        (void)cudaGetLastError();
+        return nullptr;
+    }
+    g_qwen38_gdn_scalars = (float *)ptr;
+    g_qwen38_gdn_scalars_bytes = bytes;
+    return g_qwen38_gdn_scalars;
+}
+
 static void *tt_scratch_ensure(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (g_tt_scratch_bytes >= bytes) return g_tt_scratch;
@@ -4994,6 +5024,20 @@ __device__ static float warp_sum_f32(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
         v += __shfl_down_sync(0xffffffffu, v, offset);
     }
+    return v;
+}
+
+/* Butterfly form of the warp sum: every lane ends with the total instead of
+ * lane 0 alone.  The tree is the same one -- pairs at distance 16, then 8, 4,
+ * 2, 1, summed in that order -- so the value is bit-identical to warp_sum_f32;
+ * what changes is that nobody has to broadcast it afterwards, which is one
+ * shuffle and its latency less per reduction.  Used by the GA prefill attention
+ * and by the GDN recurrence, where reductions are 12 of the chain's shuffles per
+ * two rows. */
+__device__ static float qwen38_warp_sum_all(float v) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        v += __shfl_xor_sync(0xffffffffu, v, offset);
     return v;
 }
 
@@ -27282,10 +27326,107 @@ __global__ static void qwen38_conv_silu_kernel(
     history[2ull * QWEN38_CUDA_CONV_DIM + d] = h2;
 }
 
+/* The GDN recurrence is a serial scan: one block per head walks the chunk's
+ * tokens in order, because token t+1 needs token t's state.  Everything in that
+ * loop which does not depend on the state belongs outside it.  The ablation that
+ * measured this kernel says how much: of 73.7 ms on the deepest prefill chunk,
+ * the state-independent scalars were 12.8, the output normalization 7.8, and
+ * 17.9 was the barrier skeleton -- seven barriers per token, each exposing about
+ * 250 cycles, with a single block per SM and nothing to overlap them with.
+ *
+ * So the scalars are computed by a parallel kernel over (token, head) and the
+ * output normalization by another, which leaves the recurrence with two barriers
+ * per token: one after the normalized q/k are staged, one after the state rows
+ * are updated.  Every value keeps the tree it had, so the results are
+ * bit-identical; the two extra kernels are embarrassingly parallel and the
+ * traffic they add is four floats per (token, head).  The 464x48 work items of
+ * the scalar kernel also mean the idle SMs (48 blocks, 70 SMs) are busy for it.
+ *
+ * A 32-warp version of the recurrence, measured before this split, was slower
+ * (80.0/80.8/80.2 against 73.7 ms): the row loop is not a chain waiting to be
+ * shortened, and more warps make each barrier dearer.
+ */
+__global__ static void qwen38_gdn_scalars_kernel(
+        float *scalars, const float *qkv, const float *alpha,
+        const float *beta, const float *a, const float *dt,
+        uint32_t n_tokens) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t token = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    if (head >= QWEN38_CUDA_HEADS_V || token >= n_tokens) return;
+    const uint32_t qk_head = head % QWEN38_CUDA_HEADS_QK;
+    /* 128 threads = four warps: the same partials over the same 32-element
+     * groups as the 512-thread kernel produced, with the same all-zero groups
+     * the wider block fed in, so the sum is unchanged. */
+    __shared__ float rq[4], rk[4];
+    float qs = 0.0f, ks = 0.0f;
+    if (tid < QWEN38_CUDA_HEAD_DIM) {
+        const uint64_t qkv_row = (uint64_t)token * QWEN38_CUDA_CONV_DIM;
+        const float qv = qkv[qkv_row +
+            (uint64_t)qk_head * QWEN38_CUDA_HEAD_DIM + tid];
+        const float kv = qkv[qkv_row +
+            (uint64_t)QWEN38_CUDA_HEADS_QK * QWEN38_CUDA_HEAD_DIM +
+            (uint64_t)qk_head * QWEN38_CUDA_HEAD_DIM + tid];
+        qs = qv * qv;
+        ks = kv * kv;
+    }
+    qs = warp_sum_f32(qs);
+    ks = warp_sum_f32(ks);
+    if (lane == 0u) { rq[warp] = qs; rk[warp] = ks; }
+    __syncthreads();
+    if (tid == 0u) {
+        float qsum = 0.0f, ksum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; i++) { qsum += rq[i]; ksum += rk[i]; }
+        const uint64_t scalar = (uint64_t)token * QWEN38_CUDA_HEADS_V + head;
+        const float x = alpha[scalar] + dt[head];
+        const float softplus = x > 20.0f ? x : log1pf(expf(x));
+        float *slot = scalars + scalar * 4u;
+        slot[0] = ds4_cuda_rsqrtf(qsum + 1.0e-6f);
+        slot[1] = ds4_cuda_rsqrtf(ksum + 1.0e-6f);
+        slot[2] = expf(a[head] * softplus);
+        slot[3] = 1.0f / (1.0f + expf(-beta[scalar]));
+    }
+}
+
+__global__ static void qwen38_gdn_output_kernel(
+        float *out, const float *z, const float *norm, uint32_t n_tokens) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t token = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    if (head >= QWEN38_CUDA_HEADS_V || token >= n_tokens) return;
+    /* The raw attention result is already in `out`, written there by the
+     * recurrence; the per-head inverse norm is the same reduction the recurrence
+     * used to finish with, over the same thirty-two element groups, so the
+     * scale is the value it always was. */
+    __shared__ float ro[4];
+    const uint64_t base = (uint64_t)token * QWEN38_CUDA_VALUE_DIM +
+        (uint64_t)head * QWEN38_CUDA_HEAD_DIM;
+    const float ov = tid < QWEN38_CUDA_HEAD_DIM ? out[base + tid] : 0.0f;
+    const float os = warp_sum_f32(ov * ov);
+    if (lane == 0u) ro[warp] = os;
+    __syncthreads();
+    if (tid == 0u) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; i++) sum += ro[i];
+        ro[0] = ds4_cuda_rsqrtf(sum / QWEN38_CUDA_HEAD_DIM + 1.0e-6f);
+    }
+    __syncthreads();
+    if (tid < QWEN38_CUDA_HEAD_DIM) {
+        const float zg = z[base + tid];
+        out[base + tid] = out[base + tid] * ro[0] * norm[tid] *
+            (zg / (1.0f + expf(-zg)));
+    }
+}
+
 __global__ static void qwen38_gdn_decode_kernel(
-        float *out, float *state, const float *qkv, const float *z,
-        const float *alpha, const float *beta, const float *a,
-        const float *dt, const float *norm, uint32_t n_tokens) {
+        float *out, float *state, const float *qkv, const float *scalars,
+        uint32_t n_tokens) {
     const uint32_t head = blockIdx.x;
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
@@ -27296,14 +27437,16 @@ __global__ static void qwen38_gdn_decode_kernel(
      * of the 128 rows is the serial chain, and shortening it is what this block
      * shape buys.  The threads that own no q/k/o element contribute zeros to
      * those three reductions, and adding 0.0f is exact, so every reduction
-     * keeps its order and its value. */
+     * keeps its order and its value.
+     *
+     * A 1024-thread version of this kernel (32 warps, two passes of two rows per
+     * warp instead of four of one) was measured and is slower, 80.0/80.8/80.2 ms
+     * against 73.7 on the deepest chunk: the row loop is not a chain waiting to
+     * be shortened, and more warps make the per-token barriers dearer. */
     const bool owns_elt = tid < QWEN38_CUDA_HEAD_DIM;
 
     __shared__ float q[QWEN38_CUDA_HEAD_DIM];
     __shared__ float k[QWEN38_CUDA_HEAD_DIM];
-    __shared__ float o[QWEN38_CUDA_HEAD_DIM];
-    __shared__ float rq[16], rk[16], ro[16];
-    __shared__ float q_inv, k_inv, decay, beta_h;
     /* The recurrent state lives in shared memory for the whole token loop.
      * It used to be read and written in global memory once per token, and at
      * 64 KiB per head per token that is 103 GiB of traffic for a 350-token
@@ -27324,36 +27467,21 @@ __global__ static void qwen38_gdn_decode_kernel(
 
     for (uint32_t token = 0; token < n_tokens; token++) {
         const uint64_t qkv_row = (uint64_t)token * QWEN38_CUDA_CONV_DIM;
-        float qs = 0.0f, ks = 0.0f;
+        /* Broadcast reads: every thread wants the same four floats, which the
+         * L1 serves in one transaction, and that keeps them out of the barrier
+         * sequence the shared-memory path would need. */
+        const float *slot = scalars +
+            ((uint64_t)token * QWEN38_CUDA_HEADS_V + head) * 4u;
+        const float q_inv = slot[0];
+        const float k_inv = slot[1];
+        const float decay = slot[2];
+        const float beta_h = slot[3];
         if (owns_elt) {
             q[tid] = qkv[qkv_row +
-                (uint64_t)qk_head * QWEN38_CUDA_HEAD_DIM + tid];
+                (uint64_t)qk_head * QWEN38_CUDA_HEAD_DIM + tid] * q_inv;
             k[tid] = qkv[qkv_row +
                 (uint64_t)QWEN38_CUDA_HEADS_QK * QWEN38_CUDA_HEAD_DIM +
-                (uint64_t)qk_head * QWEN38_CUDA_HEAD_DIM + tid];
-            qs = q[tid] * q[tid];
-            ks = k[tid] * k[tid];
-        }
-        qs = warp_sum_f32(qs);
-        ks = warp_sum_f32(ks);
-        if (lane == 0u) { rq[warp] = qs; rk[warp] = ks; }
-        __syncthreads();
-        if (tid == 0u) {
-            float qsum = 0.0f, ksum = 0.0f;
-#pragma unroll
-            for (int i = 0; i < 16; i++) { qsum += rq[i]; ksum += rk[i]; }
-            q_inv = ds4_cuda_rsqrtf(qsum + 1.0e-6f);
-            k_inv = ds4_cuda_rsqrtf(ksum + 1.0e-6f);
-            const uint64_t scalar = (uint64_t)token * QWEN38_CUDA_HEADS_V + head;
-            const float x = alpha[scalar] + dt[head];
-            const float softplus = x > 20.0f ? x : log1pf(expf(x));
-            decay = expf(a[head] * softplus);
-            beta_h = 1.0f / (1.0f + expf(-beta[scalar]));
-        }
-        __syncthreads();
-        if (owns_elt) {
-            q[tid] *= q_inv;
-            k[tid] *= k_inv;
+                (uint64_t)qk_head * QWEN38_CUDA_HEAD_DIM + tid] * k_inv;
         }
         __syncthreads();
 
@@ -27377,14 +27505,8 @@ __global__ static void qwen38_gdn_decode_kernel(
             h.x *= decay; h.y *= decay; h.z *= decay; h.w *= decay;
             hb.x *= decay; hb.y *= decay; hb.z *= decay; hb.w *= decay;
 
-            float p = dot4_f32(h, k4);
-            float pb = dot4_f32(hb, k4);
-            for (int off = 16; off > 0; off >>= 1) {
-                p += __shfl_down_sync(0xffffffffu, p, off);
-                pb += __shfl_down_sync(0xffffffffu, pb, off);
-            }
-            const float pred = __shfl_sync(0xffffffffu, p, 0);
-            const float pred_b = __shfl_sync(0xffffffffu, pb, 0);
+            const float pred = qwen38_warp_sum_all(dot4_f32(h, k4));
+            const float pred_b = qwen38_warp_sum_all(dot4_f32(hb, k4));
 
             const uint64_t vbase = qkv_row +
                 2u * QWEN38_CUDA_HEADS_QK * QWEN38_CUDA_HEAD_DIM +
@@ -27402,42 +27524,26 @@ __global__ static void qwen38_gdn_decode_kernel(
             *hp = h;
             *hpb = hb;
 
-            float r = dot4_f32(h, q4);
-            float rb = dot4_f32(hb, q4);
-            for (int off = 16; off > 0; off >>= 1) {
-                r += __shfl_down_sync(0xffffffffu, r, off);
-                rb += __shfl_down_sync(0xffffffffu, rb, off);
-            }
-            /* The shuffles stay outside the lane-0 branch: a full-mask
-             * __shfl_sync executed by one thread deadlocks. */
-            const float result = __shfl_sync(0xffffffffu, r, 0) *
+            /* Butterfly, so every lane already holds the total: no broadcast,
+             * and the shuffles stay outside the lane-0 branch because a
+             * full-mask __shfl_sync executed by one thread deadlocks. */
+            const float result = qwen38_warp_sum_all(dot4_f32(h, q4)) *
                                  0.08838834764831845f;
-            const float result_b = __shfl_sync(0xffffffffu, rb, 0) *
+            const float result_b = qwen38_warp_sum_all(dot4_f32(hb, q4)) *
                                    0.08838834764831845f;
             if (lane == 0u) {
-                o[value] = result;
-                o[value_b] = result_b;
+                /* Straight to the output buffer: the recurrence no longer keeps
+                 * a shared copy, and the normalization that used to read it is
+                 * the output kernel's job now. */
+                const uint64_t out_at = (uint64_t)token * QWEN38_CUDA_VALUE_DIM +
+                    (uint64_t)head * QWEN38_CUDA_HEAD_DIM;
+                out[out_at + value] = result;
+                out[out_at + value_b] = result_b;
             }
         }
-        __syncthreads();
-        const float ov = owns_elt ? o[tid] : 0.0f;
-        const float os = warp_sum_f32(ov * ov);
-        if (lane == 0u) ro[warp] = os;
-        __syncthreads();
-        if (tid == 0u) {
-            float sum = 0.0f;
-#pragma unroll
-            for (int i = 0; i < 16; i++) sum += ro[i];
-            ro[0] = ds4_cuda_rsqrtf(sum / QWEN38_CUDA_HEAD_DIM + 1.0e-6f);
-        }
-        __syncthreads();
-        if (owns_elt) {
-            const uint64_t out_at = (uint64_t)token * QWEN38_CUDA_VALUE_DIM +
-                (uint64_t)head * QWEN38_CUDA_HEAD_DIM + tid;
-            const float zg = z[out_at];
-            out[out_at] = o[tid] * ro[0] * norm[tid] *
-                (zg / (1.0f + expf(-zg)));
-        }
+        /* The state rows this warp just wrote are read by every warp on the
+         * next token, so the loop needs one barrier here; with the q/k staging
+         * barrier above that is two per token against seven before. */
         __syncthreads();
     }
     for (uint32_t i = tid; i < state_elems; i += blockDim.x) {
@@ -27765,23 +27871,6 @@ __device__ static __forceinline__ void qwen38_ga_softmax_step(
     *probability = __shfl_sync(0xffffffffu, prob, 0);
 }
 
-/* Butterfly form of the warp sum: every lane ends with the total instead of
- * lane 0 alone.  The tree is the same one -- pairs at distance 16, then 8, 4,
- * 2, 1, summed in that order -- so the value is bit-identical to warp_sum_f32;
- * what changes is that nobody has to broadcast it afterwards.
- *
- * The prefill body is issue-bound, not latency-bound: measured against a
- * standalone reproduction of the same body, the search loop runs at 0.275 ns
- * per (row, head, key) against 0.246 for the body alone, so the only lever
- * left is the length of the instruction stream.  A divergent lane-0 softmax
- * with two broadcasts was 27 of its 112 instructions. */
-__device__ static __forceinline__ float qwen38_ga_warp_sum_all(float v) {
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-        v += __shfl_xor_sync(0xffffffffu, v, off);
-    return v;
-}
-
 /* Same arithmetic as qwen38_ga_softmax_step, computed on every lane instead of
  * on lane 0 and broadcast: no divergence, no convergence barriers, no shuffles.
  * Every input is identical across the warp, so every output is too. */
@@ -27944,10 +28033,10 @@ __global__ static void qwen38_ga_decode_kernel(
             const uint32_t avail = avail_a > avail_b ? avail_a : avail_b;
             for (uint32_t token = 0; token < avail; token++) {
                 const uint64_t base = (uint64_t)token * QWEN38_CUDA_GA_HEAD_DIM;
-                float dot = qwen38_ga_warp_sum_all(qwen38_ga_score_part(
+                float dot = qwen38_warp_sum_all(qwen38_ga_score_part(
                     k_tile, base, lane, qa[0], qa[1], qa[2], qa[3], qa[4],
                     qa[5], qa[6], qa[7]));
-                float dot2 = qwen38_ga_warp_sum_all(qwen38_ga_score_part(
+                float dot2 = qwen38_warp_sum_all(qwen38_ga_score_part(
                     k_tile, base, lane, qb[0], qb[1], qb[2], qb[3], qb[4],
                     qb[5], qb[6], qb[7]));
                 if (token >= avail_a) dot = -INFINITY;
@@ -28039,13 +28128,25 @@ extern "C" int ds4_gpu_qwen38_gdn_chunk(
         (float *)qkv->ptr, (float *)conv_state->ptr, conv, n_tokens);
     if (!cuda_ok(cudaGetLastError(), "Qwen GDN convolution launch")) return 0;
     qwen38_gdn_ensure_state_shared();
+    float *scalars = qwen38_gdn_scalars_scratch(
+        (uint64_t)n_tokens * QWEN38_CUDA_HEADS_V * 4u);
+    if (!scalars) {
+        fprintf(stderr, "ds4: Qwen GDN scalar scratch allocation failed\n");
+        return 0;
+    }
+    const dim3 per_token(QWEN38_CUDA_HEADS_V, n_tokens, 1u);
+    qwen38_gdn_scalars_kernel<<<per_token,128,0,cuda_decode_stream()>>>(
+        scalars, (const float *)qkv->ptr, (const float *)alpha->ptr,
+        (const float *)beta->ptr, a, dt, n_tokens);
+    if (!cuda_ok(cudaGetLastError(), "Qwen GDN scalars launch")) return 0;
     qwen38_gdn_decode_kernel<<<48,512,QWEN38_GDN_STATE_SHARED_BYTES,
                                cuda_decode_stream()>>>(
         (float *)out->ptr, (float *)recurrent_state->ptr,
-        (const float *)qkv->ptr, (const float *)z->ptr,
-        (const float *)alpha->ptr, (const float *)beta->ptr,
-        a, dt, norm, n_tokens);
-    return cuda_ok(cudaGetLastError(), "Qwen GDN chunk launch");
+        (const float *)qkv->ptr, scalars, n_tokens);
+    if (!cuda_ok(cudaGetLastError(), "Qwen GDN chunk launch")) return 0;
+    qwen38_gdn_output_kernel<<<per_token,128,0,cuda_decode_stream()>>>(
+        (float *)out->ptr, (const float *)z->ptr, norm, n_tokens);
+    return cuda_ok(cudaGetLastError(), "Qwen GDN output launch");
 }
 
 extern "C" int ds4_gpu_qwen38_gdn_decode(

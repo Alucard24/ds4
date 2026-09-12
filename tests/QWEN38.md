@@ -360,6 +360,41 @@ to 1222 tok/s (llama.cpp: 1353).  What is left in a chunk is no longer attention
 the GDN recurrence is 73.4 ms, the output head 58.0, the projections 53.9 and the
 GA attention 47.7.
 
+The GDN recurrence was next, and it is a serial scan: one block per head walks
+the chunk's tokens in order, because token t+1 needs token t's state.  The same
+ablation method answered what the loop's time was made of: of 73.7 ms on the
+deepest chunk, the state row loop was 37.2, the state-independent scalars 12.8,
+the output normalization 7.8, and the remaining 17.9 was the barrier skeleton --
+seven `__syncthreads` per token, each exposing about 250 cycles, with one block
+per SM and nothing else resident to overlap them with.  That is 39 ms of the
+73.7 spent in barrier latency alone.  A 32-warp version of the recurrence
+testing the opposite hypothesis (that the row loop wanted a shorter chain) is
+slower, 80.0/80.8/80.2 against 73.7 ms, and was reverted: the row loop is not a
+chain waiting to be shortened, and more warps make each barrier dearer.
+
+So everything in the token loop that does not depend on the state moved out of
+it; the scalars are computed by a parallel kernel over the 464x48 (token, head)
+items and the output normalization by another, and the recurrence keeps two
+barriers per token: one after the normalized q/k are staged, one after the state
+rows are updated (every warp reads every row on the next token, so that one is
+structural).  Each moved computation keeps its tree -- the 128-wide sums are the
+same 32-element warp groups with the same all-zero groups feeding them, and the
+per-head inverse norm is the same reduction -- so the results are bit-identical.
+The warp sum also became a butterfly here, as in the GA attention: the total
+lands on every lane, which removes the broadcast that followed each of the four
+reductions in a two-row iteration.
+
+    73.4  ->  53.4  ->  48.8 ms      GDN core, deepest chunk
+   313.2  ->  251.0  -> 227.2 ms     chunk total
+    1123  ->  1222  ->  1287 tok/s   the 2000-token prompt (llama.cpp: 1353)
+
+All of it is numerics-neutral: the four greedy logits of that prompt stay
+bit-identical (max delta 0.000000), the gate reads 1.80954673, the MTP trunk is
+still bit-identical over 48 tokens, and the single-token decode phases are
+unchanged at 18.0-18.2 ms with 2.4 ms outside the windows.  The largest single
+item in a deep chunk is now the output head at 57.7 ms, ahead of the GDN at 48.8,
+the projections at 54.2 together and the GA attention at 47.8.
+
 A final experiment split Q8_1 activation quantization from MMVQ so the Qwen
 attention and FFN projections could share one quantized row. Three 538-token
 runs produced 798.1/798.4/787.3 warm prefill tok/s and
