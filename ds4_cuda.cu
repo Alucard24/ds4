@@ -28072,35 +28072,59 @@ __global__ static void qwen38_ga_split_kernel(
         float *partial, const float *q_full, const unsigned char *k_cache,
         const unsigned char *v_cache, uint32_t start_pos, uint32_t parts,
         int q8) {
+    /* One warp per part, eight parts per block.
+     *
+     * The first version had all 256 threads of a block on the same row, each of
+     * the eight warps recomputing the same 256-dim score and keeping a single
+     * accumulator - the eight-fold redundancy removed from the prefill and left
+     * here.  It only matters once the machine is busy: at N=16 there are 3072
+     * warps for 70 SMs, so the limit stops being the chain and becomes the
+     * instruction count, and that count was eight times what it needed to be.
+     *
+     * Each warp now owns a part, walks its keys with the same order as before,
+     * and keeps eight output dims per lane - the layout of the tiled prefill
+     * kernel.  The dot and its reduction tree are unchanged, so every value is
+     * bit-identical to the redundant version (the gate says 1.80977761 either
+     * way), and the partials land in the same scratch slots. */
+    const uint32_t head = blockIdx.x;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t parts_per_block = blockDim.x >> 5u;
+    const uint32_t part = blockIdx.z * parts_per_block + warp;
+    if (head >= QWEN38_CUDA_GA_HEADS || part >= parts) return;
     constexpr uint32_t queries_per_kv =
         QWEN38_CUDA_GA_HEADS / QWEN38_CUDA_GA_HEADS_KV;
-    const uint32_t head = blockIdx.x;
-    const uint32_t part = blockIdx.z;
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31u;
-    if (head >= QWEN38_CUDA_GA_HEADS || tid >= QWEN38_CUDA_GA_HEAD_DIM) return;
     const uint32_t kv_head = head / queries_per_kv;
     const uint32_t total = start_pos + 1u;
     const uint32_t chunk = (total + parts - 1u) / parts;
     const uint32_t first = part * chunk;
     uint32_t last = first + chunk;
+    float *out = partial + ((uint64_t)part * QWEN38_CUDA_GA_HEADS + head) *
+        QWEN38_GA_SPLIT_STRIDE;
     if (first >= total) {
-        /* An empty part still writes its slot.  The combine reads every part,
-         * and leaving it untouched made the trunk NLL 3.7748674 against
-         * 1.81334038 - the maximum of whatever was in the scratch. */
-        float *slot = partial +
-            ((uint64_t)part * QWEN38_CUDA_GA_HEADS + head) *
-            QWEN38_GA_SPLIT_STRIDE;
-        if (tid == 0u) {
-            slot[0] = -INFINITY;
-            slot[1] = 0.0f;
+        /* An empty part still writes its slot: the combine reads every part, and
+         * leaving it untouched made the trunk NLL 3.7748674 once already. */
+        if (lane == 0u) {
+            out[0] = -INFINITY;
+            out[1] = 0.0f;
         }
-        slot[2u + tid] = 0.0f;
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) out[2u + lane + 32u * j] = 0.0f;
         return;
     }
     if (last > total) last = total;
     const float *q = q_full + (uint64_t)head * 2u * QWEN38_CUDA_GA_HEAD_DIM;
-    float acc = 0.0f;
+    const float q0 = q[lane];
+    const float q32 = q[lane + 32u];
+    const float q64 = q[lane + 64u];
+    const float q96 = q[lane + 96u];
+    const float q128 = q[lane + 128u];
+    const float q160 = q[lane + 160u];
+    const float q192 = q[lane + 192u];
+    const float q224 = q[lane + 224u];
+    float accum[8];
+#pragma unroll
+    for (uint32_t j = 0; j < 8u; j++) accum[j] = 0.0f;
     float denominator = 0.0f;
     float maximum = -INFINITY;
     for (uint32_t token = first; token < last; token++) {
@@ -28109,24 +28133,24 @@ __global__ static void qwen38_ga_split_kernel(
             (uint64_t)kv_head * QWEN38_CUDA_GA_HEAD_DIM;
         float p0, p1, p2, p3;
         if (q8) {
-            p0 = q[lane] * qwen38_kv_q8_read(k_cache, base + lane);
-            p0 += q[lane + 128u] * qwen38_kv_q8_read(k_cache, base + lane + 128u);
-            p1 = q[lane + 64u] * qwen38_kv_q8_read(k_cache, base + lane + 64u);
-            p1 += q[lane + 192u] * qwen38_kv_q8_read(k_cache, base + lane + 192u);
-            p2 = q[lane + 32u] * qwen38_kv_q8_read(k_cache, base + lane + 32u);
-            p2 += q[lane + 160u] * qwen38_kv_q8_read(k_cache, base + lane + 160u);
-            p3 = q[lane + 96u] * qwen38_kv_q8_read(k_cache, base + lane + 96u);
-            p3 += q[lane + 224u] * qwen38_kv_q8_read(k_cache, base + lane + 224u);
+            p0 = q0 * qwen38_kv_q8_read(k_cache, base + lane);
+            p0 += q128 * qwen38_kv_q8_read(k_cache, base + lane + 128u);
+            p1 = q64 * qwen38_kv_q8_read(k_cache, base + lane + 64u);
+            p1 += q192 * qwen38_kv_q8_read(k_cache, base + lane + 192u);
+            p2 = q32 * qwen38_kv_q8_read(k_cache, base + lane + 32u);
+            p2 += q160 * qwen38_kv_q8_read(k_cache, base + lane + 160u);
+            p3 = q96 * qwen38_kv_q8_read(k_cache, base + lane + 96u);
+            p3 += q224 * qwen38_kv_q8_read(k_cache, base + lane + 224u);
         } else {
             const __half *kh = (const __half *)k_cache;
-            p0 = q[lane] * __half2float(kh[base + lane]);
-            p0 += q[lane + 128u] * __half2float(kh[base + lane + 128u]);
-            p1 = q[lane + 64u] * __half2float(kh[base + lane + 64u]);
-            p1 += q[lane + 192u] * __half2float(kh[base + lane + 192u]);
-            p2 = q[lane + 32u] * __half2float(kh[base + lane + 32u]);
-            p2 += q[lane + 160u] * __half2float(kh[base + lane + 160u]);
-            p3 = q[lane + 96u] * __half2float(kh[base + lane + 96u]);
-            p3 += q[lane + 224u] * __half2float(kh[base + lane + 224u]);
+            p0 = q0 * __half2float(kh[base + lane]);
+            p0 += q128 * __half2float(kh[base + lane + 128u]);
+            p1 = q64 * __half2float(kh[base + lane + 64u]);
+            p1 += q192 * __half2float(kh[base + lane + 192u]);
+            p2 = q32 * __half2float(kh[base + lane + 32u]);
+            p2 += q160 * __half2float(kh[base + lane + 160u]);
+            p3 = q96 * __half2float(kh[base + lane + 96u]);
+            p3 += q224 * __half2float(kh[base + lane + 224u]);
         }
         p2 += p3;
         p0 += p1;
@@ -28144,17 +28168,19 @@ __global__ static void qwen38_ga_split_kernel(
         }
         old_scale = __shfl_sync(0xffffffffu, old_scale, 0);
         probability = __shfl_sync(0xffffffffu, probability, 0);
-        acc = acc * old_scale +
-            probability * (q8 ? qwen38_kv_q8_read(v_cache, base + tid)
-                              : __half2float(((const __half *)v_cache)[base + tid]));
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; j++) {
+            accum[j] = accum[j] * old_scale + probability *
+                (q8 ? qwen38_kv_q8_read(v_cache, base + lane + 32u * j)
+                    : __half2float(((const __half *)v_cache)[base + lane + 32u * j]));
+        }
     }
-    float *out = partial + ((uint64_t)part * QWEN38_CUDA_GA_HEADS + head) *
-        QWEN38_GA_SPLIT_STRIDE;
-    if (tid == 0u) {
+    if (lane == 0u) {
         out[0] = maximum;
         out[1] = denominator;
     }
-    out[2u + tid] = acc;
+#pragma unroll
+    for (uint32_t j = 0; j < 8u; j++) out[2u + lane + 32u * j] = accum[j];
 }
 
 /* Combine the partials for one head: rescale each part by exp(max_part -
@@ -28300,7 +28326,8 @@ extern "C" int ds4_gpu_qwen38_ga_chunk(
             fprintf(stderr, "ds4: Qwen GA split decode has no scratch\n");
             return 0;
         }
-        const dim3 split_grid(QWEN38_CUDA_GA_HEADS, 1u, parts);
+        /* Eight parts per block, one per warp. */
+        const dim3 split_grid(QWEN38_CUDA_GA_HEADS, 1u, (parts + 7u) / 8u);
         qwen38_ga_split_kernel<<<split_grid,256,0,cuda_decode_stream()>>>(
             scratch, (const float *)q_full->ptr,
             (const unsigned char *)k_cache->ptr,
