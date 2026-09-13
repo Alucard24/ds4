@@ -134,7 +134,7 @@ static const struct { uint32_t type; const char *name; } quants[] = {
     {DS4_TENSOR_IQ2_XXS, "iq2_xxs"}, {DS4_TENSOR_IQ2_XS, "iq2_xs"},
     {DS4_TENSOR_IQ2_S, "iq2_s"}, {DS4_TENSOR_IQ3_XXS, "iq3_xxs"},
     {DS4_TENSOR_IQ3_S, "iq3_s"}, {DS4_TENSOR_IQ4_XS, "iq4_xs"},
-    {DS4_TENSOR_IQ1_M, "iq1_m"}, {DS4_TENSOR_Q2_K, "q2_K"},
+    {DS4_TENSOR_IQ1_S, "iq1_s"}, {DS4_TENSOR_IQ1_M, "iq1_m"}, {DS4_TENSOR_Q2_K, "q2_K"},
     {DS4_TENSOR_Q4_K, "q4_K"}
 };
 

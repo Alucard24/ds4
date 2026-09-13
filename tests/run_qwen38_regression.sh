@@ -27,7 +27,15 @@ make CUDA_ARCH=sm_120
 
 echo "===== CPU reference build and tests ====="
 make clean >/dev/null 2>&1
-make -B test-qwen38-cpu
+# The private-kernel checks always run.  When the ggml shared library named above
+# is present they are also compared against it - on 64 synthetic rows per type and
+# on that type's real tensors in this model - which is what validates a new tensor
+# type against an independent implementation instead of against its own source.
+if [ -f "$GGML_CPU" ]; then
+    tests/run_qwen38_cpu.sh "$GGML_CPU" "$MODEL" || exit 1
+else
+    make -B test-qwen38-cpu
+fi
 
 echo "===== mixed-IQ CUDA formats, batch16 MMQ ====="
 make test-qwen38-cuda DS4_TEST_GGML_CPU="$GGML_CPU"

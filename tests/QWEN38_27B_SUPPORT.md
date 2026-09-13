@@ -337,11 +337,12 @@ had its block size as 110 bytes, the size of IQ3_S, against the real 50 - wrong
 arithmetic that would have been read as corruption.
 
 What it buys is 10.44 GiB instead of 11.77, which is what lets the draft head run at
-32768 where the release trunk stops at 16384. Measured on this card, same prompt:
-58.55 tok/s of decode at 32768 and 996.8 tok/s of prefill, against the release
-trunk's 55.75 and 1095.3 at 16384 - so decode improves, prefill gives up about 9%,
-and the engine's resident-budget warning is printed even though its numbers are for
-the separate NVFP4 sidecar and the measurement does not collapse.
+49152 where the release trunk stops at 16384. Measured on this card with a 6000-token
+prompt: 995.8 tok/s of prefill and 57.1 tok/s of decode at 49152, against 999.0 and
+57.2 at 32768 - flat. At 65536 the engine skips the draft by itself (its resident
+budget computes 14.50 GiB against the device) and the trunk carries on without it.
+No warning is printed in either case: that warning belongs to the separate NVFP4
+sidecar, whose 24576 threshold was measured with the bigger trunk.
 
 The price is quality, and it is measured rather than assumed: the 16-token sentence
 the regression uses reads NLL 1.87606303 where the release trunk reads 1.80954673,
