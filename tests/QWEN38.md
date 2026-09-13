@@ -462,6 +462,40 @@ per layer, 48 TMAC/s, which is the rate recorded for llama.cpp in this same
 document: the prefill's matmuls are at the achievable rate, and that is the end of
 the prefill's road rather than a missing optimization.
 
+Splitting the GDN's state rows across more blocks was measured and **did not
+transfer**: the standalone reproduction of the row loop gained 24% with four row
+groups, and in the real kernel the same change left the GDN core at 51.1-51.6 ms
+against 48.8, with the prefill falling from 1341 to 1246 tok/s.  The row loop is
+about 37 of the kernel's 50 ms and the rest - the state load, four barriers per
+token, the scalars - does not change, while 192 blocks no longer fit in one wave
+(it is two resident blocks per SM by registers) and the tail of the second wave
+eats the gain.  Reverted.  The lesson is the one the MMA spike taught the same day:
+a microbenchmark measures the body, and the body is not the kernel.
+
+Three of the five binaries had no runtime gate at all: the script built ds4-eval,
+ds4-bench and ds4-agent and never ran them, and the last two had just been given
+their `-ctk`/`-ctv` flags.  They have one now, and it costs twenty seconds: the eval's
+grader self-tests, a prefill-only bench at 4096 (about 1400 tok/s, and a collapse to
+nothing if the flags break), and an agent one-shot turn checked for its answer.
+
+Two things came out of writing it.  Every step has to build what it uses, because the
+CPU reference step runs `make clean` and by then nothing from the first build exists -
+the first version of this step failed on a missing `ds4-eval` after passing by hand,
+which is the same trap the `ds4` binary set earlier in the same script.  And the agent
+turn reports
+
+    ds4-agent: failed to save system prompt KV: unsupported routed quantization for KV save
+
+which is a real bug of its own: `agent_kv_save_path` insists the engine's *routed
+expert* quantization is 2 or 4 bits, a DeepSeek-shaped requirement, so with Qwen the
+agent's documented session save never happens.  The engine's own payload staging works
+for Qwen - the session tests save and restore it - so the check is a leftover, not a
+limitation, and it is recorded rather than patched inside a batch about something else.
+
+The server's landing page now streams: it asks for `stream: true` and paints both
+`reasoning_content` and `content` as they arrive, because this model thinks for a long
+time before it answers and an empty box reads as a failure.
+
 The quantized twin got the same treatment and the naive form of it **lost**, which
 is worth recording because the reason is structural: q8_0's attention core went from
 72.6 to **122.6 ms** (q4_0 72.7 to 112.1) when the dequantization was moved into

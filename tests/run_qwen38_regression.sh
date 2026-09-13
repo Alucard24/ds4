@@ -136,6 +136,41 @@ else
     exit 1
 fi
 
+echo "===== the three binaries nothing was running ====="
+# ds4-eval, ds4-bench and ds4-agent are built by this script and were never run
+# by it: the eval's graders, the bench's own flag handling and the agent's
+# end-to-end turn had no gate, and the last two were touched for -ctk/-ctv.
+#
+# They have to be built *here*: the CPU reference step runs `make clean`, so by
+# this point in the script nothing from the first build exists any more.  Every
+# step that runs a binary builds it, or it measures a missing file.
+make ds4-eval ds4-bench ds4-agent CUDA_ARCH=sm_120 >/dev/null 2>&1
+./ds4-eval --self-test-extractors 2>&1 | grep -q "self-tests passed" \
+    || { echo "eval extractor self-tests failed"; exit 1; }
+echo "eval extractors: passed"
+
+# The bench wants a prompt at least as long as --ctx-max, so it is generated here.
+python3 -c "
+words = ('The capital of France is Paris and the largest ocean is the Pacific and the '
+         'tallest mountain is Everest and the longest river is the Nile.')
+open('/tmp/ds4-regression-bench.txt', 'w').write(' '.join([words] * 1100))"
+bench=$(./ds4-bench -m "$MODEL" --prompt-file /tmp/ds4-regression-bench.txt \
+        --ctx-max 4096 --gen-tokens 0 2>/dev/null || true)
+best=$(printf '%s\n' "$bench" | awk -F, 'NR > 1 && $3 + 0 > best { best = $3 + 0 } END { printf "%.0f", best }')
+if [ -z "$best" ] || [ "$best" -lt 500 ]; then
+    echo "bench prefill rate missing or collapsed: '${best:-none} t/s'"
+    printf '%s\n' "$bench" | tail -4
+    exit 1
+fi
+echo "bench prefill at 4096: ${best} t/s"
+
+agent=$( (cd /tmp && "$OLDPWD/ds4-agent" -m "$MODEL" -c 4096 --non-interactive \
+        -p 'Reply with exactly the two words: all good' 2>&1) || true)
+case "$agent" in
+    *"all good"*) echo "agent one-shot turn: answered" ;;
+    *) echo "agent one-shot turn failed:"; printf '%s\n' "$agent" | tail -4; exit 1 ;;
+esac
+
 echo "===== tokenizer vectors ====="
 make test-tokenizer-vectors 2>/dev/null || echo "(tokenizer vectors target not present; covered by run_qwen38_cpu.sh)"
 
