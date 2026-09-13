@@ -497,8 +497,14 @@ tokens is exactly 2048 * 16 * 2 * (2048 - 576) bytes.
 
 The decode cost of a quantized cache grows with depth, which the first measurements
 at 2048 did not show: 3% there (47.1-47.6 against 49.1-49.2 tok/s) but 36% at 32768
-(23.2 against 36.1), because the f16 mirror is rebuilt per chunk.  Prefill is
-unaffected (531 against 528).  At 131072 there is no comparison to make: an f16
+(23.2 against 36.1).  The two paths differ: the prefill widens a chunk once into an
+f16 mirror and then runs the f16 kernel unchanged - which is the whole point of that
+design, and why prefill is unaffected (531 against 528) - while the decode's split-KV
+kernel takes the quantized cache and the format and dequantizes inside the attention
+loop, where at depth the attention is most of the token.  The split kernel reads the
+cache raw by design (it was tuned against the redundant-score version at N=16, not
+against a dequantization-free path), so this is the price of not materializing an f16
+cache that would defeat the reason to use the format.  At 131072 there is no comparison to make: an f16
 cache of that size does not allocate.
 
 One ds4-bench finding from the same session was not a bug: --ctx-max appeared to be
