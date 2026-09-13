@@ -495,6 +495,21 @@ frontier with q4_0 instead of stopping at 4096; and the f16 payloads are
 byte-for-byte what they were - the difference between the two formats for 2048
 tokens is exactly 2048 * 16 * 2 * (2048 - 576) bytes.
 
+Two hypotheses about that decode cost were tested and both are refuted, so the cost
+is the format's and not a defect with a fix behind it.  First the dispatch: the split
+kernel took the format as a runtime int and read the cache through a helper that
+branched on it per element, so the kernel was templated on the format instead - bit
+identical by construction, and the three NLLs confirmed it - and it gained nothing:
+q4_0 23.42 against 23.17 tok/s, q8_0 20.30 against 18.56 on one sample, f16 flat as
+the control.  Then the scale load: one element costs three 64-bit multiplies for its
+address and two loads, the block's scale and the quantized byte, against one load for
+f16, so a diagnostic build read a fixed hot scale instead of the block's own and
+timed the difference: q4_0 came out at 21.00 (baseline 23.17, i.e. noise or worse) and
+q8_0 at 19.75 (baseline 18.56).  What remains is the unpacking and the addressing - a
+shift, a mask and an add per value where f16 has one conversion - which is what the
+format costs to be a quarter of the size.  Closing it would mean a different cache
+layout or a summation order that is no longer bit-identical.
+
 The decode cost of a quantized cache grows with depth, which the first measurements
 at 2048 did not show: 3% there (47.1-47.6 against 49.1-49.2 tok/s) but 36% at 32768
 (23.2 against 36.1).  The two paths differ: the prefill widens a chunk once into an

@@ -32,6 +32,9 @@
 #
 # What the format buys is memory, and its decode cost grows with depth: 3% at 2048
 # (47.1-47.6 tok/s against f16's 49.1-49.2) but 36% at 32768 (23.2 against 36.1).
+# That cost was chased twice and is the format's, not a defect: templating the decode
+# kernel on the format (bit-identical, measured) gained nothing, and a probe that read
+# a fixed scale instead of each block's own did not speed it up either.
 # The paths differ: the prefill widens a chunk once into an f16 mirror and runs the
 # f16 kernel, so it is unaffected (531 against 528 tok/s at 32768), while the decode
 # reads the quantized cache directly and dequantizes inside the attention loop, which
