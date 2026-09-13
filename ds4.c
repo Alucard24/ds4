@@ -940,6 +940,16 @@ typedef struct {
     uint8_t  qs[QK_K / 2];
 } block_iq4_xs;
 
+/* IQ1_S: 256 weights in 50 bytes - an fp16 delta, 32 bytes of grid indices and
+ * 16 bytes carrying each group's high index bit, its sign and its scale.  The
+ * grid is the same iq1s_grid the IQ1_M path below already uses; the two formats
+ * differ in how the scale and sign bits are packed, not in the table. */
+typedef struct {
+    uint16_t d;
+    uint8_t  qs[QK_K / 8];
+    uint16_t qh[QK_K / 32];
+} block_iq1_s;
+
 /* IQ1_M packs each block's fp16 scale into the high nibbles of scales. */
 typedef struct {
     uint8_t qs[QK_K / 8];
@@ -964,6 +974,7 @@ DS4_STATIC_ASSERT(ds4_block_iq2_s_size, sizeof(block_iq2_s) == 82);
 DS4_STATIC_ASSERT(ds4_block_iq3_xxs_size, sizeof(block_iq3_xxs) == 98);
 DS4_STATIC_ASSERT(ds4_block_iq3_s_size, sizeof(block_iq3_s) == 110);
 DS4_STATIC_ASSERT(ds4_block_iq4_xs_size, sizeof(block_iq4_xs) == 136);
+DS4_STATIC_ASSERT(ds4_block_iq1_s_size, sizeof(block_iq1_s) == 50);
 DS4_STATIC_ASSERT(ds4_block_iq1_m_size, sizeof(block_iq1_m) == 56);
 DS4_STATIC_ASSERT(ds4_block_mxfp4_size, sizeof(block_mxfp4) == 17);
 
@@ -2186,7 +2197,7 @@ static const gguf_type_info gguf_types[] = {
     [16] = {"iq2_xxs",256,  66},
     [17] = {"iq2_xs", 256,  74},
     [18] = {"iq3_xxs",256,  98},
-    [19] = {"iq1_s",  256, 110},
+    [19] = {"iq1_s",  256,  50},
     [20] = {"iq4_nl", 256,  50},
     [21] = {"iq3_s",  256, 110},
     [22] = {"iq2_s",  256,  82},
@@ -2214,6 +2225,7 @@ enum {
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_IQ2_XS   = 17,
     DS4_TENSOR_IQ3_XXS  = 18,
+    DS4_TENSOR_IQ1_S    = 19,
     DS4_TENSOR_IQ3_S    = 21,
     DS4_TENSOR_IQ2_S    = 22,
     DS4_TENSOR_IQ4_XS   = 23,
@@ -4223,6 +4235,30 @@ static DS4_MAYBE_UNUSED void ds4_dequant_row_iq3_s(const block_iq3_s *x, float *
     }
 }
 
+/* Same grid lookup as IQ1_M, different packing: the scale lives in bits 12-14 of
+ * each qh word, the high index bit in bits 3*l, and the sign in the top bit. */
+static DS4_MAYBE_UNUSED void ds4_dequant_row_iq1_s(const block_iq1_s *x, float *y, int64_t k) {
+    const int64_t nb = k / QK_K;
+    for (int i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d);
+        const uint8_t *qs = x[i].qs;
+        const uint16_t *qh = x[i].qh;
+        for (int ib = 0; ib < QK_K / 32; ++ib) {
+            const float dl = d * (2 * ((qh[ib] >> 12) & 0x7) + 1);
+            const float delta = qh[ib] & 0x8000 ? -DS4_IQ1S_DELTA : DS4_IQ1S_DELTA;
+            for (int l = 0; l < 4; ++l) {
+                const int8_t *grid = (const int8_t *)(iq1s_grid +
+                    (qs[l] | (((qh[ib] >> (3 * l)) & 0x7) << 8)));
+                for (int j = 0; j < 8; ++j) {
+                    y[j] = dl * (grid[j] + delta);
+                }
+                y += 8;
+            }
+            qs += 4;
+        }
+    }
+}
+
 static DS4_MAYBE_UNUSED void ds4_dequant_row_iq1_m(const block_iq1_m *x, float *y, int64_t k) {
     const int64_t nb = k / QK_K;
     for (int i = 0; i < nb; i++) {
@@ -4373,6 +4409,7 @@ DS4_IQ_VEC_DOT(ds4_vec_dot_iq2_xs_f32, block_iq2_xs, ds4_dequant_row_iq2_xs)
 DS4_IQ_VEC_DOT(ds4_vec_dot_iq2_s_f32, block_iq2_s, ds4_dequant_row_iq2_s)
 DS4_IQ_VEC_DOT(ds4_vec_dot_iq3_xxs_f32, block_iq3_xxs, ds4_dequant_row_iq3_xxs)
 DS4_IQ_VEC_DOT(ds4_vec_dot_iq3_s_f32, block_iq3_s, ds4_dequant_row_iq3_s)
+DS4_IQ_VEC_DOT(ds4_vec_dot_iq1_s_f32, block_iq1_s, ds4_dequant_row_iq1_s)
 DS4_IQ_VEC_DOT(ds4_vec_dot_iq1_m_f32, block_iq1_m, ds4_dequant_row_iq1_m)
 DS4_IQ_VEC_DOT(ds4_vec_dot_iq4_xs_f32, block_iq4_xs, ds4_dequant_row_iq4_xs)
 
@@ -7363,6 +7400,7 @@ static bool qwen38_tensor_type_supported(const ds4_tensor *t, bool matrix) {
     case DS4_TENSOR_IQ3_XXS:
     case DS4_TENSOR_IQ3_S:
     case DS4_TENSOR_IQ4_XS:
+    case DS4_TENSOR_IQ1_S:
     case DS4_TENSOR_IQ1_M:
         return true;
     default:
@@ -8086,6 +8124,9 @@ static void qwen38_dequant_row(uint32_t type, const uint8_t *row, uint64_t n, fl
     case DS4_TENSOR_IQ3_S:
         ds4_dequant_row_iq3_s((const block_iq3_s *)row, out, (int64_t)n);
         return;
+    case DS4_TENSOR_IQ1_S:
+        ds4_dequant_row_iq1_s((const block_iq1_s *)row, out, (int64_t)n);
+        return;
     case DS4_TENSOR_IQ1_M:
         ds4_dequant_row_iq1_m((const block_iq1_m *)row, out, (int64_t)n);
         return;
@@ -8139,6 +8180,8 @@ static float qwen38_row_dot(uint32_t type, int n, const uint8_t *row, const floa
         return ds4_vec_dot_iq3_xxs_f32(n, (const block_iq3_xxs *)row, x);
     case DS4_TENSOR_IQ3_S:
         return ds4_vec_dot_iq3_s_f32(n, (const block_iq3_s *)row, x);
+    case DS4_TENSOR_IQ1_S:
+        return ds4_vec_dot_iq1_s_f32(n, (const block_iq1_s *)row, x);
     case DS4_TENSOR_IQ1_M:
         return ds4_vec_dot_iq1_m_f32(n, (const block_iq1_m *)row, x);
     case DS4_TENSOR_IQ4_XS:
@@ -8524,7 +8567,12 @@ static int qwen38_gpu_matvec_rows(ds4_gpu_tensor *out, const ds4_model *m,
                                   const ds4_gpu_tensor *x,
                                   uint32_t n_tokens) {
     if (n_tokens == 0 || n_tokens > QWEN38_CUDA_PREFILL_CHUNK) return 0;
-    if (weight->type == DS4_TENSOR_IQ1_M && n_tokens > 8u) {
+    /* Both 1-bit formats go through the vector kernels in slices of eight rows.
+     * The dense glue has no ds4_mmq_dense_impl specialization for either, so the
+     * full-band path would fail at runtime (for IQ1_S it fails at link time),
+     * while the vector kernels handle both. */
+    if ((weight->type == DS4_TENSOR_IQ1_M || weight->type == DS4_TENSOR_IQ1_S) &&
+        n_tokens > 8u) {
         for (uint32_t first = 0; first < n_tokens; first += 8u) {
             const uint32_t rows = n_tokens - first < 8u ?
                 n_tokens - first : 8u;
@@ -8565,6 +8613,7 @@ static int qwen38_gpu_matvec_rows(ds4_gpu_tensor *out, const ds4_model *m,
     case DS4_TENSOR_IQ3_S:
     case DS4_TENSOR_IQ4_XS:
     case DS4_TENSOR_IQ1_M:
+    case DS4_TENSOR_IQ1_S:
         return ds4_gpu_matmul_quant_tensor(out, m->map, m->size,
             weight->abs_offset, weight->type, weight->dim[0],
             weight->dim[1], x, n_tokens);

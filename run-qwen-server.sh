@@ -6,6 +6,7 @@
 #   ./run-qwen-server.sh           trunk + embedded draft head, ctx 16384  (chat)
 #   ./run-qwen-server.sh sidecar   trunk + NVFP4 sidecar,      ctx 16384
 #   ./run-qwen-server.sh long      trunk only,                 ctx 32768  (documents)
+#   ./run-qwen-server.sh xxs       IQ3_XXS trunk + draft,      ctx 32768  (chat, smaller trunk)
 #   ./run-qwen-server.sh q4        trunk only, q4_0 KV,        ctx 131072 (documents that
 #                                                                        do not fit)
 #
@@ -41,6 +42,18 @@
 # --ctx-max is divided by the KV ratio for quantized types - 8192 asked measures
 # at 2048 - so its ctx_tokens column is the context actually run, not the one
 # requested.
+#
+# `xxs` is the same chat shape as `merged` - the IQ3_XXS trunk carries its draft
+# head inside it too - except that the trunk is 10.44 GiB against 11.77, so the
+# draft fits at 32768 where the release trunk has to stop at 16384.  Measured on
+# this card, same prompt: 58.55 tok/s of decode at 32768 against the release
+# trunk's 55.75 at 16384, with prefill at 996.8 against 1095.3.  The engine still
+# prints its resident-budget warning here, because that warning is written for the
+# separate NVFP4 sidecar ("sidecar 0.79 GiB + 0.17 GiB state") and the embedded
+# head is not it; the measurement above is what the warning predicts will collapse,
+# and it does not.  The price is quality: the same 16-token sentence reads NLL
+# 1.87606303 against 1.80954673, confirmed against the CPU reference to 0.0027
+# nats.  The regression pins both values.
 #
 # Any profile can be adjusted without editing this file:
 #
@@ -99,6 +112,17 @@ if [ -n "$DS4_POWER" ]; then
 fi
 
 case "$PROFILE" in
+xxs)
+    printf '%s\n' "ds4-server (xxs: IQ3_XXS trunk + draft head, ctx ${DS4_CTX:-32768}, KV $CTK) on http://$HOST:$PORT" >&2
+    exec ./ds4-server \
+        -m "$M/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf" \
+        --ctx "${DS4_CTX:-32768}" --host "$HOST" --port "$PORT" \
+        -ctk "$CTK" -ctv "$CTV" --kv-cache-reject-different-quant \
+        --vision "$M/mmproj-Qwen3.8-27B-BF16.gguf" \
+        --mtp --mtp-draft 4 \
+        --kv-disk-dir "$KV" --kv-disk-space-mb 8192 \
+        --trace /tmp/ds4-server.trace $POWER_ARGS
+    ;;
 merged)
     # 16384 is the largest context where the draft head fits on a 16 GiB card
     # next to the KV (at 24576 the engine warns and everything slows down).  For

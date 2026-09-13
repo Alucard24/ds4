@@ -55,6 +55,22 @@ else
     exit 1
 fi
 nll_q4=$(DS4_KV_Q4=1 DS4_TEST_QWEN38_CUDA=1 ./tests/test_qwen38_session_cuda "$MODEL" "$PROMPT" 2>&1 | grep '^MEAN_NLL' || true)
+
+# The second trunk format, the one the engine learned to execute for the IQ1_S
+# tensors: same sentence, its own pinned NLL.  Optional, because the file is a
+# local quantization mix and not part of the release set; when it is there, the
+# gate is exact.
+MODEL_XXS=${DS4_QWEN_TEST_MODEL_XXS:-$MODEL_DIR/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf}
+if [ -f "$MODEL_XXS" ]; then
+    nll_xxs=$(DS4_TEST_QWEN38_CUDA=1 DS4_TEST_QWEN38_EXPECT_NLL=1.87606303 \
+        ./tests/test_qwen38_session_cuda "$MODEL_XXS" "$PROMPT" 2>&1 | grep '^MEAN_NLL' || true)
+    case "$nll_xxs" in
+        *1.87606303*) echo "IQ3_XXS trunk NLL as recorded: $nll_xxs" ;;
+        *) echo "IQ3_XXS trunk NLL drifted: '${nll_xxs:-none}'"; exit 1 ;;
+    esac
+else
+    echo "(IQ3_XXS trunk not present; the IQ1_S path is covered by the CPU kernel checks)"
+fi
 if [ "$nll_q4" = "MEAN_NLL 1.82242633 TOKENS 16" ]; then
     echo "q4_0 KV NLL as recorded: $nll_q4"
 else

@@ -33924,6 +33924,11 @@ static int cuda_matmul_mmq_dense_quant(
     case 16u: block_elems = 256u; block_bytes = 66u; label = "IQ2_XXS"; break;
     case 17u: block_elems = 256u; block_bytes = 74u; label = "IQ2_XS"; break;
     case 18u: block_elems = 256u; block_bytes = 98u; label = "IQ3_XXS"; break;
+    /* 256 weights in 50 bytes.  The vendored MMQ and MMVQ kernels have carried
+     * IQ1_S all along; like Q6_K before it, it was the ds4-side table that never
+     * named it - and the loader's own type table had its block size as 110, the
+     * size of IQ3_S, so the offset arithmetic would have been wrong if it had. */
+    case 19u: block_elems = 256u; block_bytes = 50u; label = "IQ1_S"; break;
     case 21u: block_elems = 256u; block_bytes = 110u; label = "IQ3_S"; break;
     case 22u: block_elems = 256u; block_bytes = 82u; label = "IQ2_S"; break;
     case 23u: block_elems = 256u; block_bytes = 136u; label = "IQ4_XS"; break;
@@ -34039,6 +34044,7 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
     case 16u:  /* IQ2_XXS */
     case 17u:  /* IQ2_XS */
     case 18u:  /* IQ3_XXS */
+    case 19u:  /* IQ1_S */
     case 21u:  /* IQ3_S */
     case 22u:  /* IQ2_S */
     case 23u:  /* IQ4_XS */

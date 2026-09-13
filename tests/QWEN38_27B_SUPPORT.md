@@ -292,6 +292,7 @@ four profiles and can be adjusted without editing it:
 | `sidecar` | trunk + NVFP4 draft sidecar | 16384 | f16 |
 | `long` | trunk | 32768 | f16 |
 | `q4` | trunk | 131072 | q4_0 |
+| `xxs` | IQ3_XXS trunk with the draft head inside it | 32768 | f16 |
 
 `./run-qwen-server.sh --help` prints the same list.  Any profile accepts:
 
@@ -315,6 +316,29 @@ with 15411 MiB of VRAM in use.  Measured on the card: at the same context q4_0
 costs a few percent of decode (47.1-47.6 against f16's 49.1-49.2 tok/s at 2048),
 and at 65536 the same measurement reads 15.3 tok/s - depth is what costs, not the
 format.
+
+### The second trunk format
+
+`Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf` is a differently mixed trunk: the name says
+IQ3_XXS, but the file carries nine quantization types and six of them were ones the
+engine did not execute - IQ3_XXS, IQ2_S, IQ2_XS, IQ4_XS, IQ1_M and IQ1_S, 59% of
+its tensors. The engine refused the file at load with a message naming the type.
+It runs now, and the whole difference is one missing type plus three dispatch lists:
+the vendored MMQ and MMVQ kernels already had IQ1_S, and the loader's own type table
+had its block size as 110 bytes, the size of IQ3_S, against the real 50 - wrong
+arithmetic that would have been read as corruption.
+
+What it buys is 10.44 GiB instead of 11.77, which is what lets the draft head run at
+32768 where the release trunk stops at 16384. Measured on this card, same prompt:
+58.55 tok/s of decode at 32768 and 996.8 tok/s of prefill, against the release
+trunk's 55.75 and 1095.3 at 16384 - so decode improves, prefill gives up about 9%,
+and the engine's resident-budget warning is printed even though its numbers are for
+the separate NVFP4 sidecar and the measurement does not collapse.
+
+The price is quality, and it is measured rather than assumed: the 16-token sentence
+the regression uses reads NLL 1.87606303 where the release trunk reads 1.80954673,
+and the CPU reference agrees with the CUDA path to 0.0027 nats on that file. Both
+values are pinned by the regression, so neither can drift unnoticed.
 
 `ds4-bench` is not the tool to compare this with.  It fails to create a session at
 131072 with q4_0 even with 13947 MiB free ("failed to allocate Qwen CUDA tensor

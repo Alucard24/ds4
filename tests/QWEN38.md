@@ -472,6 +472,37 @@ token, the scalars - does not change, while 192 blocks no longer fit in one wave
 eats the gain.  Reverted.  The lesson is the one the MMA spike taught the same day:
 a microbenchmark measures the body, and the body is not the kernel.
 
+A second trunk quantization mix now runs: Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf,
+10.44 GiB against 11.77.  Its name is a recipe, not a type - it carries nine
+quantizations and six of them were unexecutable (IQ3_XXS, IQ2_S, IQ2_XS, IQ4_XS,
+IQ1_M, IQ1_S = 59% of its tensors).  Five were already accepted by the loader's type
+gate and already named in both CUDA dispatch tables, and the vendored MMQ/MMVQ
+kernels implement all five; the only missing type was IQ1_S, and the vendored
+kernels implement it too.  So the engine work was: the CPU dequantizer and vec_dot
+for IQ1_S (ported from the same table the IQ1_M path already uses, iq1s_grid),
+DS4_TENSOR_IQ1_S in the type gate, and the type in three dispatch lists - the
+geometry table, the dense matmul switch and ds4_mmq_quant_dense_vec.  Two things
+came out of it.  The loader's type table declared iq1_s as 110 bytes per block, the
+size of IQ3_S, where the format is 50; nothing had ever read it, and any
+implementation would have read the tensor at the wrong offsets.  And IQ1_S could not
+take the MMA path even though the vendored kernels have tiles for it: the ds4-side
+glue has no ds4_mmq_dense_impl<GGML_TYPE_IQ1_S> to link, which shows up as a link
+error, so the format rides the same eight-row chunking as IQ1_M
+(qwen38_gpu_matvec_rows), which is 0.05 GiB of tensors and costs nothing measurable.
+
+Verification, in the order it was done: the CPU dequantizer is line-for-line the
+llama.cpp reference (same dl, same delta, same grid index); the session test passes
+on the file from the CPU path with LOGIT_MAX_ERROR 0; and the two paths agree on the
+same sentence to 0.0027 nats (CPU 1.8733425 against CUDA 1.87606303), which is what
+validates the chunking path that no model had exercised.  The release trunk is
+untouched: the same gate still reads 1.80954673 bit for bit.  The pin was made
+model-aware (DS4_TEST_QWEN38_EXPECT_NLL) so both values are gated.
+
+The trade, measured: NLL 1.80954673 -> 1.87606303 (+3.7%) for -11% of model size;
+decode 55.75 -> 58.55 tok/s and prefill 1095.3 -> 996.8 at the same context.  The
+engine's resident-budget warning fires on this trunk even though its text describes
+the separate NVFP4 sidecar; the measurement it predicts would collapse does not.
+
 Two ds4-bench findings, recorded because the profile work ran into them and neither
 is something to write a number on top of.  At ctx 131072 with q4_0 the bench cannot
 create a session even with 13947 MiB of VRAM free ("failed to allocate Qwen CUDA

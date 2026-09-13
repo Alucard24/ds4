@@ -4975,6 +4975,15 @@ extern "C" int ds4_mmq_quant_dense(
         DS4_MMQ_CASE(GGML_TYPE_IQ3_S,   "ds4_mmq_iq3_s_dense");
         DS4_MMQ_CASE(GGML_TYPE_IQ4_XS,  "ds4_mmq_iq4_xs_dense");
         DS4_MMQ_CASE(GGML_TYPE_Q6_K,    "ds4_mmq_q6_K_dense");
+        /* IQ1_M and IQ1_S are deliberately absent here.  The vendored MMVQ has
+         * kernels for both and the vendored MMQ even has IQ1_S tiles, but the
+         * ds4-side glue only has ds4_mmq_dense_impl specializations for the types
+         * the release trunks use: naming IQ1_S here links and fails on an
+         * undefined mul_mat_q_case<(ggml_type)19>, and IQ1_M has no tiles at all.
+         * Both therefore go through the vector kernels in slices of eight rows
+         * (qwen38_gpu_matvec_rows), which is the path that works; IQ1_S weighs
+         * 0.03 GiB in the mixed file it appears in, so the smaller matmul tiles
+         * cost nothing measurable. */
         default:
             fprintf(stderr, "ds4_mmq_quant_dense: unsupported type %u\n", weight_type);
             return -1;
@@ -4997,6 +5006,9 @@ extern "C" int ds4_mmq_quant_dense_vec(
         DS4_MMQ_VEC_CASE(GGML_TYPE_IQ3_S,   "ds4_mmq_iq3_s_dense_vec");
         DS4_MMQ_VEC_CASE(GGML_TYPE_IQ4_XS,  "ds4_mmq_iq4_xs_dense_vec");
         DS4_MMQ_VEC_CASE(GGML_TYPE_IQ1_M,   "ds4_mmq_iq1_m_dense_vec");
+        /* The vendored MMVQ has carried IQ1_S all along, like Q6_K and IQ1_M; the
+         * ds4-side dispatch list was the only thing that never named it. */
+        DS4_MMQ_VEC_CASE(GGML_TYPE_IQ1_S,   "ds4_mmq_iq1_s_dense_vec");
         DS4_MMQ_VEC_CASE(GGML_TYPE_Q6_K,    "ds4_mmq_q6_K_dense_vec");
         default:
             fprintf(stderr, "ds4_mmq_quant_dense_vec: unsupported type %u\n", weight_type);
