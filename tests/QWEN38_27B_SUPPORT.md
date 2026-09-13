@@ -280,3 +280,45 @@ four drafted tokens pays the 10.95 GiB of weights once - which is the whole poin
 token. So `--mtp` is for chat, which is what the default `run-qwen-server.sh`
 profile is for (ctx 16384 with the draft head, the largest context where it
 fits); use the `long` profile for documents.
+
+## The server profiles
+
+`run-qwen-server.sh` is the shortcut for a server that is ready to use.  It has
+four profiles and can be adjusted without editing it:
+
+| profile | model | context | KV |
+|---|---|---|---|
+| `merged` (default) | trunk with the draft head inside it | 16384 | f16 |
+| `sidecar` | trunk + NVFP4 draft sidecar | 16384 | f16 |
+| `long` | trunk | 32768 | f16 |
+| `q4` | trunk | 131072 | q4_0 |
+
+`./run-qwen-server.sh --help` prints the same list.  Any profile accepts:
+
+    DS4_CTX         context tokens            (default: the profile's own)
+    DS4_CTK/DS4_CTV KV type, f16 (default), q8_0 or q4_0; K and V must match
+    DS4_HOST        bind address              (default 127.0.0.1; 0.0.0.0 for the LAN)
+    DS4_PORT        port                      (default 8080)
+    DS4_POWER       1..100 duty cycle         (default: the engine's 100)
+    DS4_QWEN_MODEL_DIR, DS4_KV_DIR
+
+so `DS4_CTK=q8_0 DS4_CTV=q8_0 DS4_CTX=65536 ./run-qwen-server.sh long` is the f16
+profile made twice as wide without touching the file.  Mismatched `DS4_CTK` and
+`DS4_CTV` are refused with a message instead of starting.  All profiles share one
+disk KV directory and always pass `--kv-cache-reject-different-quant`, so a
+checkpoint written with one KV type is never resumed by another.
+
+Why `q4` exists: attention K/V is 64 KiB per token as f16, and at 131072 tokens
+the f16 K alone asks the allocator for 4096 MiB, which this 16 GiB card refuses.
+q4_0 stores it at about a quarter, and the profile starts and serves at 131072
+with 15411 MiB of VRAM in use.  Measured on the card: at the same context q4_0
+costs a few percent of decode (47.1-47.6 against f16's 49.1-49.2 tok/s at 2048),
+and at 65536 the same measurement reads 15.3 tok/s - depth is what costs, not the
+format.
+
+`ds4-bench` is not the tool to compare this with.  It fails to create a session at
+131072 with q4_0 even with 13947 MiB free ("failed to allocate Qwen CUDA tensor
+hidden", 10 MiB), so it does not allocate the way the server does; and its
+`--ctx-max` is divided by the KV ratio for quantized types - 8192 asked measures at
+2048 - so its `ctx_tokens` column is the context actually run, not the one
+requested.

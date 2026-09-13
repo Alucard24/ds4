@@ -154,9 +154,14 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
                 "Vision encoder GGUF for the selected model.");
         }
         opt(fp, c, "-ctk, -ctv TYPE",
-            "Attention KV cache type: f16 (default) or q8_0.  q8_0 halves the "
-            "cache, which raises the context that fits, at a small cost in "
-            "quality: NLL 1.81927471 against 1.81334038.  K and V must match.");
+            "Attention KV cache type: f16 (default), q8_0 or q4_0.  Attention "
+            "K/V is 64 KiB per token as f16, which is what puts a long context "
+            "out of reach; q8_0 stores it at about half size and q4_0 at about "
+            "a quarter, and the prefill reads a quantized cache through an f16 "
+            "mirror, so the format costs memory and a few percent of decode "
+            "speed rather than the bandwidth it saves.  K and V must match.  On "
+            "Qwen3.8-27B the 16-token regression sentence reads NLL 1.80954673 "
+            "(f16), 1.80900178 (q8_0) and 1.82242633 (q4_0).");
     }
 #ifdef DS4_ROCM_BUILD
     opt(fp, c, "--metal | --rocm | --cpu", "Select the backend explicitly.");

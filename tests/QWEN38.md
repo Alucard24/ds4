@@ -472,6 +472,19 @@ token, the scalars - does not change, while 192 blocks no longer fit in one wave
 eats the gain.  Reverted.  The lesson is the one the MMA spike taught the same day:
 a microbenchmark measures the body, and the body is not the kernel.
 
+Two ds4-bench findings, recorded because the profile work ran into them and neither
+is something to write a number on top of.  At ctx 131072 with q4_0 the bench cannot
+create a session even with 13947 MiB of VRAM free ("failed to allocate Qwen CUDA
+tensor hidden", 10 MiB) while ds4-server runs the same 131072/q4_0 shape in 15411
+MiB, so the two do not allocate alike.  And for a quantized KV the bench's --ctx-max
+is divided by the KV ratio - 8192 asked measures at 2048, 32768 asked at 8192 - so
+the ctx_tokens column is the context actually run; one case (65536 asked with q4_0)
+printed 65536 instead, so the rule is not self-consistent.  The same change replaced
+a stale claim in the profile script: "1253 tok/s of prefill and 58.2 tok/s of decode
+at 131072" was not reproducible, and the measurements that were taken say the format
+costs a few percent of decode at equal context (47.1-47.6 against 49.1-49.2 tok/s at
+2048) and that depth, not the format, is what moves throughput (15.3 tok/s at 65536).
+
 Three of the five binaries had no runtime gate at all: the script built ds4-eval,
 ds4-bench and ds4-agent and never ran them, and the last two had just been given
 their `-ctk`/`-ctv` flags.  They have one now, and it costs twenty seconds: the eval's
