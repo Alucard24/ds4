@@ -486,11 +486,16 @@ turn reports
 
     ds4-agent: failed to save system prompt KV: unsupported routed quantization for KV save
 
-which is a real bug of its own: `agent_kv_save_path` insists the engine's *routed
+which was a real bug of its own: `agent_kv_save_path` insisted the engine's *routed
 expert* quantization is 2 or 4 bits, a DeepSeek-shaped requirement, so with Qwen the
-agent's documented session save never happens.  The engine's own payload staging works
-for Qwen - the session tests save and restore it - so the check is a leftover, not a
-limitation, and it is recorded rather than patched inside a batch about something else.
+agent's documented session save never happened.  The byte is a checkpoint identity
+field: it is written into the header and compared on load against the same engine
+call (`ds4_engine_routed_quant_bits`), which reports zero for a model with no routed
+experts.  Zero was therefore already self-consistent on the load side; only the save
+refused it, and for DeepSeek the check never fired, so removing it is a no-op there.
+The agent now saves `sysprompt.kv` (2048 tokens, 292 MB of payload - the GDN recurrent
+state is 201 MB of it) and reloads it on the next run, which the regression checks
+together with the header byte itself.
 
 The server's landing page now streams: it asks for `stream: true` and paints both
 `reasoning_content` and `content` as they arrive, because this model thinks for a long

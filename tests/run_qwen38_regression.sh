@@ -171,6 +171,43 @@ case "$agent" in
     *) echo "agent one-shot turn failed:"; printf '%s\n' "$agent" | tail -4; exit 1 ;;
 esac
 
+# The agent's session cache: agent_kv_save_path demanded a routed-expert
+# quantization of 2 or 4 bits, a DeepSeek-shaped requirement, so with Qwen every
+# save failed and the documented session persistence never happened.  The header
+# byte is compared on load against the same engine call, so zero (no routed
+# experts) is self-consistent.  A private HOME keeps this away from real sessions.
+acache=$(mktemp -d)
+(cd /tmp && HOME="$acache" "$OLDPWD/ds4-agent" -m "$MODEL" -c 4096 --non-interactive \
+    -p 'Reply with exactly the two words: all good' >/dev/null 2>"$acache/first.log") || true
+if grep -q "failed to save system prompt KV" "$acache/first.log"; then
+    echo "the agent still refuses to save its KV cache:"
+    grep "failed to save" "$acache/first.log" | head -2
+    exit 1
+fi
+if [ ! -f "$acache/.ds4/kvcache/sysprompt.kv" ]; then
+    echo "the agent ran but wrote no sysprompt KV cache"
+    exit 1
+fi
+# Same invariant the load path checks: the byte must be what the engine reports.
+qsaved=$(python3 -c "
+import sys
+h = open(sys.argv[1], 'rb').read(16)
+print(h[4])" "$acache/.ds4/kvcache/sysprompt.kv")
+if [ "$qsaved" != "0" ]; then
+    echo "sysprompt KV records quant_bits=$qsaved; Qwen3.8 has no routed experts"
+    exit 1
+fi
+# And the second run must accept that file rather than fail on it.
+(cd /tmp && HOME="$acache" "$OLDPWD/ds4-agent" -m "$MODEL" -c 4096 --non-interactive \
+    -p 'Reply with exactly the two words: all good' >/dev/null 2>"$acache/second.log") || true
+if grep -qE "failed to (save|load) .*KV|cached text does not match" "$acache/second.log"; then
+    echo "the agent rejected its own KV cache on the second run:"
+    grep -E "failed to (save|load)|does not match" "$acache/second.log" | head -2
+    exit 1
+fi
+echo "agent KV cache: saved (quant_bits=0) and reloaded"
+rm -rf "$acache"
+
 echo "===== tokenizer vectors ====="
 make test-tokenizer-vectors 2>/dev/null || echo "(tokenizer vectors target not present; covered by run_qwen38_cpu.sh)"
 

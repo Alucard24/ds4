@@ -4738,11 +4738,14 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
         snprintf(err, err_len, "live KV state does not match session transcript");
         return false;
     }
+    /* The header records the routed-expert quantization so a checkpoint cannot be
+     * resumed by a model whose experts were quantized differently.  A model with
+     * no routed experts at all - Qwen3.8 has none - reports zero, which is just as
+     * meaningful: the load path compares this byte against the same function, so
+     * zero is self-consistent, and demanding 2 or 4 here only made every save fail
+     * with "unsupported routed quantization" while the engine's own payload
+     * staging had already written it correctly. */
     const int quant_bits = ds4_engine_routed_quant_bits(w->engine);
-    if (quant_bits != 2 && quant_bits != 4) {
-        snprintf(err, err_len, "unsupported routed quantization for KV save");
-        return false;
-    }
     const int model_id = ds4_engine_model_id(w->engine);
 
     size_t text_len = 0;
