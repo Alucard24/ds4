@@ -434,6 +434,34 @@ score.  The finder was a new diagnostic, `DS4_QWEN38_GA_DUMP`, which prints the
 first GA layer's attention rows: it turned "1-5 logits off" into "NaN in most
 dimensions, row 0 identical".
 
+The phase attribution of a chunk was wrong for as long as it existed, in two ways
+that together hid where the time actually goes.  The collector attributes an
+interval to the group of the mark that *closes* it, so the FFN's mark has to come
+after the down projection and the residual rather than before the SwiGLU: with it
+before, those 59 ms were filed under `head` and groups 3 and 7 stayed at zero.  And
+the extra line subtracted a running total from per-chunk numbers, so every chunk
+after the first printed a negative time for the post-attention norm.
+
+With both fixed, a 336 ms chunk at 464 rows adds up with about 3 ms unaccounted:
+
+| item | ms | share |
+|---|---|---|
+| **FFN up** | 53.3 | 16% |
+| **FFN gate** | 60.1 | 18% |
+| **FFN down + SwiGLU + residual** | 59.2 | 18% |
+| attention core (GDN 50.5 + GA 29.9) | 80.4 | 24% |
+| projections (qkv and o) | 57.7 | 17% |
+| attention output | 19.6 | 6% |
+| output head and final norm | ~3 | 1% |
+
+So the chunk is **FFN-dominated at 51%**, and the head is not a large item at all:
+the 57.6 ms bucket I had been calling "the head" was the FFN's own down projection,
+which also means the 20.3 TFLOP/s I attributed to the head earlier measured the FFN
+with head-shaped arithmetic, a number to discard.  The FFN's gate runs at 0.64 ms
+per layer, 48 TMAC/s, which is the rate recorded for llama.cpp in this same
+document: the prefill's matmuls are at the achievable rate, and that is the end of
+the prefill's road rather than a missing optimization.
+
 The quantized twin got the same treatment and the naive form of it **lost**, which
 is worth recording because the reason is structural: q8_0's attention core went from
 72.6 to **122.6 ms** (q4_0 72.7 to 112.1) when the dequantization was moved into

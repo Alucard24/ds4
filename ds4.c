@@ -8787,16 +8787,13 @@ static void qwen38_phase_collect(void) {
     g_qwen38_phase.ffn[1] += totals[7] / 1000.0;
     g_qwen38_phase.head += totals[8] / 1000.0;
     g_qwen38_phase.proj[0] += 0.0;
-    /* Printed per chunk, not accumulated: an earlier version kept a running
-     * total and made a warm chunk look as slow as the cold one. */
-    static double extra_prev[3];
-    double extra[3];
-    extra[0] = totals[9] / 1000.0 - extra_prev[0];
-    extra[1] = totals[10] / 1000.0 - extra_prev[1];
-    extra[2] = totals[11] / 1000.0 - extra_prev[2];
-    extra_prev[0] += extra[0];
-    extra_prev[1] += extra[1];
-    extra_prev[2] += extra[2];
+    /* These are per-chunk totals already - ds4_gpu_phase_finish resets the
+     * marks - so nothing is subtracted here.  An earlier version kept a running
+     * extra_prev and subtracted it, which made every chunk after the first
+     * report a negative number. */
+    const double extra[3] = {
+        totals[9] / 1000.0, totals[10] / 1000.0, totals[11] / 1000.0,
+    };
     /* Group 9 closes the interval before the gate matmul (the post-attention
      * norm), 10 and 11 the gate and up matmuls themselves. */
     fprintf(stderr,
@@ -9006,7 +9003,6 @@ static int qwen38_gpu_forward_chunk(ds4_qwen38_gpu_state *st,
         QWEN38_CHUNK_CHECK(qwen38_gpu_matvec_rows(
             st->ffn_u, m, l->ffn_up, st->xnorm, n_tokens), "FFN up");
         qwen38_phase_mark(11);
-        qwen38_phase_mark(phase_gdn ? 3 : 7);
         QWEN38_CHUNK_CHECK(ds4_gpu_swiglu_tensor(
             st->ffn_m, st->ffn_g, st->ffn_u,
             n_tokens * QWEN38_N_FF, 0.0f, 1.0f), "SwiGLU");
@@ -9015,6 +9011,11 @@ static int qwen38_gpu_forward_chunk(ds4_qwen38_gpu_state *st,
         QWEN38_CHUNK_CHECK(ds4_gpu_add_tensor(
             st->hidden, st->hidden, st->proj,
             n_tokens * QWEN38_N_EMBD), "FFN residual");
+        /* The collector attributes an interval to the group of the mark that
+         * *closes* it, so this mark has to come after the work it labels: with
+         * it before the SwiGLU, the whole down projection and residual were
+         * being filed under "head" and groups 3 and 7 stayed at zero. */
+        qwen38_phase_mark(phase_gdn ? 3 : 7);
         qwen38_phase_mark(QWEN38_PHASE_HEAD_GROUP);
     }
     QWEN38_CHUNK_CHECK(ds4_gpu_rms_norm_weight_rows_tensor(
