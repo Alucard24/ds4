@@ -30,11 +30,12 @@
 # out of memory".  q4_0 stores it at about a quarter, and this profile starts and
 # serves at 131072 with 15411 MiB of VRAM used on a 16 GiB card.
 #
-# What the format buys is memory, not speed, but the speed cost at the same
-# context is small: 47.1-47.6 tok/s of decode against f16's 49.1-49.2 at 2048,
-# and the prefill reads a quantized cache through an f16 mirror either way.  What
-# changes throughput is depth, not the format - the same measurement reads 15.3
-# tok/s at 65536.  The NLL costs are in the server's -ctk help.
+# What the format buys is memory, and its decode cost grows with depth: 3% at 2048
+# (47.1-47.6 tok/s against f16's 49.1-49.2) but 36% at 32768 (23.2 against 36.1),
+# because the prefill and the decode both read the cache through an f16 mirror that
+# is rebuilt per chunk.  Prefill is unaffected - 531 against 528 tok/s at 32768 -
+# and at 131072 there is no f16 comparison to make: that cache does not allocate.
+# The NLL costs are in the server's -ctk help.
 #
 # ds4-bench is not the tool to price this with.  It fails to create a session at
 # 131072 with q4_0 even with 13947 MiB free ("failed to allocate Qwen CUDA tensor

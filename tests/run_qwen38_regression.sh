@@ -243,6 +243,53 @@ echo "===== MTP draft and speculative decoding ====="
 make tests/test_qwen38_mtp CUDA_ARCH=sm_120
 ./tests/test_qwen38_mtp "$MODEL" "$MTP" "$PROMPT"
 
+echo "===== the disk KV cache of a quantized session ====="
+# A quantized cache made every save fail - "session tensor is smaller than the
+# payload" - because the payload sizing asked for f16 bytes per position (2048)
+# from a tensor holding the block format's 576.  Saves are skipped rather than
+# fatal, so the feature was quietly dead: the server never wrote a file and the
+# bench could not snapshot past 4096 positions.  This is that round trip.
+# Build what this step runs: the CPU reference step ran `make clean`, so no
+# binary from the first build exists at this point.  Every step that runs a
+# binary builds it, or it measures a missing file.
+make ds4-server CUDA_ARCH=sm_120 >/dev/null 2>&1
+kvdir=$(mktemp -d)
+python3 -c "
+w = 'The capital of France is Paris and the largest ocean is the Pacific and the tallest mountain is Everest. '
+open('$kvdir/req.json', 'w').write(__import__('json').dumps(
+    {'messages': [{'role': 'user', 'content': ' '.join([w] * 60)}], 'max_tokens': 8}))"
+./ds4-server -m "$MODEL" --ctx 4096 --host 127.0.0.1 --port 8096 \
+    -ctk q4_0 -ctv q4_0 --kv-disk-dir "$kvdir" --kv-disk-space-mb 1024 \
+    > "$kvdir/first.log" 2>&1 &
+kvpid=$!
+for _ in $(seq 1 60); do sleep 2; grep -q "listening on" "$kvdir/first.log" 2>/dev/null && break; done
+curl -s -m 300 http://127.0.0.1:8096/v1/chat/completions \
+    -H 'Content-Type: application/json' --data @"$kvdir/req.json" >/dev/null || true
+sleep 3
+kill $kvpid 2>/dev/null || true; wait $kvpid 2>/dev/null || true; sleep 3
+if ! ls "$kvdir"/*.kv >/dev/null 2>&1; then
+    echo "a q4_0 session wrote no disk KV cache:"
+    grep -iE "kv cache|skipped" "$kvdir/first.log" | tail -2
+    rm -rf "$kvdir"; exit 1
+fi
+echo "q4_0 KV cache saved: $(ls "$kvdir"/*.kv | head -1 | xargs basename | cut -c1-12)… ($(du -h "$kvdir"/*.kv | cut -f1))"
+./ds4-server -m "$MODEL" --ctx 4096 --host 127.0.0.1 --port 8096 \
+    -ctk q4_0 -ctv q4_0 --kv-disk-dir "$kvdir" --kv-disk-space-mb 1024 \
+    > "$kvdir/second.log" 2>&1 &
+kvpid=$!
+for _ in $(seq 1 60); do sleep 2; grep -q "listening on" "$kvdir/second.log" 2>/dev/null && break; done
+curl -s -m 300 http://127.0.0.1:8096/v1/chat/completions \
+    -H 'Content-Type: application/json' --data @"$kvdir/req.json" >/dev/null || true
+sleep 3
+kill $kvpid 2>/dev/null || true; wait $kvpid 2>/dev/null || true; sleep 2
+if ! grep -q "kv cache hit" "$kvdir/second.log"; then
+    echo "the second server did not restore the q4_0 cache:"
+    grep -iE "kv cache|skipped" "$kvdir/second.log" | tail -2
+    rm -rf "$kvdir"; exit 1
+fi
+grep -m1 "kv cache hit" "$kvdir/second.log" | sed 's/.*ds4-server: /q4_0 KV cache hit: /' | cut -c1-100
+rm -rf "$kvdir"
+
 echo "===== server protocol tests ====="
 make ds4_test CUDA_ARCH=sm_120
 ./ds4_test --server

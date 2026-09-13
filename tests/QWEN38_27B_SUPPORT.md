@@ -313,9 +313,11 @@ Why `q4` exists: attention K/V is 64 KiB per token as f16, and at 131072 tokens
 the f16 K alone asks the allocator for 4096 MiB, which this 16 GiB card refuses.
 q4_0 stores it at about a quarter, and the profile starts and serves at 131072
 with 15411 MiB of VRAM in use.  Measured on the card: at the same context q4_0
-costs a few percent of decode (47.1-47.6 against f16's 49.1-49.2 tok/s at 2048),
-and at 65536 the same measurement reads 15.3 tok/s - depth is what costs, not the
-format.
+costs a few percent of decode at 2048 (47.1-47.6 against f16's 49.1-49.2 tok/s) and
+much more deeper down - 23.2 against 36.1 at 32768 - because the cache is read
+through an f16 mirror that is rebuilt per chunk. Prefill is unaffected (531 against
+528 tok/s at 32768). At 131072 there is no f16 comparison to make: that cache does
+not allocate at all.
 
 ### The second trunk format
 

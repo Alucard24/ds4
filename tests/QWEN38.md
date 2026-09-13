@@ -472,6 +472,40 @@ token, the scalars - does not change, while 192 blocks no longer fit in one wave
 eats the gain.  Reverted.  The lesson is the one the MMA spike taught the same day:
 a microbenchmark measures the body, and the body is not the kernel.
 
+The quantized KV cache could not be saved to disk at all, and the bug sat two
+functions away from the code that had sized the arena correctly all along.  The
+session arena asks for 576 bytes per position per layer for a q4_0 cache (32 blocks
+of 18 bytes), 1088 for q8_0 and 2048 for f16; the payload sizing computed
+saved_tokens * KV_DIM * kv_element_bytes and passed 2 for any GPU session, so it
+demanded 2048 bytes per position from a tensor holding 576.  Every save then failed
+with "session tensor is smaller than the payload" - in the server, where a cache
+store is skipped with a log line rather than fatal, and in ds4-bench, where the
+snapshot dies and the harness stops measuring at the frontier it failed on.  Nothing
+had noticed because the release trunk runs f16 KV, where both numbers agree.
+
+The load side was worse in principle: it chose its branch by element width, which is
+2 both for f16 and for the block formats, so a quantized payload would have been
+written raw into the block tensor.  That path was unreachable precisely because the
+save never produced a file.  Both directions now go through one helper,
+session_qwen38_kv_pos_bytes(), which is also what the arena calls, so the three
+numbers cannot drift apart again.  Measured after the fix: the server writes cold
+checkpoints again (173.63 MiB, 100.3 ms) and the next start restores them with a
+cache hit (46.3 ms against the 1047 ms prefill it replaces); the bench runs every
+frontier with q4_0 instead of stopping at 4096; and the f16 payloads are
+byte-for-byte what they were - the difference between the two formats for 2048
+tokens is exactly 2048 * 16 * 2 * (2048 - 576) bytes.
+
+The decode cost of a quantized cache grows with depth, which the first measurements
+at 2048 did not show: 3% there (47.1-47.6 against 49.1-49.2 tok/s) but 36% at 32768
+(23.2 against 36.1), because the f16 mirror is rebuilt per chunk.  Prefill is
+unaffected (531 against 528).  At 131072 there is no comparison to make: an f16
+cache of that size does not allocate.
+
+One ds4-bench finding from the same session was not a bug: --ctx-max appeared to be
+divided by the KV ratio (8192 asked, 2048 measured), but the run had died at the
+4096 frontier and the last surviving row had been mistaken for the whole curve.  The
+defect was the redirection in the measurement, not the harness.
+
 A second trunk quantization mix now runs: Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf,
 10.44 GiB against 11.77.  Its name is a recipe, not a type - it carries nine
 quantizations and six of them were unexecutable (IQ3_XXS, IQ2_S, IQ2_XS, IQ4_XS,

@@ -7839,6 +7839,10 @@ typedef struct {
 
 static void qwen38_mtp_drop_history(ds4_session *s);
 
+/* Defined with the Qwen payload sizing far below; the session arena needs it
+ * first, and both must agree or a saved cache cannot be restored. */
+static uint64_t session_qwen38_kv_pos_bytes(bool cpu);
+
 static int qwen38_gpu_alloc_bytes(ds4_gpu_tensor **out, uint64_t bytes,
                                   const char *label) {
     *out = ds4_gpu_tensor_alloc(bytes);
@@ -7901,8 +7905,8 @@ static int qwen38_gpu_state_init(ds4_qwen38_gpu_state *st, uint32_t ctx_size) {
     if (getenv("DS4_KV_Q8") != NULL) kv_fmt = 1;
     if (getenv("DS4_KV_Q4") != NULL) kv_fmt = 2;
     ds4_gpu_qwen38_set_kv_fmt(kv_fmt);
-    const uint64_t kv_pos_bytes = kv_fmt == 2 ? 576ull :
-                                  (kv_fmt == 1 ? 1088ull : 2048ull);
+    const uint64_t kv_pos_bytes = session_qwen38_kv_pos_bytes(false);
+
     if (!qwen38_gpu_alloc_bytes(&st->attn_k,
             16ull * ctx_size * kv_pos_bytes, "attn_k")) goto fail;
     if (!qwen38_gpu_alloc_bytes(&st->attn_v,
@@ -58455,12 +58459,35 @@ static uint64_t session_qwen38_conv_state_bytes(void) {
 /* Qwen stores backend-native GA precision in DSV4: F32 for the CPU oracle and
  * F16 for CUDA. The element-size header allows either backend to restore either
  * representation while preserving the source checkpoint's exact values. */
+/* Bytes of one GA layer's K (or V) per saved position, in the format the session's
+ * cache actually uses.  A quantized cache is a block format, so this is not an
+ * element size: the 1024 values of one position are 32 blocks - 18 bytes each for
+ * q4_0, 34 for q8_0 - against 2 bytes each for f16, which is where the arena sizing
+ * has had these three numbers all along.  The payload sizing assumed f16 and asked
+ * for 2048 bytes per position from a tensor holding 576, so every disk KV save of a
+ * quantized session failed with "session tensor is smaller than the payload" - in
+ * the server and in the bench's snapshot alike.  The load, which chose its branch by
+ * element width, would have copied those bytes raw into a block tensor.  Both
+ * directions are made consistent here. */
+static uint64_t session_qwen38_kv_pos_bytes(bool cpu) {
+    if (cpu) return (uint64_t)QWEN38_GA_KV_DIM * sizeof(float);
+#ifdef DS4_NO_GPU
+    return (uint64_t)QWEN38_GA_KV_DIM * sizeof(uint16_t);
+#else
+    switch (ds4_gpu_qwen38_kv_fmt()) {
+        case 1:  return 1088ull;
+        case 2:  return 576ull;
+        default: return 2048ull;
+    }
+#endif
+}
+
 static bool session_qwen38_payload_size(uint32_t saved_tokens,
                                         uint32_t image_count,
-                                        uint32_t kv_element_bytes,
+                                        uint64_t kv_pos_bytes,
                                         uint64_t *out) {
-    if (!out || (kv_element_bytes != sizeof(uint16_t) &&
-                 kv_element_bytes != sizeof(float))) return false;
+    if (!out || kv_pos_bytes == 0) return false;
+
     uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
     bytes += (uint64_t)saved_tokens * sizeof(uint32_t);
     bytes += (uint64_t)DS4_N_VOCAB * sizeof(float);
@@ -58468,7 +58495,7 @@ static bool session_qwen38_payload_size(uint32_t saved_tokens,
     bytes += session_qwen38_ssm_state_bytes();
     bytes += session_qwen38_conv_state_bytes();
     bytes += (uint64_t)QWEN38_N_GA_LAYER * saved_tokens *
-             QWEN38_GA_KV_DIM * 2u * kv_element_bytes;
+             2u * kv_pos_bytes;
     *out = bytes;
     return true;
 }
@@ -58611,8 +58638,8 @@ static int ds4_session_save_qwen38_payload(ds4_session *s, FILE *fp,
         rc = payload_write_tensor_span(fp, st->conv_state, 0,
                                        session_qwen38_conv_state_bytes(),
                                        buf, DS4_SESSION_IO_CHUNK, err, errlen);
-    const uint64_t kv_bytes = (uint64_t)saved_tokens * QWEN38_GA_KV_DIM *
-                              sizeof(uint16_t);
+    const uint64_t kv_bytes =
+        (uint64_t)saved_tokens * session_qwen38_kv_pos_bytes(false);
     for (uint32_t ga = 0; rc == 0 && ga < QWEN38_N_GA_LAYER; ga++) {
         rc = payload_write_tensor_span(fp, st->attn_k_layer[ga], 0, kv_bytes,
                                        buf, DS4_SESSION_IO_CHUNK, err, errlen);
@@ -58662,7 +58689,7 @@ static int ds4_session_load_qwen38_payload(ds4_session *s, FILE *fp,
         h[10] != QWEN38_N_GA_LAYER || h[11] != DS4_N_VOCAB ||
         h[12] != QWEN38_GA_KV_DIM ||
         !session_qwen38_payload_size(saved_tokens, image_count,
-                                     kv_element_bytes, &expected_bytes)) {
+                                     session_qwen38_kv_pos_bytes(ds4_session_is_cpu(s)), &expected_bytes)) {
         payload_set_err(err, errlen, "KV checkpoint was written for a different Qwen layout");
         return 1;
     }
@@ -58770,7 +58797,19 @@ static int ds4_session_load_qwen38_payload(ds4_session *s, FILE *fp,
                                           buf, DS4_SESSION_IO_CHUNK,
                                           remaining, err, errlen);
         for (uint32_t ga = 0; rc == 0 && ga < QWEN38_N_GA_LAYER; ga++) {
-            if (kv_element_bytes == sizeof(uint16_t)) {
+            if (kv_file_format != 0u) {
+                /* A quantized cache travels as its own block bytes: the file's format
+                 * already matched the session's above, and one position per layer is 32
+                 * blocks of 18 or 34 bytes rather than 2 bytes per value.  Only a GPU
+                 * writer produces this, so no width conversion is involved. */
+                const uint64_t kv_bytes =
+                    (uint64_t)saved_tokens * session_qwen38_kv_pos_bytes(false);
+                rc = payload_read_tensor_span(fp, st->attn_k_layer[ga], 0, kv_bytes, buf,
+                                              DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+                if (rc == 0)
+                    rc = payload_read_tensor_span(fp, st->attn_v_layer[ga], 0, kv_bytes, buf,
+                                                  DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+            } else if (kv_element_bytes == sizeof(uint16_t)) {
                 const uint64_t kv_bytes = kv_count * sizeof(uint16_t);
                 rc = payload_read_tensor_span(fp, st->attn_k_layer[ga], 0,
                                               kv_bytes, buf,
@@ -59861,13 +59900,14 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
         if (s->checkpoint.len <= 0 || s->checkpoint_image_count > UINT32_MAX)
             return 0;
         uint64_t bytes = 0;
-        const uint32_t kv_element_bytes = ds4_session_is_cpu(s) ?
-            sizeof(float) : sizeof(uint16_t);
+
+
         return session_qwen38_payload_size(
             (uint32_t)s->checkpoint.len,
             (uint32_t)s->checkpoint_image_count,
-            kv_element_bytes, &bytes) ? bytes : 0;
-    }
+            session_qwen38_kv_pos_bytes(ds4_session_is_cpu(s)),
+              &bytes) ? bytes : 0;
+      }
     if (ds4_session_is_cpu(s)) {
         uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
         bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
@@ -69067,8 +69107,15 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
              * (1.6 GiB) + the sidecar and its state (0.96 GiB) no longer stay
              * resident, and every token then streams weights from host memory.
              * Decode collapsed from ~50 to ~4.2 tok/s with speculation either
-             * on or off, so the cause is residency, not the draft rounds. */
-            if (ctx_size >= 24576) {
+             * on or off, so the cause is residency, not the draft rounds.
+             *
+             * The measurement is the sidecar's, and so are the numbers in the
+             * message: an embedded draft head (--mtp, block 64 inside the trunk)
+             * shares the trunk's bytes and does not add 0.96 GiB.  Measured with
+             * the IQ3_XXS trunk, whose matrix is 0.85 GiB smaller: draft at 32768
+             * decodes at 58.55 tok/s, so warning there would be wrong and would
+             * push a working configuration off the table. */
+            if (e->qwen38_mtp_source == &e->mtp_model && ctx_size >= 24576) {
                 fprintf(stderr,
                         "ds4: warning: --mtp-model with a %d-token context "
                         "exceeds the resident budget measured on a 16 GiB "
