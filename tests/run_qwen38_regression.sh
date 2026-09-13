@@ -76,6 +76,19 @@ if [ -f "$MODEL_XXS" ]; then
         *1.87606303*) echo "IQ3_XXS trunk NLL as recorded: $nll_xxs" ;;
         *) echo "IQ3_XXS trunk NLL drifted: '${nll_xxs:-none}'"; exit 1 ;;
     esac
+    # The same trunk with a quantized cache: the two cells that were never run
+    # before they were measured here (q8_0 1.87684186, q4_0 1.87755574).
+    for cell in "q8_0:1.87684186:DS4_KV_Q8" "q4_0:1.87755574:DS4_KV_Q4"; do
+        fmt=${cell%%:*}; rest=${cell#*:}
+        pin=${rest%%:*}; hook=${rest##*:}
+        rm -f /tmp/ds4.lock
+        got=$(env "$hook=1" DS4_TEST_QWEN38_CUDA=1 DS4_TEST_QWEN38_EXPECT_NLL="$pin" \
+            ./tests/test_qwen38_session_cuda "$MODEL_XXS" "$PROMPT" 2>&1 | grep '^MEAN_NLL' || true)
+        case "$got" in
+            *"$pin"*) echo "IQ3_XXS trunk NLL with KV $fmt as recorded: $got" ;;
+            *) echo "IQ3_XXS trunk NLL with KV $fmt drifted: '${got:-none}'"; exit 1 ;;
+        esac
+    done
 else
     echo "(IQ3_XXS trunk not present; the IQ1_S path is covered by the CPU kernel checks)"
 fi
@@ -261,13 +274,16 @@ echo "===== the disk KV cache of a quantized session ====="
 # binary from the first build exists at this point.  Every step that runs a
 # binary builds it, or it measures a missing file.
 make ds4-server CUDA_ARCH=sm_120 >/dev/null 2>&1
+# Both quantized formats: the payload sizing is per format (576 and 1088 bytes per
+# position per layer against f16's 2048) and q8_0 was never exercised end to end.
+for kvfmt in q4_0 q8_0; do
 kvdir=$(mktemp -d)
 python3 -c "
 w = 'The capital of France is Paris and the largest ocean is the Pacific and the tallest mountain is Everest. '
 open('$kvdir/req.json', 'w').write(__import__('json').dumps(
     {'messages': [{'role': 'user', 'content': ' '.join([w] * 60)}], 'max_tokens': 8}))"
 ./ds4-server -m "$MODEL" --ctx 4096 --host 127.0.0.1 --port 8096 \
-    -ctk q4_0 -ctv q4_0 --kv-disk-dir "$kvdir" --kv-disk-space-mb 1024 \
+    -ctk "$kvfmt" -ctv "$kvfmt" --kv-disk-dir "$kvdir" --kv-disk-space-mb 1024 \
     > "$kvdir/first.log" 2>&1 &
 kvpid=$!
 for _ in $(seq 1 60); do sleep 2; grep -q "listening on" "$kvdir/first.log" 2>/dev/null && break; done
@@ -280,9 +296,9 @@ if ! ls "$kvdir"/*.kv >/dev/null 2>&1; then
     grep -iE "kv cache|skipped" "$kvdir/first.log" | tail -2
     rm -rf "$kvdir"; exit 1
 fi
-echo "q4_0 KV cache saved: $(ls "$kvdir"/*.kv | head -1 | xargs basename | cut -c1-12)… ($(du -h "$kvdir"/*.kv | cut -f1))"
+echo "$kvfmt KV cache saved: $(ls "$kvdir"/*.kv | head -1 | xargs basename | cut -c1-12)… ($(du -h "$kvdir"/*.kv | cut -f1))"
 ./ds4-server -m "$MODEL" --ctx 4096 --host 127.0.0.1 --port 8096 \
-    -ctk q4_0 -ctv q4_0 --kv-disk-dir "$kvdir" --kv-disk-space-mb 1024 \
+    -ctk "$kvfmt" -ctv "$kvfmt" --kv-disk-dir "$kvdir" --kv-disk-space-mb 1024 \
     > "$kvdir/second.log" 2>&1 &
 kvpid=$!
 for _ in $(seq 1 60); do sleep 2; grep -q "listening on" "$kvdir/second.log" 2>/dev/null && break; done
@@ -295,8 +311,9 @@ if ! grep -q "kv cache hit" "$kvdir/second.log"; then
     grep -iE "kv cache|skipped" "$kvdir/second.log" | tail -2
     rm -rf "$kvdir"; exit 1
 fi
-grep -m1 "kv cache hit" "$kvdir/second.log" | sed 's/.*ds4-server: /q4_0 KV cache hit: /' | cut -c1-100
+grep -m1 "kv cache hit" "$kvdir/second.log" | sed "s/.*ds4-server: /$kvfmt KV cache hit: /" | cut -c1-100
 rm -rf "$kvdir"
+done
 
 echo "===== server protocol tests ====="
 make ds4_test CUDA_ARCH=sm_120
