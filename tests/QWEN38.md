@@ -494,7 +494,13 @@ Verification, in the order it was done: the CPU dequantizer is line-for-line the
 llama.cpp reference (same dl, same delta, same grid index); the session test passes
 on the file from the CPU path with LOGIT_MAX_ERROR 0; and the two paths agree on the
 same sentence to 0.0027 nats (CPU 1.8733425 against CUDA 1.87606303), which is what
-validates the chunking path that no model had exercised.  The release trunk is
+validates IQ1_S itself on both engines.  It does not validate the eight-row chunking:
+that path was already exercised by the release trunk, whose single IQ1_M tensor
+(blk.13.ffn_gate, 19.5 MB) goes through it in every prefill and has been covered by
+the prefill gates all along.  Nor is IQ1_S alone in the "new" trunk's type list: the
+release trunk already carries IQ3_XXS, IQ4_XS, IQ2_S, IQ2_XS and IQ2_XXS, so those
+kernels were in production use before this change and nothing about them was
+touched.  The release trunk is
 untouched: the same gate still reads 1.80954673 bit for bit.  The pin was made
 model-aware (DS4_TEST_QWEN38_EXPECT_NLL) so both values are gated.
 

@@ -340,6 +340,16 @@ the regression uses reads NLL 1.87606303 where the release trunk reads 1.8095467
 and the CPU reference agrees with the CUDA path to 0.0027 nats on that file. Both
 values are pinned by the regression, so neither can drift unnoticed.
 
+The release trunks are unaffected, and that is checked rather than asserted. They
+contain no IQ1_S at all, so the only loader table line that changed cannot reach
+them; the five types that made the new file look exotic - IQ3_XXS, IQ4_XS, IQ2_S,
+IQ2_XS, IQ2_XXS - are in the release trunk too and were already executable, so no
+kernel or case label of theirs was touched. The one shared condition that did change
+is the eight-row chunking guard, which now covers IQ1_S as well: for IQ1_M, the type
+the release trunk uses there (one tensor, blk.13.ffn_gate), the condition is
+identical before and after. The pinned NLL 1.80954673 and the whole regression,
+measured on the committed tree, are the same values as before the change.
+
 `ds4-bench` is not the tool to compare this with.  It fails to create a session at
 131072 with q4_0 even with 13947 MiB free ("failed to allocate Qwen CUDA tensor
 hidden", 10 MiB), so it does not allocate the way the server does; and its
