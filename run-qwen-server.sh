@@ -6,7 +6,7 @@
 #   ./run-qwen-server.sh           trunk + embedded draft head, ctx 16384  (chat)
 #   ./run-qwen-server.sh sidecar   trunk + NVFP4 sidecar,      ctx 16384
 #   ./run-qwen-server.sh long      trunk only,                 ctx 32768  (documents)
-#   ./run-qwen-server.sh xxs       IQ3_XXS trunk + draft,      ctx 32768  (chat, smaller trunk)
+#   ./run-qwen-server.sh xxs       IQ3_XXS variant, draft,     ctx 32768  (+3.7% NLL, not the default)
 #   ./run-qwen-server.sh q4        trunk only, q4_0 KV,        ctx 131072 (documents that
 #                                                                        do not fit)
 #
@@ -45,7 +45,9 @@
 # at 2048 - so its ctx_tokens column is the context actually run, not the one
 # requested.
 #
-# `xxs` is the same chat shape as `merged` - the IQ3_XXS trunk carries its draft
+# `xxs` is not the default and is not meant to become one: the release trunk is
+# IQ3_S, and every other profile here uses it.  This one is the same chat shape as
+# `merged` - the IQ3_XXS trunk carries its draft
 # head inside it too - except that the trunk is 10.44 GiB against 11.77, so the
 # draft fits at 32768 where the release trunk has to stop at 16384.  Measured on
 # this card, same prompt: 58.55 tok/s of decode at 32768 against the release

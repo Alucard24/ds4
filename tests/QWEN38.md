@@ -512,7 +512,10 @@ divided by the KV ratio (8192 asked, 2048 measured), but the run had died at the
 4096 frontier and the last surviving row had been mistaken for the whole curve.  The
 defect was the redirection in the measurement, not the harness.
 
-A second trunk quantization mix now runs: Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf,
+A second trunk quantization mix runs beside the first, and the first stays the
+default everywhere - in the server script, in the regression's model and in every
+gate above.  It is an option, not a replacement:
+ Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf,
 10.44 GiB against 11.77.  Its name is a recipe, not a type - it carries nine
 quantizations and six of them were unexecutable (IQ3_XXS, IQ2_S, IQ2_XS, IQ4_XS,
 IQ1_M, IQ1_S = 59% of its tensors).  Five were already accepted by the loader's type

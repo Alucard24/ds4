@@ -321,7 +321,11 @@ split-KV kernel reads the quantized cache directly and dequantizes inside the
 attention loop, where at depth the attention is most of the token. At 131072 there is
 no f16 comparison to make: that cache does not allocate at all.
 
-### The second trunk format
+### The second trunk format (an option; IQ3_S stays the default)
+
+IQ3_S remains the default trunk everywhere: every profile except `xxs` uses it, the
+regression's model defaults to it, and its gates are the ones that must hold.  The
+file below is a second option, chosen with `-m` or with the `xxs` profile.
 
 `Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf` is a differently mixed trunk: the name says
 IQ3_XXS, but the file carries nine quantization types and six of them were ones the
