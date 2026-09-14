@@ -799,6 +799,9 @@ typedef struct {
      * happens to be named "tool_search". */
     bool responses_tool_search;
     char **prop;
+    /* Each property's raw schema.  A Qwen tool call carries no type of its own,
+     * so a declared "string" has to outrank the value-shape guess. */
+    char **prop_schema;
     int len;
     int cap;
 } tool_schema_order;
@@ -975,8 +978,12 @@ static void tool_schema_order_free(tool_schema_order *o) {
     free(o->name);
     free(o->wire_name);
     free(o->namespace);
-    for (int i = 0; i < o->len; i++) free(o->prop[i]);
+    for (int i = 0; i < o->len; i++) {
+        free(o->prop[i]);
+        free(o->prop_schema[i]);
+    }
     free(o->prop);
+    free(o->prop_schema);
     memset(o, 0, sizeof(*o));
 }
 
@@ -986,12 +993,16 @@ static void tool_schema_orders_free(tool_schema_orders *orders) {
     memset(orders, 0, sizeof(*orders));
 }
 
-static void tool_schema_order_prop_push(tool_schema_order *o, char *prop) {
+static void tool_schema_order_prop_push(tool_schema_order *o, char *prop, char *schema) {
     if (o->len == o->cap) {
         o->cap = o->cap ? o->cap * 2 : 8;
         o->prop = xrealloc(o->prop, (size_t)o->cap * sizeof(o->prop[0]));
+        o->prop_schema = xrealloc(o->prop_schema,
+                                  (size_t)o->cap * sizeof(o->prop_schema[0]));
     }
-    o->prop[o->len++] = prop;
+    o->prop[o->len] = prop;
+    o->prop_schema[o->len] = schema;
+    o->len++;
 }
 
 static int tool_schema_orders_find_index(const tool_schema_orders *orders, const char *name) {
@@ -1711,8 +1722,12 @@ static bool parse_schema_properties(const char *json, tool_schema_order *order) 
                     return false;
                 }
                 p++;
-                tool_schema_order_prop_push(order, prop);
-                if (!json_skip_value(&p)) return false;
+                char *schema = NULL;
+                if (!json_raw_value(&p, &schema)) {
+                    free(prop);
+                    return false;
+                }
+                tool_schema_order_prop_push(order, prop, schema);
                 json_ws(&p);
                 if (*p == ',') p++;
                 json_ws(&p);
@@ -6376,11 +6391,39 @@ static bool qwen_parameter_is_json_literal(const char *value) {
     return *p == '\0';
 }
 
+/* A Qwen tool call carries no argument types, so the value shape used to be the
+ * only clue: "12345" reached the client as the number 12345 and "3.10" as 3.1.
+ * When the request's schema declares the property as a string, the text is what
+ * must be sent; the guess stays for properties the schema does not describe. */
+static bool qwen_param_declared_string(const tool_schema_orders *orders,
+                                       const char *name, const char *key) {
+    const tool_schema_order *order = tool_schema_orders_find(orders, name);
+    if (!order || !key) return false;
+    for (int i = 0; i < order->len; i++) {
+        if (strcmp(order->prop[i], key)) continue;
+        bool is_string = false;
+        json_args schema = {0};
+        if (json_args_parse(order->prop_schema[i], &schema)) {
+            for (int j = 0; j < schema.len; j++) {
+                const json_arg *arg = &schema.v[j];
+                if (arg->is_string && !strcmp(arg->key, "type") &&
+                    !strcmp(arg->value, "string")) {
+                    is_string = true;
+                }
+            }
+        }
+        json_args_free(&schema);
+        return is_string;
+    }
+    return false;
+}
+
 static bool parse_qwen_generated_message_ex(const char *text,
                                             bool require_thinking_closed,
                                             char **content_out,
                                             char **reasoning_out,
-                                            tool_calls *calls) {
+                                            tool_calls *calls,
+                                            const tool_schema_orders *orders) {
     static const char tool_start[] = "<tool_call>";
     static const char tool_end[] = "</tool_call>";
     static const char function_start[] = "<function=";
@@ -6471,9 +6514,9 @@ static bool parse_qwen_generated_message_ex(const char *text,
             if (value_end > value_start && value_end[-1] == '\n') value_end--;
             char *value = xstrndup(value_start, (size_t)(value_end - value_start));
             ds4_tool_text_unescape(value, parameter_end);
-            tool_call_json_args_add(&args, key, value,
-                                    qwen_parameter_is_json_literal(value) ?
-                                    "false" : "true");
+            const bool is_string = qwen_param_declared_string(orders, name, key) ||
+                                   !qwen_parameter_is_json_literal(value);
+            tool_call_json_args_add(&args, key, value, is_string ? "true" : "false");
             free(value);
             free(key);
             p = parameter_close + sizeof(parameter_end) - 1u;
@@ -6521,7 +6564,7 @@ static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
     if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return parse_qwen_generated_message_ex(text, require_thinking_closed,
                                                content_out, reasoning_out,
-                                               calls);
+                                               calls, NULL);
     }
     return parse_deepseek_generated_message_ex(text, require_thinking_closed,
                                                content_out, reasoning_out,
@@ -6626,15 +6669,22 @@ static bool parse_generated_message_for_response_for_syntax(server_model_syntax 
                                                             char **content_out,
                                                             char **reasoning_out,
                                                             tool_calls *calls,
-                                                            bool *recovered_out) {
+                                                            bool *recovered_out,
+                                                            const tool_schema_orders *orders) {
     if (recovered_out) *recovered_out = false;
 
-    bool parsed_ok = parse_generated_message_ex_for_syntax(syntax,
-                                                           text ? text : "",
-                                                           require_thinking_closed,
-                                                           content_out,
-                                                           reasoning_out,
-                                                           calls);
+    /* Only this parse sees the request's tool schemas; the incremental ones keep
+     * the value-shape guess, so the Qwen case is dispatched here directly. */
+    bool parsed_ok = syntax == SERVER_MODEL_SYNTAX_QWEN ?
+        parse_qwen_generated_message_ex(text ? text : "",
+                                        require_thinking_closed,
+                                        content_out, reasoning_out, calls, orders) :
+        parse_generated_message_ex_for_syntax(syntax,
+                                              text ? text : "",
+                                              require_thinking_closed,
+                                              content_out,
+                                              reasoning_out,
+                                              calls);
     if (parsed_ok) return true;
 
     free(*content_out);
@@ -6672,7 +6722,7 @@ static DS4_SERVER_MAYBE_UNUSED bool parse_generated_message_for_response(
     return parse_generated_message_for_response_for_syntax(
         SERVER_MODEL_SYNTAX_DEEPSEEK, text, has_tools, saw_tool_start,
         require_thinking_closed, finish_io, err, errlen, content_out,
-        reasoning_out, calls, recovered_out);
+        reasoning_out, calls, recovered_out, NULL);
 }
 
 static void append_json_object_string(buf *b, const char *json) {
@@ -7004,6 +7054,10 @@ typedef struct {
     bool param_is_string;
     bool qwen_style;
     char *param_name;
+    /* The Qwen wire carries no argument types; the request schema does.  The
+     * name of the tool being streamed selects the order that describes it. */
+    const tool_schema_orders *orders;
+    char *tool_name;
     char **ids;
     int ids_cap;
 } openai_tool_stream;
@@ -7032,8 +7086,10 @@ static void openai_tool_stream_free(openai_tool_stream *ts) {
     for (int i = 0; i < ts->ids_cap; i++) free(ts->ids[i]);
     free(ts->ids);
     free(ts->param_name);
+    free(ts->tool_name);
     ts->ids = NULL;
     ts->param_name = NULL;
+    ts->tool_name = NULL;
     ts->ids_cap = 0;
 }
 
@@ -7654,6 +7710,9 @@ static bool openai_tool_stream_init(openai_tool_stream *ts, const request *r,
                                     size_t pos) {
     openai_tool_stream_free(ts);
     memset(ts, 0, sizeof(*ts));
+    /* The wire projection needs the request schema to tell a declared string
+     * from a JSON literal when the Qwen text carries no type. */
+    ts->orders = r ? &r->tool_orders : NULL;
     ts->active = true;
     ts->state = DSML_TOOL_BETWEEN_INVOKES;
     ts->parse_pos = pos;
@@ -7730,7 +7789,9 @@ static bool openai_tool_start_invoke(int fd, server *s, const request *r, const 
     const char *tool_id = openai_tool_stream_id(s, ts, ts->index);
     bool ok = sse_chat_tool_call_start_delta(fd, r, id, ts->index, tool_id, name) &&
               openai_tool_emit_args_fragment(fd, r, id, ts, "{", 1);
-    free(name);
+    /* Keep the name: the schema lookup for each parameter needs it. */
+    free(ts->tool_name);
+    ts->tool_name = name;
     if (!ok) return false;
 
     ts->emitted_any = true;
@@ -7787,7 +7848,9 @@ static bool openai_tool_finish_param(int fd, const request *r, const char *id,
         if (value_end > value_start && raw[value_end - 1u] == '\n') value_end--;
         char *value = xstrndup(raw + value_start, value_end - value_start);
         ds4_tool_text_unescape(value, ts->param_end);
-        const bool string_value = !qwen_parameter_is_json_literal(value);
+        const bool string_value =
+            qwen_param_declared_string(ts->orders, ts->tool_name, ts->param_name) ||
+            !qwen_parameter_is_json_literal(value);
         bool ok = openai_tool_emit_param_prefix(
             fd, r, id, ts, ts->param_name, string_value);
         if (ok && value[0]) {
@@ -9066,6 +9129,9 @@ typedef struct {
     bool param_is_string;
     bool qwen_style;
     char *param_name;
+    /* Same as the OpenAI streamer: the schema decides a declared string. */
+    const tool_schema_orders *orders;
+    char *tool_name;
     char **ids;
     int ids_cap;
 } anthropic_tool_stream;
@@ -9117,8 +9183,10 @@ static void anthropic_tool_stream_free(anthropic_tool_stream *ts) {
     for (int i = 0; i < ts->ids_cap; i++) free(ts->ids[i]);
     free(ts->ids);
     free(ts->param_name);
+    free(ts->tool_name);
     ts->ids = NULL;
     ts->param_name = NULL;
+    ts->tool_name = NULL;
     ts->ids_cap = 0;
 }
 
@@ -9327,6 +9395,7 @@ static bool anthropic_tool_stream_init(anthropic_tool_stream *ts,
                                        size_t pos) {
     anthropic_tool_stream_free(ts);
     memset(ts, 0, sizeof(*ts));
+    ts->orders = r ? &r->tool_orders : NULL;
     ts->active = true;
     ts->state = DSML_TOOL_BETWEEN_INVOKES;
     if (r && r->model_syntax == SERVER_MODEL_SYNTAX_QWEN &&
@@ -9379,7 +9448,9 @@ static bool anthropic_tool_start_invoke(int fd, server *s, anthropic_stream *st,
     const char *tool_id = anthropic_tool_stream_id(s, ts, ts->index);
     bool ok = anthropic_sse_open_tool_block(fd, st, tool_id, name) &&
               anthropic_tool_emit_args_fragment(fd, st, "{", 1);
-    free(name);
+    /* Keep the name: the schema lookup for each parameter needs it. */
+    free(ts->tool_name);
+    ts->tool_name = name;
     if (!ok) return false;
 
     ts->emitted_any = true;
@@ -9436,7 +9507,9 @@ static bool anthropic_tool_finish_param(int fd, anthropic_stream *st,
         if (value_end > value_start && raw[value_end - 1u] == '\n') value_end--;
         char *value = xstrndup(raw + value_start, value_end - value_start);
         ds4_tool_text_unescape(value, ts->syn->param_end);
-        const bool string_value = !qwen_parameter_is_json_literal(value);
+        const bool string_value =
+            qwen_param_declared_string(ts->orders, ts->tool_name, ts->param_name) ||
+            !qwen_parameter_is_json_literal(value);
         bool ok = anthropic_tool_emit_param_prefix(
             fd, st, ts->param_name, string_value);
         if (ok && value[0]) {
@@ -14085,7 +14158,8 @@ decode_again:
             &parsed_content,
             &parsed_reasoning,
             &parsed_calls,
-            &recovered_tool_parse_failure);
+            &recovered_tool_parse_failure,
+            &j->req.tool_orders);
         if (!parsed_ok && recovered_tool_parse_failure && j->req.has_tools && saw_tool_start) {
             /* parse_generated_message failed even though DSML was present.
              * Semantic repair is intentionally avoided: if the parser cannot
@@ -17742,6 +17816,64 @@ static void test_qwen_anthropic_tool_stream(void) {
     close(sv[1]);
 }
 
+
+/* The SSE argument streamer makes the same string-or-literal decision as the
+ * final parse, so the schema has to reach it too: a client reading deltas would
+ * otherwise still see "code":12345 for a parameter declared as a string. */
+static void test_qwen_stream_schema_string_argument(void) {
+    static const char function_json[] =
+        "{\"name\":\"save_code\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"code\":{\"type\":\"string\"}},"
+        "\"required\":[\"code\"]}}";
+    static const char raw[] =
+        "<tool_call>\n<function=save_code>\n"
+        "<parameter=code>\n12345\n</parameter>\n"
+        "</function>\n</tool_call>";
+    for (int anthropic = 0; anthropic < 2; anthropic++) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        if (sv[0] < 0 || sv[1] < 0) return;
+
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = anthropic ? API_ANTHROPIC : API_OPENAI;
+        r.stream = true;
+        r.think_mode = DS4_THINK_NONE;
+        r.has_tools = true;
+        r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+        tool_schema_orders_add_json(&r.tool_orders, function_json);
+
+        if (anthropic) {
+            anthropic_stream st;
+            TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_schema", 0, &st));
+            TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_schema", &st,
+                                                    raw, strlen(raw), false));
+            shutdown(sv[0], SHUT_WR);
+            char *out = read_socket_text(sv[1]);
+            /* The value arrives in its own delta: what distinguishes a declared
+             * string is the opening quote the prefix carries with it. */
+            TEST_ASSERT(strstr(out, "\\\"code\\\":\\\"") != NULL);
+            free(out);
+            anthropic_stream_free(&st);
+        } else {
+            openai_stream st;
+            openai_stream_start(&r, &st);
+            TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_schema", &st,
+                                                 raw, strlen(raw), false));
+            shutdown(sv[0], SHUT_WR);
+            char *out = read_socket_text(sv[1]);
+            /* The value arrives in its own delta: what distinguishes a declared
+             * string is the opening quote the prefix carries with it. */
+            TEST_ASSERT(strstr(out, "\\\"code\\\":\\\"") != NULL);
+            free(out);
+            openai_stream_free(&st);
+        }
+        request_free(&r);
+        close(sv[0]);
+        close(sv[1]);
+    }
+}
+
 static void test_render_glm_chat_prompt_text(void) {
     chat_msgs msgs = {0};
     chat_msg sys = {0};
@@ -18366,7 +18498,7 @@ static void test_incomplete_tool_call_keeps_stop_reason(void) {
             TEST_ASSERT(!parse_generated_message_for_response_for_syntax(
                 glm ? SERVER_MODEL_SYNTAX_GLM : SERVER_MODEL_SYNTAX_DEEPSEEK,
                 raw[glm], true, true, false, &finish, err, sizeof(err),
-                &content, &reasoning, &calls, &recovered));
+                &content, &reasoning, &calls, &recovered, NULL));
             TEST_ASSERT(!strcmp(finish, reasons[i]));
             TEST_ASSERT(recovered && calls.len == 0);
             TEST_ASSERT(content && !strcmp(content, raw[glm]));
@@ -21564,6 +21696,72 @@ static void test_server_image_embedding_cache(void) {
     TEST_ASSERT(cache.bytes == 0);
 }
 
+/* The Qwen parser has no argument types in the model's output, so this pins the
+ * schema-driven decision and the shape guess that remains for undeclared
+ * properties: "12345" and "3.10" must stay text, an integer must stay a number. */
+static void test_qwen_schema_declared_string_argument(void) {
+    static const char function_json[] =
+        "{\"name\":\"save_code\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"code\":{\"type\":\"string\"},"
+        "\"version\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"}},"
+        "\"required\":[\"code\"]}}";
+    static const char raw[] =
+        "<tool_call>\n<function=save_code>\n"
+        "<parameter=code>\n12345\n</parameter>\n"
+        "<parameter=version>\n3.10\n</parameter>\n"
+        "<parameter=count>\n7\n</parameter>\n"
+        "</function>\n</tool_call>";
+    tool_schema_orders orders = {0};
+    tool_schema_orders_add_json(&orders, function_json);
+
+    char err[128] = {0};
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    bool recovered = false;
+    const char *finish = "tool_calls";
+    TEST_ASSERT(parse_generated_message_for_response_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, raw, true, true, false, &finish,
+        err, sizeof(err), &content, &reasoning, &calls, &recovered, &orders));
+    TEST_ASSERT(calls.len == 1);
+    json_args args = {0};
+    TEST_ASSERT(json_args_parse(calls.v[0].arguments, &args));
+    int code = json_args_find_unused(&args, "code");
+    int version = json_args_find_unused(&args, "version");
+    int count = json_args_find_unused(&args, "count");
+    TEST_ASSERT(code >= 0 && args.v[code].is_string &&
+                !strcmp(args.v[code].value, "12345"));
+    TEST_ASSERT(version >= 0 && args.v[version].is_string &&
+                !strcmp(args.v[version].value, "3.10"));
+    TEST_ASSERT(count >= 0 && !args.v[count].is_string &&
+                !strcmp(args.v[count].value, "7"));
+    json_args_free(&args);
+    tool_calls_free(&calls);
+    free(content);
+    free(reasoning);
+
+    /* No schema in hand: the shape guess still decides, which is the behaviour
+     * the incremental parses keep. */
+    content = NULL;
+    reasoning = NULL;
+    memset(&calls, 0, sizeof(calls));
+    finish = "tool_calls";
+    TEST_ASSERT(parse_generated_message_for_response_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, raw, true, true, false, &finish,
+        err, sizeof(err), &content, &reasoning, &calls, &recovered, NULL));
+    TEST_ASSERT(calls.len == 1);
+    memset(&args, 0, sizeof(args));
+    TEST_ASSERT(json_args_parse(calls.v[0].arguments, &args));
+    code = json_args_find_unused(&args, "code");
+    TEST_ASSERT(code >= 0 && !args.v[code].is_string &&
+                !strcmp(args.v[code].value, "12345"));
+    json_args_free(&args);
+    tool_calls_free(&calls);
+    free(content);
+    free(reasoning);
+    tool_schema_orders_free(&orders);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_visible_image_key();
     test_anthropic_tool_image_output();
@@ -21587,6 +21785,8 @@ static void ds4_server_unit_tests_run(void) {
     test_render_qwen_template_history();
     test_qwen_openai_tool_stream();
     test_qwen_anthropic_tool_stream();
+    test_qwen_stream_schema_string_argument();
+    test_qwen_schema_declared_string_argument();
     test_render_glm_chat_prompt_text();
     test_render_glm_drops_old_reasoning_without_tools();
     test_render_glm_preserves_reasoning_with_tools();
