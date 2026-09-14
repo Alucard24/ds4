@@ -68249,6 +68249,11 @@ bool ds4_engine_is_glm53(ds4_engine *e) {
     return ds4_model_is_glm53();
 }
 
+bool ds4_engine_is_qwen38(ds4_engine *e) {
+    (void)e;
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN38;
+}
+
 /* Decode gate firing schedule for the TP transport (see ds4_tp_identity).
  * Resident GLM splits attention and FFN on sparse layers. Streaming keeps
  * attention replicated and exchanges only the routed FFN partial. */
