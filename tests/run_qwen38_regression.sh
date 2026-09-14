@@ -22,8 +22,11 @@ PROMPT='The capital of France is Paris. The largest ocean on Earth is the Pacifi
 
 cd "$(dirname "$0")/.."
 
+echo "===== model-free launcher checks ====="
+python3 tests/test_qwen_server_launcher.py
+
 echo "===== all five binaries ====="
-make CUDA_ARCH=sm_120
+make ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=sm_120
 
 echo "===== CPU reference build and tests ====="
 make clean >/dev/null 2>&1
@@ -55,48 +58,42 @@ echo "===== the same gate with the q8_0 KV cache ====="
 # Two explicit invocations, not one clever loop: setting an environment variable
 # to the empty string still defines it, so a conditional assignment turned both
 # hooks on at once and q4_0's number was reported for q8_0.
-nll_q8=$(DS4_KV_Q8=1 DS4_TEST_QWEN38_CUDA=1 ./tests/test_qwen38_session_cuda "$MODEL" "$PROMPT" 2>&1 | grep '^MEAN_NLL' || true)
-if [ "$nll_q8" = "MEAN_NLL 1.80900178 TOKENS 16" ]; then
-    echo "q8_0 KV NLL as recorded: $nll_q8"
-else
-    echo "q8_0 KV NLL changed from the recorded 1.80900178: $nll_q8"
-    exit 1
-fi
-nll_q4=$(DS4_KV_Q4=1 DS4_TEST_QWEN38_CUDA=1 ./tests/test_qwen38_session_cuda "$MODEL" "$PROMPT" 2>&1 | grep '^MEAN_NLL' || true)
-
-# The second trunk format, the one the engine learned to execute for the IQ1_S
-# tensors: same sentence, its own pinned NLL.  Optional, because the file is a
-# local quantization mix and not part of the release set; when it is there, the
-# gate is exact.
+# Preserve the producer exit status and require the final PASS, not just an
+# NLL printed before later session/cache checks. Never remove the instance lock.
+run_session_gate() (
+    model=$1; fmt=$2; pin=$3
+    unset DS4_KV_Q8 DS4_KV_Q4
+    case "$fmt" in
+        q8_0) export DS4_KV_Q8=1 ;;
+        q4_0) export DS4_KV_Q4=1 ;;
+    esac
+    log=$(mktemp)
+    trap 'rm -f "$log"' EXIT
+    if ! DS4_TEST_QWEN38_CUDA=1 DS4_TEST_QWEN38_EXPECT_NLL="$pin" \
+        ./tests/test_qwen38_session_cuda "$model" "$PROMPT" >"$log" 2>&1; then
+        cat "$log"; exit 1
+    fi
+    grep -Fx "MEAN_NLL $pin TOKENS 16" "$log"
+    grep -Fx "Qwen CUDA session PASS" "$log"
+)
+run_session_gate "$MODEL" q8_0 1.80900178
+run_session_gate "$MODEL" q4_0 1.82242633
 MODEL_XXS=${DS4_QWEN_TEST_MODEL_XXS:-$MODEL_DIR/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf}
 if [ -f "$MODEL_XXS" ]; then
-    nll_xxs=$(DS4_TEST_QWEN38_CUDA=1 DS4_TEST_QWEN38_EXPECT_NLL=1.87606303 \
-        ./tests/test_qwen38_session_cuda "$MODEL_XXS" "$PROMPT" 2>&1 | grep '^MEAN_NLL' || true)
-    case "$nll_xxs" in
-        *1.87606303*) echo "IQ3_XXS trunk NLL as recorded: $nll_xxs" ;;
-        *) echo "IQ3_XXS trunk NLL drifted: '${nll_xxs:-none}'"; exit 1 ;;
-    esac
-    # The same trunk with a quantized cache: the two cells that were never run
-    # before they were measured here (q8_0 1.87684186, q4_0 1.87755574).
-    for cell in "q8_0:1.87684186:DS4_KV_Q8" "q4_0:1.87755574:DS4_KV_Q4"; do
-        fmt=${cell%%:*}; rest=${cell#*:}
-        pin=${rest%%:*}; hook=${rest##*:}
-        rm -f /tmp/ds4.lock
-        got=$(env "$hook=1" DS4_TEST_QWEN38_CUDA=1 DS4_TEST_QWEN38_EXPECT_NLL="$pin" \
-            ./tests/test_qwen38_session_cuda "$MODEL_XXS" "$PROMPT" 2>&1 | grep '^MEAN_NLL' || true)
-        case "$got" in
-            *"$pin"*) echo "IQ3_XXS trunk NLL with KV $fmt as recorded: $got" ;;
-            *) echo "IQ3_XXS trunk NLL with KV $fmt drifted: '${got:-none}'"; exit 1 ;;
-        esac
-    done
+    run_session_gate "$MODEL_XXS" f16 1.87606303
+    run_session_gate "$MODEL_XXS" q8_0 1.87684186
+    run_session_gate "$MODEL_XXS" q4_0 1.87755574
 else
-    echo "(IQ3_XXS trunk not present; the IQ1_S path is covered by the CPU kernel checks)"
+    echo "(IQ3_XXS trunk not present; live XXS gates skipped)"
 fi
-if [ "$nll_q4" = "MEAN_NLL 1.82242633 TOKENS 16" ]; then
-    echo "q4_0 KV NLL as recorded: $nll_q4"
-else
-    echo "q4_0 KV NLL changed from the recorded 1.82242633: $nll_q4"
-    exit 1
+
+echo "===== directional steering: projection, no-op, live scales and cache identity ====="
+make tests/test_qwen38_steering CUDA_ARCH=sm_120
+./tests/test_qwen38_steering "$MODEL"
+DS4_KV_Q8=1 ./tests/test_qwen38_steering "$MODEL"
+DS4_KV_Q4=1 ./tests/test_qwen38_steering "$MODEL"
+if [ -f "$MODEL_XXS" ]; then
+    ./tests/test_qwen38_steering "$MODEL_XXS"
 fi
 
 echo "===== the prefill, which both gates above miss ====="
@@ -263,6 +260,13 @@ make tests/test_qwen3vl_video CUDA_ARCH=sm_120
 echo "===== MTP draft and speculative decoding ====="
 make tests/test_qwen38_mtp CUDA_ARCH=sm_120
 ./tests/test_qwen38_mtp "$MODEL" "$MTP" "$PROMPT"
+
+echo "===== Qwen capture/build and steered MTP correctness ====="
+steer_tmp=$(mktemp -d)
+python3 tests/test_qwen38_capture.py "$MODEL" "$steer_tmp/style.json"
+DS4_TEST_STEERING_FILE="$steer_tmp/style.f32" \
+    ./tests/test_qwen38_mtp "$MODEL" "$MTP" "$PROMPT"
+rm -rf "$steer_tmp"
 
 echo "===== the disk KV cache of a quantized session ====="
 # A quantized cache made every save fail - "session tensor is smaller than the

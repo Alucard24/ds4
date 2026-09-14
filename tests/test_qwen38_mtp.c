@@ -212,6 +212,11 @@ int main(int argc, char **argv) {
     options.mtp_path = argv[2];
     options.backend = DS4_BACKEND_CUDA;
     options.context_size = 256;
+    options.directional_steering_file = getenv("DS4_TEST_STEERING_FILE");
+    if (options.directional_steering_file) {
+        options.directional_steering_ffn = 0.5f;
+        options.directional_steering_attn = 0.25f;
+    }
 
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &options) != 0) return 1;
@@ -334,6 +339,9 @@ int main(int argc, char **argv) {
     plain.model_path = argv[1];
     plain.backend = DS4_BACKEND_CUDA;
     plain.context_size = 256;
+    plain.directional_steering_file = options.directional_steering_file;
+    plain.directional_steering_ffn = options.directional_steering_ffn;
+    plain.directional_steering_attn = options.directional_steering_attn;
     ds4_engine *plain_engine = NULL;
     if (ds4_engine_open(&plain_engine, &plain) != 0) {
         free(tokens);

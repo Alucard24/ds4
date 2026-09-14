@@ -6,6 +6,11 @@ ROCm and video remain intentionally outside the hardware-validated MVP rather
 than being partially implemented release paths. Performance is measured against
 normal llama.cpp and numerical parity is claimed only by the gates below.
 
+## Directional steering
+
+Qwen CPU/CUDA runtime, last-prompt-row extraction, cache compatibility and
+no-steering regression results are documented in [QWEN38_STEERING.md](QWEN38_STEERING.md).
+
 ## No-model kernel tests
 
 ```sh

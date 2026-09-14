@@ -7671,6 +7671,9 @@ typedef struct {
     float *scores;  /* 24 * ctx_size; one independent row per query head */
     float *q_full;  /* 24*512 */
     uint32_t ctx_size;
+    /* Borrowed from the engine; scales belong to this timeline. */
+    const float *steering_dirs;
+    float steering_attn_scale, steering_ffn_scale;
 } ds4_qwen38_cpu_state;
 
 static ds4_context_memory qwen38_memory_estimate(int ctx_size, bool cuda) {
@@ -7797,7 +7800,18 @@ typedef struct {
     ds4_gpu_tensor *xnorm_row[QWEN38_CUDA_PREFILL_CHUNK];
     ds4_gpu_tensor *out_norm_row[QWEN38_CUDA_PREFILL_CHUNK];
     uint32_t ctx_size;
+    ds4_gpu_tensor *steering_dirs;
+    float steering_attn_scale, steering_ffn_scale;
 } ds4_qwen38_gpu_state;
+
+/* Edit the sublayer output, never the accumulated residual. All trunk paths,
+ * including speculative verification/replay, use this same session state. */
+static int qwen38_gpu_steer(ds4_qwen38_gpu_state *st, uint32_t il,
+                           uint32_t rows, float scale) {
+    if (!st->steering_dirs || scale == 0.0f) return 1;
+    return ds4_gpu_directional_steering_project_tensor(
+        st->proj, st->steering_dirs, il, QWEN38_N_EMBD, rows, scale);
+}
 
 /* Draft-head state. It is a single dense block, so every buffer is bounded by
  * QWEN38_MTP_MAX_ROWS rows and the head owns its own GA K/V rows: drafting
@@ -7843,16 +7857,14 @@ static void qwen38_mtp_drop_history(ds4_session *s);
  * first, and both must agree or a saved cache cannot be restored. */
 static uint64_t session_qwen38_kv_pos_bytes(bool cpu);
 
-/* The activation dump that dir-steering/tools/build_direction.py reads.  It asks
- * for one component (ffn_out by default) at one position (pos 0) through the same
- * environment variables the Metal and ROCm graphs honour, and reads back
- * <prefix>_<component>-<layer>_pos<pos>.bin, so nothing about the tool changes.  It
- * runs only when DS4_METAL_GRAPH_DUMP_PREFIX is set: without it this is one string
- * comparison per layer, and the layer's numbers are untouched either way. */
+/* One last-row activation per chunk, before the optional runtime edit. Filenames
+ * use the chunk's start position. The extractor prefills only and picks the last
+ * chunk, so captures reflect the whole prompt rather than its common first token.
+ * Prefix/name/position filters are shared with the existing graph diagnostics. */
 static const char *metal_graph_debug_prefix_for(const char *name, uint32_t il, uint32_t pos);
 
 static void qwen38_dump_activation(const char *name, const ds4_gpu_tensor *t,
-                                   uint32_t il, uint32_t pos) {
+                                   uint32_t il, uint32_t pos, uint32_t rows) {
     const char *prefix = metal_graph_debug_prefix_for(name, il, pos);
     if (!t || !prefix) return;
     if (ds4_gpu_synchronize() == 0) {
@@ -7862,7 +7874,7 @@ static void qwen38_dump_activation(const char *name, const ds4_gpu_tensor *t,
     }
     const uint64_t bytes = (uint64_t)QWEN38_N_EMBD * sizeof(float);
     float *buf = xmalloc((size_t)bytes);
-    if (ds4_gpu_tensor_read(t, 0, buf, bytes) != 0) {
+    if (ds4_gpu_tensor_read(t, (uint64_t)(rows - 1u) * bytes, buf, bytes) != 0) {
         char path[1024];
         snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
         if (write_f32_binary_file(path, buf, QWEN38_N_EMBD)) {
@@ -7903,6 +7915,7 @@ static void qwen38_gpu_state_free(ds4_qwen38_gpu_state *st) {
         ds4_gpu_tensor_free(st->out_norm_row[i]);
     }
 #define QWEN38_GPU_FREE(name) ds4_gpu_tensor_free(st->name)
+    QWEN38_GPU_FREE(steering_dirs);
     QWEN38_GPU_FREE(ssm_state); QWEN38_GPU_FREE(conv_state);
     QWEN38_GPU_FREE(attn_k); QWEN38_GPU_FREE(attn_v);
     QWEN38_GPU_FREE(hidden); QWEN38_GPU_FREE(xnorm);
@@ -8277,7 +8290,7 @@ static void qwen38_rope_inplace(float *v, uint32_t n_rot, uint32_t pos) {
 static void qwen38_ffn_tail(ds4_qwen38_cpu_state *st,
                             const ds4_qwen38_layer_weights *l,
                             const ds4_model *m,
-                            float *x) {
+                            float *x, uint32_t il) {
     rms_norm_weight(st->xnorm, x,
                     (const float *)tensor_data(m, l->attn_post_norm),
                     QWEN38_N_EMBD, 1.0e-6f);
@@ -8287,6 +8300,8 @@ static void qwen38_ffn_tail(ds4_qwen38_cpu_state *st,
         st->ffn_m[i] = qwen38_silu(st->ffn_g[i]) * st->ffn_u[i];
     }
     qwen38_matvec(st->attn, m, l->ffn_down, st->ffn_m);
+    cpu_directional_steering_project_rows(st->attn, st->steering_dirs,
+                                          il, 1, st->steering_ffn_scale);
     for (uint32_t i = 0; i < QWEN38_N_EMBD; i++) x[i] += st->attn[i];
 }
 
@@ -8426,9 +8441,12 @@ static void qwen38_layer_gdn(ds4_qwen38_cpu_state *st,
     };
     ds4_parallel_for(QWEN38_N_V_HEAD, qwen38_gdn_head_worker, &gdn_ctx);
 
+    const uint32_t il = gdn_idx + gdn_idx / 3u;
     qwen38_matvec(st->attn, m, l->ssm_out, st->o);
+    cpu_directional_steering_project_rows(st->attn, st->steering_dirs,
+                                          il, 1, st->steering_attn_scale);
     for (uint32_t i = 0; i < QWEN38_N_EMBD; i++) x[i] += st->attn[i];
-    qwen38_ffn_tail(st, l, m, x);
+    qwen38_ffn_tail(st, l, m, x, il);
 }
 
 typedef struct {
@@ -8533,9 +8551,12 @@ static void qwen38_layer_ga(ds4_qwen38_cpu_state *st,
     };
     ds4_parallel_for(QWEN38_N_HEAD, qwen38_ga_head_worker, &ga_ctx);
 
+    const uint32_t il = ga_idx * 4u + 3u;
     qwen38_matvec(st->z, m, l->attn_output, st->attn);
+    cpu_directional_steering_project_rows(st->z, st->steering_dirs,
+                                          il, 1, st->steering_attn_scale);
     for (uint32_t i = 0; i < QWEN38_N_EMBD; i++) x[i] += st->z[i];
-    qwen38_ffn_tail(st, l, m, x);
+    qwen38_ffn_tail(st, l, m, x, il);
 }
 
 static void qwen38_cpu_forward_token(ds4_qwen38_cpu_state *st,
@@ -8795,6 +8816,9 @@ static int qwen38_gpu_forward_token(ds4_qwen38_gpu_state *st,
             qwen38_phase_mark(6);
             QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->proj, m, l->attn_output, st->attn), "GA output");
         }
+        qwen38_dump_activation("attn_out", st->proj, il, pos, 1);
+        QWEN38_GPU_CHECK(qwen38_gpu_steer(st, il, 1, st->steering_attn_scale),
+                         "attention steering");
         QWEN38_GPU_CHECK(ds4_gpu_add_tensor(st->hidden, st->hidden,
                                              st->proj, QWEN38_N_EMBD), "attention residual");
         QWEN38_GPU_CHECK(ds4_gpu_rms_norm_weight_tensor(
@@ -8807,7 +8831,9 @@ static int qwen38_gpu_forward_token(ds4_qwen38_gpu_state *st,
         QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->proj, m, l->ffn_down, st->ffn_m), "FFN down");
 
         /* The FFN output, before the residual: the component the steering tool dumps. */
-        qwen38_dump_activation("ffn_out", st->proj, il, pos);
+        qwen38_dump_activation("ffn_out", st->proj, il, pos, 1);
+        QWEN38_GPU_CHECK(qwen38_gpu_steer(st, il, 1, st->steering_ffn_scale),
+                         "FFN steering");
         QWEN38_GPU_CHECK(ds4_gpu_add_tensor(st->hidden, st->hidden,
                                              st->proj, QWEN38_N_EMBD), "FFN residual");
     }
@@ -9075,6 +9101,9 @@ static int qwen38_gpu_forward_chunk(ds4_qwen38_gpu_state *st,
             QWEN38_CHUNK_CHECK(qwen38_gpu_matvec_rows(
                 st->proj, m, l->attn_output, st->attn, n_tokens), "GA output");
         }
+        qwen38_dump_activation("attn_out", st->proj, il, start_pos, n_tokens);
+        QWEN38_CHUNK_CHECK(qwen38_gpu_steer(st, il, n_tokens, st->steering_attn_scale),
+                           "attention steering");
         QWEN38_CHUNK_CHECK(ds4_gpu_add_tensor(
             st->hidden, st->hidden, st->proj,
             n_tokens * QWEN38_N_EMBD), "attention residual");
@@ -9095,8 +9124,9 @@ static int qwen38_gpu_forward_chunk(ds4_qwen38_gpu_state *st,
             n_tokens * QWEN38_N_FF, 0.0f, 1.0f), "SwiGLU");
         QWEN38_CHUNK_CHECK(qwen38_gpu_matvec_rows(
             st->proj, m, l->ffn_down, st->ffn_m, n_tokens), "FFN down");
-        /* Row 0 is the first token of the chunk, which is the position a dump filter names. */
-        qwen38_dump_activation("ffn_out", st->proj, il, start_pos);
+        qwen38_dump_activation("ffn_out", st->proj, il, start_pos, n_tokens);
+        QWEN38_CHUNK_CHECK(qwen38_gpu_steer(st, il, n_tokens, st->steering_ffn_scale),
+                           "FFN steering");
         QWEN38_CHUNK_CHECK(ds4_gpu_add_tensor(
             st->hidden, st->hidden, st->proj,
             n_tokens * QWEN38_N_EMBD), "FFN residual");
@@ -41650,10 +41680,27 @@ static void cpu_directional_steering_project_rows(
     }
 }
 
+/* Bit test stays valid in builds using -ffast-math. */
+static bool steering_f32_finite(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return (bits & 0x7f800000u) != 0x7f800000u;
+}
+
 static bool cpu_load_directional_steering(ds4_engine *e) {
+    const bool qwen = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN38;
+    if (e && qwen &&
+        (!steering_f32_finite(e->directional_steering_attn_scale) ||
+         !steering_f32_finite(e->directional_steering_ffn_scale) ||
+         fabsf(e->directional_steering_attn_scale) > 100.0f ||
+         fabsf(e->directional_steering_ffn_scale) > 100.0f)) {
+        fprintf(stderr, "ds4: Qwen steering scales must be finite and within [-100, 100]\n");
+        return false;
+    }
     if (!e ||
         (e->directional_steering_attn_scale == 0.0f &&
-         e->directional_steering_ffn_scale == 0.0f)) {
+         e->directional_steering_ffn_scale == 0.0f &&
+         !(qwen && e->directional_steering_file && e->directional_steering_file[0]))) {
         return true;
     }
 
@@ -41673,7 +41720,18 @@ static bool cpu_load_directional_steering(ds4_engine *e) {
         fprintf(stderr, "ds4: failed to load directional steering vectors from %s\n", path);
         return false;
     }
-    fprintf(stderr, "ds4: CPU directional steering enabled: %s attn=%g ffn=%g\n",
+    if (qwen) {
+        for (uint64_t i = 0; i < n; i++) {
+            if (!steering_f32_finite(e->directional_steering_dirs[i])) {
+                fprintf(stderr, "ds4: non-finite Qwen steering direction at index %llu\n",
+                        (unsigned long long)i);
+                free(e->directional_steering_dirs);
+                e->directional_steering_dirs = NULL;
+                return false;
+            }
+        }
+    }
+    fprintf(stderr, "ds4: directional steering loaded: %s attn=%g ffn=%g\n",
             path,
             (double)e->directional_steering_attn_scale,
             (double)e->directional_steering_ffn_scale);
@@ -58518,6 +58576,92 @@ static uint64_t session_qwen38_kv_pos_bytes(bool cpu) {
 #endif
 }
 
+/* Versioned attachment semantics: directions edit GDN/GA output and FFN down,
+ * before each trunk residual; the separate MTP draft head is not edited.
+ * Unsteered payloads retain the old layout. Steered ones carry exact directions
+ * and scales (1.25 MiB), plus a conservative local GGUF identity. No text-only
+ * cache key can make two different steering configurations interchangeable. */
+#define QWEN38_STEERING_PAYLOAD_V1 0x80000000u
+#define QWEN38_STEERING_MODEL_FIELDS 7u
+
+static float session_qwen38_attn_scale(const ds4_session *s) {
+#ifndef DS4_NO_GPU
+    if (!ds4_session_is_cpu(s)) return s->qwen38_gpu_state.steering_attn_scale;
+#endif
+    return s->qwen38_state.steering_attn_scale;
+}
+
+static bool session_qwen38_steering_active(ds4_session *s) {
+    return s->engine->directional_steering_dirs &&
+        (session_qwen38_attn_scale(s) != 0.0f ||
+         ds4_session_directional_steering_ffn(s) != 0.0f);
+}
+
+static uint64_t qwen38_steering_payload_bytes(void) {
+    return QWEN38_STEERING_MODEL_FIELDS * sizeof(uint64_t) + 2u * sizeof(float) +
+        (uint64_t)DS4_N_LAYER * QWEN38_N_EMBD * sizeof(float);
+}
+
+static bool qwen38_steering_model_identity(const ds4_model *m,
+                                          uint64_t id[QWEN38_STEERING_MODEL_FIELDS]) {
+    struct stat st;
+    if (fstat(m->fd, &st) != 0) return false;
+    id[0] = (uint64_t)st.st_dev;
+    id[1] = (uint64_t)st.st_ino;
+    id[2] = (uint64_t)st.st_size;
+#ifdef __APPLE__
+    id[3] = (uint64_t)st.st_mtimespec.tv_sec;
+    id[4] = (uint64_t)st.st_mtimespec.tv_nsec;
+    id[5] = (uint64_t)st.st_ctimespec.tv_sec;
+    id[6] = (uint64_t)st.st_ctimespec.tv_nsec;
+#else
+    id[3] = (uint64_t)st.st_mtim.tv_sec;
+    id[4] = (uint64_t)st.st_mtim.tv_nsec;
+    id[5] = (uint64_t)st.st_ctim.tv_sec;
+    id[6] = (uint64_t)st.st_ctim.tv_nsec;
+#endif
+    return true;
+}
+
+/* Compare before touching tokens, logits, or device state. This intentionally
+ * rejects copied/touched GGUFs rather than hashing all mmap-backed weights. */
+static int session_qwen38_steering_identity(ds4_session *s, FILE *fp, bool write,
+                                           uint64_t *remaining,
+                                           char *err, size_t errlen) {
+    uint64_t model[QWEN38_STEERING_MODEL_FIELDS], saved[QWEN38_STEERING_MODEL_FIELDS];
+    if (!qwen38_steering_model_identity(&s->engine->model, model)) {
+        payload_set_err(err, errlen, "cannot stat Qwen model for steering cache identity");
+        return 1;
+    }
+    const float scales[2] = {session_qwen38_attn_scale(s),
+                             ds4_session_directional_steering_ffn(s)};
+    float saved_scales[2];
+    const uint64_t bytes = (uint64_t)DS4_N_LAYER * QWEN38_N_EMBD * sizeof(float);
+    const float *dirs = s->engine->directional_steering_dirs;
+    if (write) {
+        return payload_write_bytes(fp, model, sizeof(model), err, errlen) ||
+               payload_write_bytes(fp, scales, sizeof(scales), err, errlen) ||
+               payload_write_bytes(fp, dirs, bytes, err, errlen);
+    }
+    if (payload_read_bytes(fp, saved, sizeof(saved), remaining, err, errlen) ||
+        payload_read_bytes(fp, saved_scales, sizeof(saved_scales), remaining, err, errlen))
+        return 1;
+    if (memcmp(saved, model, sizeof(model)) || memcmp(saved_scales, scales, sizeof(scales))) {
+        payload_set_err(err, errlen, "Qwen steering cache model or scales mismatch");
+        return 1;
+    }
+    float buf[4096];
+    for (uint64_t off = 0; off < bytes; off += sizeof(buf)) {
+        const uint64_t n = bytes - off < sizeof(buf) ? bytes - off : sizeof(buf);
+        if (payload_read_bytes(fp, buf, n, remaining, err, errlen)) return 1;
+        if (memcmp(buf, (const uint8_t *)dirs + off, (size_t)n)) {
+            payload_set_err(err, errlen, "Qwen steering cache directions mismatch");
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static bool session_qwen38_payload_size(uint32_t saved_tokens,
                                         uint32_t image_count,
                                         uint64_t kv_pos_bytes,
@@ -58622,11 +58766,13 @@ static int ds4_session_save_qwen38_payload(ds4_session *s, FILE *fp,
         QWEN38_N_GDN_LAYER,
         QWEN38_N_GA_LAYER,
         DS4_N_VOCAB,
-        QWEN38_GA_KV_DIM,
+        QWEN38_GA_KV_DIM | (session_qwen38_steering_active(s) ? QWEN38_STEERING_PAYLOAD_V1 : 0u),
     };
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
     }
+    if (session_qwen38_steering_active(s) &&
+        session_qwen38_steering_identity(s, fp, true, NULL, err, errlen)) return 1;
     for (uint32_t i = 0; i < saved_tokens; i++) {
         if (payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen) != 0)
             return 1;
@@ -58712,6 +58858,11 @@ static int ds4_session_load_qwen38_payload(ds4_session *s, FILE *fp,
                         "cache and this session runs q8_0");
         return 1;
     }
+    const bool steered = (h[12] & QWEN38_STEERING_PAYLOAD_V1) != 0;
+    if (steered != session_qwen38_steering_active(s)) {
+        payload_set_err(err, errlen, "Qwen cache steering mode mismatch");
+        return 1;
+    }
     const uint32_t saved_ctx = h[2];
     const uint32_t kv_element_bytes = h[4] & 0xffffu;
     const uint32_t rope_pos = h[5];
@@ -58723,17 +58874,24 @@ static int ds4_session_load_qwen38_payload(ds4_session *s, FILE *fp,
         (image_count == 0 && rope_pos != saved_tokens) ||
         h[8] != DS4_N_LAYER || h[9] != QWEN38_N_GDN_LAYER ||
         h[10] != QWEN38_N_GA_LAYER || h[11] != DS4_N_VOCAB ||
-        h[12] != QWEN38_GA_KV_DIM ||
+        (h[12] & ~QWEN38_STEERING_PAYLOAD_V1) != QWEN38_GA_KV_DIM ||
+        (kv_element_bytes != sizeof(float) && kv_element_bytes != sizeof(uint16_t)) ||
+        (kv_file_format != 0u && kv_element_bytes != sizeof(uint16_t)) ||
         !session_qwen38_payload_size(saved_tokens, image_count,
-                                     session_qwen38_kv_pos_bytes(ds4_session_is_cpu(s)), &expected_bytes)) {
+            kv_file_format ? session_qwen38_kv_pos_bytes(false) :
+                            (uint64_t)QWEN38_GA_KV_DIM * kv_element_bytes,
+            &expected_bytes)) {
         payload_set_err(err, errlen, "KV checkpoint was written for a different Qwen layout");
         return 1;
     }
     (void)h[3]; /* Prefill capacity is scratch scheduling state, not durable KV. */
+    if (steered) expected_bytes += qwen38_steering_payload_bytes();
     if (expected_bytes != payload_bytes) {
         payload_set_err(err, errlen, "Qwen checkpoint payload size does not match its layout");
         return 1;
     }
+    if (steered && session_qwen38_steering_identity(s, fp, false, remaining, err, errlen))
+        return 1;
     const bool cpu = ds4_session_is_cpu(s);
 #ifndef DS4_NO_GPU
     if (!cpu && !s->qwen38_gpu_ready) {
@@ -59942,7 +60100,8 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
             (uint32_t)s->checkpoint.len,
             (uint32_t)s->checkpoint_image_count,
             session_qwen38_kv_pos_bytes(ds4_session_is_cpu(s)),
-              &bytes) ? bytes : 0;
+              &bytes) ? bytes + (session_qwen38_steering_active(s) ?
+                                qwen38_steering_payload_bytes() : 0u) : 0;
       }
     if (ds4_session_is_cpu(s)) {
         uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
@@ -67114,10 +67273,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     opt->ctk_q8 == 2 ? 576u : 1088u);
         }
         if (load_slice || opt->distributed.role != DS4_DISTRIBUTED_NONE ||
-            opt->tp.role != DS4_TP_NONE ||
-            opt->dspark || opt->directional_steering_file) {
+            opt->tp.role != DS4_TP_NONE || opt->dspark) {
             fprintf(stderr, "ds4: Qwen3.8 does not support layer slicing, "
-                            "distributed/TP or steering yet\n");
+                            "distributed/TP or DFlash yet\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -67174,6 +67332,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
             }
         }
 #endif
+        if (!cpu_load_directional_steering(e)) {
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
         /* The Qwen3.8 engine returns here, so the draft head is bound on this
          * path rather than in the generic support-model block below: from an
          * external sidecar when --mtp-model names one, or from this same file
@@ -69109,6 +69272,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                                      e->prefill_chunk);
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN38) {
             qwen38_cpu_state_init(&s->qwen38_state, (uint32_t)ctx_size);
+            s->qwen38_state.steering_dirs = e->directional_steering_dirs;
+            s->qwen38_state.steering_attn_scale = e->directional_steering_attn_scale;
+            s->qwen38_state.steering_ffn_scale = e->directional_steering_ffn_scale;
         } else {
             kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
             cpu_decode_scratch_init(&s->cpu_scratch, (uint32_t)ctx_size);
@@ -69138,6 +69304,19 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             return 1;
         }
         s->qwen38_gpu_ready = true;
+        s->qwen38_gpu_state.steering_attn_scale = e->directional_steering_attn_scale;
+        s->qwen38_gpu_state.steering_ffn_scale = e->directional_steering_ffn_scale;
+        if (e->directional_steering_dirs) {
+            const uint64_t bytes = (uint64_t)directional_steering_layer_count() *
+                                   DS4_N_EMBD * sizeof(float);
+            ds4_gpu_tensor *dirs = ds4_gpu_tensor_alloc(bytes);
+            s->qwen38_gpu_state.steering_dirs = dirs;
+            if (!dirs || !ds4_gpu_tensor_write(dirs, 0, e->directional_steering_dirs, bytes)) {
+                fprintf(stderr, "ds4: failed to upload Qwen steering directions\n");
+                ds4_session_free(s);
+                return 1;
+            }
+        }
         if (e->qwen38_mtp_ready) {
             /* Measured on a 16 GiB device: model (10.95 GiB) + a 24k context
              * (1.6 GiB) + the sidecar and its state (0.96 GiB) no longer stay
@@ -69584,6 +69763,12 @@ int ds4_session_set_power(ds4_session *s, int power_percent) {
 
 float ds4_session_directional_steering_ffn(ds4_session *s) {
     if (!s || !s->engine) return 0.0f;
+    if (ds4_session_is_qwen38(s)) {
+#ifndef DS4_NO_GPU
+        if (!ds4_session_is_cpu(s)) return s->qwen38_gpu_state.steering_ffn_scale;
+#endif
+        return s->qwen38_state.steering_ffn_scale;
+    }
 #ifndef DS4_NO_GPU
     if (!ds4_session_is_cpu(s)) {
         return ds4_session_is_glm(s) ?
@@ -69603,6 +69788,21 @@ int ds4_session_set_directional_steering_ffn(ds4_session *s, float scale) {
         fprintf(stderr,
                 "ds4: live steering changes are not supported for distributed or network tensor-parallel sessions\n");
         return 1;
+    }
+
+    if (ds4_session_is_qwen38(s)) {
+        if (!steering_f32_finite(scale) ||
+            (scale != 0.0f && !s->engine->directional_steering_dirs)) return 1;
+        if (ds4_session_directional_steering_ffn(s) == scale) return 0;
+        /* A changed scale changes every subsequent layer's KV/GDN history.
+         * Require full-prefix sync, and do not change other sessions/defaults. */
+#ifndef DS4_NO_GPU
+        if (!ds4_session_is_cpu(s)) s->qwen38_gpu_state.steering_ffn_scale = scale;
+        else
+#endif
+            s->qwen38_state.steering_ffn_scale = scale;
+        ds4_session_invalidate(s);
+        return 0;
     }
 
     bool loaded = s->engine->directional_steering_dirs != NULL;
@@ -73302,6 +73502,22 @@ static int qwen38_mtp_commit_round(ds4_session *s, int *out_tokens,
     const uint32_t base = (uint32_t)s->checkpoint.len;
     if (n_drafts > QWEN38_MTP_MAX_ROWS ||
         (uint64_t)base + n_drafts >= trunk->ctx_size) return 1;
+
+    if (session_qwen38_steering_active(s)) {
+        /* Steering exposed a greedy divergence between MMQ chunk verification
+         * and MMVQ decode in the style-direction gate. Verify on the ordinary
+         * token path instead: no rejected draft enters KV/GDN, and MTP's rows
+         * are refreshed from the same predecessor hidden as plain decoding.
+         * This sacrifices batch speed only for the opt-in edited timeline. */
+        *out_count = 1u;
+        for (uint32_t i = 0; i < n_drafts; i++) {
+            const int next = sample_argmax(s->logits, DS4_N_VOCAB);
+            if (qwen38_mtp_eval_pending(s, next, err, errlen)) return 1;
+            out_tokens[(*out_count)++] = next;
+            if (next != drafts[i]) break;
+        }
+        return 0;
+    }
 
     if (!ds4_gpu_tensor_copy(mst->ssm_snapshot, 0, trunk->ssm_state, 0,
                              ds4_gpu_tensor_bytes(trunk->ssm_state)) ||
