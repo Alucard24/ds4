@@ -284,7 +284,7 @@ fits); use the `long` profile for documents.
 ## The server profiles
 
 `run-qwen-server.sh` is the shortcut for a server that is ready to use.  It has
-four profiles and can be adjusted without editing it:
+six profiles and can be adjusted without editing it:
 
 | profile | model | context | KV |
 |---|---|---|---|
@@ -292,7 +292,17 @@ four profiles and can be adjusted without editing it:
 | `sidecar` | trunk + NVFP4 draft sidecar | 16384 | f16 |
 | `long` | trunk | 32768 | f16 |
 | `q4` | trunk | 131072 | q4_0 |
-| `xxs` | IQ3_XXS trunk with the draft head inside it | 32768 | f16 |
+| `xxs` | IQ3_XXS trunk with the draft head inside it | 49152 | f16 |
+| `orca` | OrcaRouter fine-tune, same mix and embedded draft head | 49152 | f16 |
+
+`orca` is opt-in and is not a replacement for the IQ3_S default: it measured a
+16-token NLL of 1.89104305 against IQ3_XXS's 1.87606303 and IQ3_S's 1.80954673.
+It writes its cache under `<KV_DIR>/orca`, not the directory the other profiles
+share: the payload records the model id (4 for every Qwen3.8 trunk) and the routed
+quant bits (0, this model has no routed experts), so nothing but a directory of its
+own separates two different trunks under the same rendered text.  The same text
+produces the same file name in either directory, which is what makes the
+separation necessary rather than cosmetic.
 
 `./run-qwen-server.sh --help` prints the same list.  Any profile accepts:
 
@@ -305,9 +315,10 @@ four profiles and can be adjusted without editing it:
 
 so `DS4_CTK=q8_0 DS4_CTV=q8_0 DS4_CTX=65536 ./run-qwen-server.sh long` is the f16
 profile made twice as wide without touching the file.  Mismatched `DS4_CTK` and
-`DS4_CTV` are refused with a message instead of starting.  All profiles share one
-disk KV directory and always pass `--kv-cache-reject-different-quant`, so a
-checkpoint written with one KV type is never resumed by another.
+`DS4_CTV` are refused with a message instead of starting.  Every profile passes
+`--kv-cache-reject-different-quant`, so a checkpoint written with one KV type is
+never resumed by another, and all of them share one disk KV directory except
+`orca`, which has its own for the reason above.
 
 Why `q4` exists: attention K/V is 64 KiB per token as f16, and at 131072 tokens
 the f16 K alone asks the allocator for 4096 MiB, which this 16 GiB card refuses.

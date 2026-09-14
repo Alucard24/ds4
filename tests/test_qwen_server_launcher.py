@@ -18,6 +18,7 @@ with tempfile.TemporaryDirectory(prefix="qwen-launcher-") as td:
     model_dir.mkdir()
     for name in ("IQ3_S", "IQ3_S-mtp", "IQ3_XXS-mtp"):
         (model_dir / f"Qwen3.8-27B-GSQ-RCO-{name}.gguf").touch()
+    (model_dir / "Qwen3.8-27B-OrcaRouter-GSQ-RCO-IQ3_XXS-v2.0.gguf").touch()
     env = {k: v for k, v in os.environ.items() if not k.startswith("DS4_")}
     env.update(DS4_QWEN_MODEL_DIR=str(model_dir), DS4_KV_DIR=str(root / "cache"))
 
@@ -33,13 +34,25 @@ with tempfile.TemporaryDirectory(prefix="qwen-launcher-") as td:
         return argv[argv.index(flag) + 1]
 
     for profile, ctx in ((None, 16384), ("sidecar", 16384), ("long", 32768),
-                         ("q4", 131072), ("xxs", 49152)):
+                         ("q4", 131072), ("xxs", 49152), ("orca", 49152)):
         argv = run(profile)
         assert value(argv, "--ctx") == str(ctx)
-        assert ("IQ3_XXS" in value(argv, "-m")) == (profile == "xxs")
+        assert ("IQ3_XXS" in value(argv, "-m")) == (profile in ("xxs", "orca"))
+        assert ("OrcaRouter" in value(argv, "-m")) == (profile == "orca")
+        if profile in (None, "xxs", "orca"):
+            # Embedded draft head: the same file carries block 64.
+            assert "--mtp" in argv and "--mtp-draft" in argv
+        elif profile == "sidecar":
+            # Separate NVFP4 draft file.
+            assert "--mtp-model" in argv and "--mtp" not in argv
+        else:
+            assert "--mtp" not in argv and "--mtp-model" not in argv
         assert value(argv, "-ctk") == ("q4_0" if profile == "q4" else "f16")
         assert "--dir-steering-file" not in argv
-        assert value(argv, "--kv-disk-dir") == env["DS4_KV_DIR"]
+        # orca is a different trunk under the same model id and quant bits, so its
+        # cache must not be the directory the release/xxs profiles share.
+        expected = env["DS4_KV_DIR"] + ("/orca" if profile == "orca" else "")
+        assert value(argv, "--kv-disk-dir") == expected
 
     prefix = str(root / "prefix [one] *.txt")
     argv = run(DS4_PREFIX=prefix, DS4_SYSTEM="one two * three", DS4_POWER="0")

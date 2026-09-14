@@ -4,13 +4,20 @@ set -eu
 
 usage() {
     cat <<'EOF'
-Usage: ./run-qwen-server.sh [merged|sidecar|long|q4|xxs]
+Usage: ./run-qwen-server.sh [merged|sidecar|long|q4|xxs|orca]
   merged   IQ3_S + embedded MTP, 16384 context (default)
   sidecar  IQ3_S + NVFP4 MTP sidecar, 16384 context
   long     IQ3_S, no MTP, 32768 context
   q4       IQ3_S, no MTP, q4_0 KV, 131072 allocated context
   xxs      IQ3_XXS + embedded MTP, 49152 allocated context
+  orca     OrcaRouter IQ3_XXS + embedded MTP, 49152, own cache dir
 Capacity is not a guarantee of full-depth throughput or MTP residency.
+
+`orca` is opt-in and is not the release default: a different trunk (community
+fine-tune) with the same IQ3_XXS mix, so its caches go to <KV_DIR>/orca because
+the payload's model id and quant bits do not separate it from the release trunk.
+Its measured 16-token NLL is 1.89104305 against IQ3_XXS's 1.87606303 and IQ3_S's
+1.80954673, and it ships no per-layer steering direction of its own.
 
 Environment overrides:
   DS4_CTX, DS4_CTK, DS4_CTV     context and matching KV types: f16/q8_0/q4_0
@@ -57,6 +64,18 @@ case "$PROFILE" in
         MODEL=$M/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf
         CTX=49152; DEFAULT_KV=f16
         set -- --mtp --mtp-draft 4 ;;
+    orca)
+        # A different trunk with the same mix, and its embedded draft head binds the
+        # same way, so the memory budget is `xxs`'s. The separate cache directory is
+        # deliberate: the payload carries only the model id (4 for every Qwen3.8)
+        # and the routed quant bits (0, this model has no routed experts), so a
+        # text-keyed entry written by one trunk would otherwise be resumed by the
+        # other and the restored cache would not be the one that prompt was built
+        # with.
+        MODEL=$M/Qwen3.8-27B-OrcaRouter-GSQ-RCO-IQ3_XXS-v2.0.gguf
+        CTX=49152; DEFAULT_KV=f16
+        set -- --mtp --mtp-draft 4
+        KV=$KV/orca ;;
     *) echo "unknown profile: $PROFILE" >&2; usage >&2; exit 2 ;;
 esac
 CTK=${DS4_CTK:-$DEFAULT_KV}
