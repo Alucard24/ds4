@@ -7843,6 +7843,37 @@ static void qwen38_mtp_drop_history(ds4_session *s);
  * first, and both must agree or a saved cache cannot be restored. */
 static uint64_t session_qwen38_kv_pos_bytes(bool cpu);
 
+/* The activation dump that dir-steering/tools/build_direction.py reads.  It asks
+ * for one component (ffn_out by default) at one position (pos 0) through the same
+ * environment variables the Metal and ROCm graphs honour, and reads back
+ * <prefix>_<component>-<layer>_pos<pos>.bin, so nothing about the tool changes.  It
+ * runs only when DS4_METAL_GRAPH_DUMP_PREFIX is set: without it this is one string
+ * comparison per layer, and the layer's numbers are untouched either way. */
+static const char *metal_graph_debug_prefix_for(const char *name, uint32_t il, uint32_t pos);
+
+static void qwen38_dump_activation(const char *name, const ds4_gpu_tensor *t,
+                                   uint32_t il, uint32_t pos) {
+    const char *prefix = metal_graph_debug_prefix_for(name, il, pos);
+    if (!t || !prefix) return;
+    if (ds4_gpu_synchronize() == 0) {
+        fprintf(stderr, "ds4: failed to synchronize before dumping %s layer %u\n",
+                name, il);
+        return;
+    }
+    const uint64_t bytes = (uint64_t)QWEN38_N_EMBD * sizeof(float);
+    float *buf = xmalloc((size_t)bytes);
+    if (ds4_gpu_tensor_read(t, 0, buf, bytes) != 0) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin", prefix, name, il, pos);
+        if (write_f32_binary_file(path, buf, QWEN38_N_EMBD)) {
+            fprintf(stderr, "ds4: dumped %s layer %u pos %u to %s\n",
+                    name, il, pos, path);
+        }
+    }
+    free(buf);
+}
+
+
 static int qwen38_gpu_alloc_bytes(ds4_gpu_tensor **out, uint64_t bytes,
                                   const char *label) {
     *out = ds4_gpu_tensor_alloc(bytes);
@@ -8774,6 +8805,9 @@ static int qwen38_gpu_forward_token(ds4_qwen38_gpu_state *st,
         QWEN38_GPU_CHECK(ds4_gpu_swiglu_tensor(st->ffn_m, st->ffn_g,
                                                st->ffn_u, QWEN38_N_FF, 0.0f, 1.0f), "SwiGLU");
         QWEN38_GPU_CHECK(qwen38_gpu_matvec(st->proj, m, l->ffn_down, st->ffn_m), "FFN down");
+
+        /* The FFN output, before the residual: the component the steering tool dumps. */
+        qwen38_dump_activation("ffn_out", st->proj, il, pos);
         QWEN38_GPU_CHECK(ds4_gpu_add_tensor(st->hidden, st->hidden,
                                              st->proj, QWEN38_N_EMBD), "FFN residual");
     }
@@ -9061,6 +9095,8 @@ static int qwen38_gpu_forward_chunk(ds4_qwen38_gpu_state *st,
             n_tokens * QWEN38_N_FF, 0.0f, 1.0f), "SwiGLU");
         QWEN38_CHUNK_CHECK(qwen38_gpu_matvec_rows(
             st->proj, m, l->ffn_down, st->ffn_m, n_tokens), "FFN down");
+        /* Row 0 is the first token of the chunk, which is the position a dump filter names. */
+        qwen38_dump_activation("ffn_out", st->proj, il, start_pos);
         QWEN38_CHUNK_CHECK(ds4_gpu_add_tensor(
             st->hidden, st->hidden, st->proj,
             n_tokens * QWEN38_N_EMBD), "FFN residual");

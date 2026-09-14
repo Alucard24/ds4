@@ -23,6 +23,10 @@ from pathlib import Path
 MODEL_PROFILES = {
     "deepseek-v4-flash": (43, 4096),
     "glm-5.3-flash": (45, 4096),
+    # Qwen3.8-27B: 64 normal layers, 5120 hidden.  The dump comes from the CUDA path,
+    # which honours the same DS4_METAL_GRAPH_DUMP_* variables as the Metal and ROCm
+    # graphs, so only this table entry was missing.
+    "qwen3.8-27b": (64, 5120),
 }
 
 
