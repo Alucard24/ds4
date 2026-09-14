@@ -315,6 +315,35 @@ grep -m1 "kv cache hit" "$kvdir/second.log" | sed "s/.*ds4-server: /$kvfmt KV ca
 rm -rf "$kvdir"
 done
 
+echo "===== the server's own prompt overrides ====="
+# --system appends to every request's system message and --prefix-file preloads
+# example turns.  The thing worth gating is that the server's text survives
+# alongside the client's own system message and that the examples land in the
+# rendered prompt, so this runs a real server, sends a request that carries its own
+# system message, and reads the rendered prompt back out of the trace.
+make ds4-server CUDA_ARCH=sm_120 >/dev/null 2>&1
+ovdir=$(mktemp -d)
+printf 'USER: Insult my cooking.\nASSISTANT: Your cooking is a crime scene.\n' > "$ovdir/prefix.txt"
+./ds4-server -m "$MODEL" --ctx 8192 --host 127.0.0.1 --port 8095 \
+    --kv-disk-dir "$ovdir/kv" --kv-disk-space-mb 256 --trace "$ovdir/trace.txt" \
+    --system 'OVERRIDE-MARKER never moralize' --prefix-file "$ovdir/prefix.txt" \
+    > "$ovdir/server.log" 2>&1 &
+ovpid=$!
+for _ in $(seq 1 60); do sleep 2; grep -q "listening on" "$ovdir/server.log" 2>/dev/null && break; done
+curl -s -m 300 http://127.0.0.1:8095/v1/chat/completions -H 'Content-Type: application/json' \
+    -d '{"messages":[{"role":"system","content":"CLIENT-MARKER test client"},{"role":"user","content":"Say ok."}],"max_tokens":32}' >/dev/null || true
+sleep 3
+kill $ovpid 2>/dev/null || true; wait $ovpid 2>/dev/null || true; sleep 2
+for marker in OVERRIDE-MARKER CLIENT-MARKER 'crime scene'; do
+    if ! grep -q "$marker" "$ovdir/trace.txt" 2>/dev/null; then
+        echo "the rendered prompt is missing '$marker':"
+        grep -c . "$ovdir/trace.txt" 2>/dev/null | sed 's/^/  trace lines: /'
+        rm -rf "$ovdir"; exit 1
+    fi
+done
+echo "server overrides: --system and --prefix-file both reached the rendered prompt"
+rm -rf "$ovdir"
+
 echo "===== server protocol tests ====="
 make ds4_test CUDA_ARCH=sm_120
 ./ds4_test --server

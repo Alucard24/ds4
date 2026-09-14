@@ -67,6 +67,8 @@
 #   DS4_CTX      context tokens            (default: the profile's own)
 #   DS4_CTK      KV cache type for K       (default f16; also q8_0, q4_0)
 #   DS4_CTV      KV cache type for V       (must match DS4_CTK)
+#   DS4_SYSTEM   text appended to every request's system message (default: none)
+#   DS4_PREFIX   file of example turns preloaded before the conversation
 #   DS4_TRACE    trace file                (default /tmp/ds4-server.trace; /dev/null
 #                                           discards it - it holds prompts and replies)
 #   DS4_HOST     bind address              (default 127.0.0.1; 0.0.0.0 for the LAN)
@@ -88,6 +90,11 @@ CTK=${DS4_CTK:-f16}
 CTV=${DS4_CTV:-f16}
 # The trace holds rendered prompts and replies in clear text.  /dev/null discards it.
 TRACE=${DS4_TRACE:-/tmp/ds4-server.trace}
+SYSTEM=${DS4_SYSTEM:-}
+PREFIX_ARGS=
+if [ -n "$DS4_PREFIX" ]; then
+    PREFIX_ARGS="--prefix-file $DS4_PREFIX"
+fi
 PROFILE=${1:-merged}
 KV=${DS4_KV_DIR:-$HOME/.ds4/server-kv}
 
@@ -132,7 +139,7 @@ xxs)
         --vision "$M/mmproj-Qwen3.8-27B-BF16.gguf" \
         --mtp --mtp-draft 4 \
         --kv-disk-dir "$KV" --kv-disk-space-mb 8192 \
-        --trace "$TRACE" $POWER_ARGS
+        --trace "$TRACE" $PREFIX_ARGS --system "$SYSTEM" \
     ;;
 merged)
     # 16384 is the largest context where the draft head fits on a 16 GiB card
@@ -152,7 +159,7 @@ merged)
         --vision "$M/mmproj-Qwen3.8-27B-BF16.gguf" \
         --mtp --mtp-draft 4 \
         --kv-disk-dir "$KV" --kv-disk-space-mb 8192 \
-        --trace "$TRACE" $POWER_ARGS
+        --trace "$TRACE" $PREFIX_ARGS --system "$SYSTEM" \
     ;;
 sidecar)
     printf '%s\n' "ds4-server (sidecar, ctx ${DS4_CTX:-16384}, KV $CTK) on http://$HOST:$PORT" >&2
@@ -163,7 +170,7 @@ sidecar)
         --vision "$M/mmproj-Qwen3.8-27B-BF16.gguf" \
         --mtp-model "$M/Qwen3.8-27B-NVFP4-MTP-HIGHEST.gguf" --mtp-draft 4 \
         --kv-disk-dir "$KV" --kv-disk-space-mb 8192 \
-        --trace "$TRACE" $POWER_ARGS
+        --trace "$TRACE" $PREFIX_ARGS --system "$SYSTEM" \
     ;;
 long)
     printf '%s\n' "ds4-server (long, ctx ${DS4_CTX:-32768}, KV $CTK, no draft head) on http://$HOST:$PORT" >&2
@@ -173,7 +180,7 @@ long)
         -ctk "$CTK" -ctv "$CTV" --kv-cache-reject-different-quant \
         --vision "$M/mmproj-Qwen3.8-27B-BF16.gguf" \
         --kv-disk-dir "$KV" --kv-disk-space-mb 8192 \
-        --trace "$TRACE" $POWER_ARGS
+        --trace "$TRACE" $PREFIX_ARGS --system "$SYSTEM" \
     ;;
 q4)
     # The largest context this card can hold: q4_0 KV, no draft head (it would
@@ -188,7 +195,7 @@ q4)
         -ctk "$CTK" -ctv "$CTV" --kv-cache-reject-different-quant \
         --vision "$M/mmproj-Qwen3.8-27B-BF16.gguf" \
         --kv-disk-dir "$KV" --kv-disk-space-mb 8192 \
-        --trace "$TRACE" $POWER_ARGS
+        --trace "$TRACE" $PREFIX_ARGS --system "$SYSTEM" \
     ;;
 *)
     echo "unknown profile: $PROFILE" >&2

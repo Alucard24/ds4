@@ -4,6 +4,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
+#include "ds4_prompt_prefix.h"
 #include "ds4_tp.h"
 #include "rax.h"
 
@@ -3986,6 +3987,37 @@ static void anthropic_prepare_live_continuation(request *r,
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
  * prompt plus the small amount of protocol state needed to translate the reply. */
+/* Prompt overrides for every request the server handles.  --system TEXT is pushed
+ * as a system-role message so each renderer hoists it into its own system region,
+ * after the client's own text and the tool schemas; --prefix-file turns are
+ * prepended as ordinary messages, which is where few-shot examples belong.  Without
+ * either option both are no-ops and the request is rendered exactly as before. */
+static const char *g_system_extra;
+static ds4_prompt_prefix g_prompt_prefix;
+
+static void server_apply_prompt_overrides(chat_msgs *msgs) {
+    if (g_prompt_prefix.count) {
+        const int n = (int)g_prompt_prefix.count;
+        for (int k = n - 1; k >= 0; k--) {
+            chat_msg turn = {0};
+            turn.role = xstrdup(g_prompt_prefix.turns[k].role == DS4_PROMPT_PREFIX_ASSISTANT
+                                ? "assistant" : "user");
+            turn.content = xstrdup(g_prompt_prefix.turns[k].content);
+            chat_msgs_push(msgs, (chat_msg){0});        /* make room at the end */
+            for (int j = msgs->len - 1; j > 0; j--)     /* shift right, in place */
+                msgs->v[j] = msgs->v[j - 1];
+            msgs->v[0] = turn;
+        }
+    }
+    if (g_system_extra && g_system_extra[0]) {
+        chat_msg sysmsg = {0};
+        sysmsg.role = xstrdup("system");
+        sysmsg.content = xstrdup(g_system_extra);
+        chat_msgs_push(msgs, sysmsg);
+    }
+}
+
+
 static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
@@ -4158,6 +4190,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
+    server_apply_prompt_overrides(&msgs);
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
@@ -4379,6 +4412,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
+    server_apply_prompt_overrides(&msgs);
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
@@ -5409,6 +5443,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     responses_prepare_live_continuation(r, &msgs);
+    server_apply_prompt_overrides(&msgs);
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
@@ -5608,6 +5643,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     user_msg.content = prompt;
     prompt = NULL;
     chat_msgs_push(&msgs, user_msg);
+    server_apply_prompt_overrides(&msgs);
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, NULL, NULL, r->think_mode);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
@@ -15397,6 +15433,16 @@ static server_config parse_options(int argc, char **argv) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
+          } else if (!strcmp(arg, "--system")) {
+              g_system_extra = need_arg(&i, argc, argv, arg);
+          } else if (!strcmp(arg, "--prefix-file")) {
+              char perr[256] = {0};
+              if (ds4_prompt_prefix_load(&g_prompt_prefix, need_arg(&i, argc, argv, arg),
+                                         perr, sizeof(perr)) != 0) {
+                  fprintf(stderr, "ds4-server: %s\n",
+                          perr[0] ? perr : "invalid prefix file");
+                  exit(2);
+              }
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batched-session")) {
