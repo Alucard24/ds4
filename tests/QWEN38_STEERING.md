@@ -41,6 +41,16 @@ This checks acceptance and finite continuation, not CPU/GPU bit equality.
 
 ## Results on RTX 5070 Ti 16GB / Linux
 
+- Re-run at the `stable-34` state (native Qwen tool path in `ds4-agent`, drafting
+  profiles defaulting to 32768): exit 0, 0 failing assertions, 8 minutes wall clock
+  including the `make clean` rebuilds - the earlier "about an hour" was my own wrong
+  estimate. Same six pins, `recall at ~19.5k: 4/4`, prefill first-token logits f16
+  16.5558395 / q8_0 16.5136585 / q4_0 16.2306328, bench prefill 1452 t/s, MTP 48/48
+  on both runs, `agent KV cache: saved (quant_bits=0) and reloaded`, four steering
+  gates, q4_0 and q8_0 disk cache hits, `server: OK`. One step does not run here:
+  `make test-tokenizer-vectors` has no such target in this Makefile, so the script
+  prints that it is covered by `run_qwen38_cpu.sh`.
+
 - Full `run_qwen38_regression.sh`: exit 0, including six weight/KV session cells,
   mixed-IQ kernels, prefill/recall, image/video, MTP, frontend smoke tests and
   server protocol/cache checks. All six pre-existing NLL pins unchanged:
