@@ -5,13 +5,17 @@ set -eu
 usage() {
     cat <<'EOF'
 Usage: ./run-qwen-server.sh [merged|sidecar|long|q4|xxs|orca]
-  merged   IQ3_S + embedded MTP, 16384 context (default)
-  sidecar  IQ3_S + NVFP4 MTP sidecar, 16384 context
+  merged   IQ3_S + embedded MTP, 32768 context (default)
+  sidecar  IQ3_S + NVFP4 MTP sidecar, 32768 context
   long     IQ3_S, no MTP, 32768 context
   q4       IQ3_S, no MTP, q4_0 KV, 131072 allocated context
   xxs      IQ3_XXS + embedded MTP, 49152 allocated context
   orca     OrcaRouter IQ3_XXS + embedded MTP, 49152, own cache dir
-Capacity is not a guarantee of full-depth throughput or MTP residency.
+Capacity is not a guarantee of full-depth throughput or MTP residency: on a
+16 GiB card the draft head does not fit next to a 32768-token f16 cache, so the
+engine skips drafting and `merged` serves the same context as `long`.
+DS4_CTX lowers it again when drafting matters more than depth (16384 measured
+best for that), and `long` is the same model without the draft head.
 
 `orca` is opt-in and is not the release default: a different trunk (community
 fine-tune) with the same IQ3_XXS mix, so its caches go to <KV_DIR>/orca because
@@ -48,11 +52,11 @@ set --
 case "$PROFILE" in
     merged)
         MODEL=$M/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
-        CTX=16384; DEFAULT_KV=f16
+        CTX=32768; DEFAULT_KV=f16
         set -- --mtp --mtp-draft 4 ;;
     sidecar)
         MODEL=$M/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf
-        CTX=16384; DEFAULT_KV=f16
+        CTX=32768; DEFAULT_KV=f16
         set -- --mtp-model "$M/Qwen3.8-27B-NVFP4-MTP-HIGHEST.gguf" --mtp-draft 4 ;;
     long)
         MODEL=$M/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf

@@ -33,7 +33,7 @@ with tempfile.TemporaryDirectory(prefix="qwen-launcher-") as td:
     def value(argv, flag):
         return argv[argv.index(flag) + 1]
 
-    for profile, ctx in ((None, 16384), ("sidecar", 16384), ("long", 32768),
+    for profile, ctx in ((None, 32768), ("sidecar", 32768), ("long", 32768),
                          ("q4", 131072), ("xxs", 49152), ("orca", 49152)):
         argv = run(profile)
         assert value(argv, "--ctx") == str(ctx)

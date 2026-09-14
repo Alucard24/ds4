@@ -277,9 +277,12 @@ head, so what is being paid there is the weight cache thinning out around it.
 The reason depth costs drafting so much is the verify pass: one trunk pass over
 four drafted tokens pays the 10.95 GiB of weights once - which is the whole point
 - but pays the attention four times, and at 16k the attention is a third of a
-token. So `--mtp` is for chat, which is what the default `run-qwen-server.sh`
-profile is for (ctx 16384 with the draft head, the largest context where it
-fits); use the `long` profile for documents.
+token. So `--mtp` is for chat, and the default profile now serves 32768 tokens
+without drafting: at that depth the engine skips the draft head by itself (its own
+budget message reports 13.93 GiB resident for the embedded head against the
+15.51 GiB device), so `merged` and `long` serve the same context.  Set
+`DS4_CTX=16384` when drafting matters more than depth, which is where it was
+measured to pay.
 
 ## The server profiles
 
@@ -288,12 +291,19 @@ six profiles and can be adjusted without editing it:
 
 | profile | model | context | KV |
 |---|---|---|---|
-| `merged` (default) | trunk with the draft head inside it | 16384 | f16 |
-| `sidecar` | trunk + NVFP4 draft sidecar | 16384 | f16 |
+| `merged` (default) | trunk with the draft head inside it | 32768 | f16 |
+| `sidecar` | trunk + NVFP4 draft sidecar | 32768 | f16 |
 | `long` | trunk | 32768 | f16 |
 | `q4` | trunk | 131072 | q4_0 |
 | `xxs` | IQ3_XXS trunk with the draft head inside it | 49152 | f16 |
 | `orca` | OrcaRouter fine-tune, same mix and embedded draft head | 49152 | f16 |
+
+At 32768 both drafting profiles are skipped by the engine for lack of resident room
+and then serve like `long`: measured on this card over a 64-token continuation,
+27.7 tok/s for `merged`, 26.6 for `sidecar` and 26.0 for `long`, with 15546, 15279
+and 15360 MiB in use.  The engine prints the reason itself, e.g. `skipping the
+Qwen3.8 MTP draft head: 32768-token context needs ~13.93 GiB resident (trunk 11.29
++ context 2.36 + draft 0.62 ...)`.  Lower `DS4_CTX` to get drafting back.
 
 `orca` is opt-in and is not a replacement for the IQ3_S default: it measured a
 16-token NLL of 1.89104305 against IQ3_XXS's 1.87606303 and IQ3_S's 1.80954673.
@@ -348,7 +358,8 @@ had its block size as 110 bytes, the size of IQ3_S, against the real 50 - wrong
 arithmetic that would have been read as corruption.
 
 What it buys is 10.44 GiB instead of 11.77, which is what lets the draft head run at
-49152 where the release trunk stops at 16384. Measured on this card with a 6000-token
+49152 where the release trunk drafts only up to 16384 and above that serves the
+same context without it. Measured on this card with a 6000-token
 prompt: 995.8 tok/s of prefill and 57.1 tok/s of decode at 49152, against 999.0 and
 57.2 at 32768 - flat. At 65536 the engine skips the draft by itself (its resident
 budget computes 14.50 GiB against the device) and the trunk carries on without it.
