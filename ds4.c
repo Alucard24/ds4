@@ -7901,6 +7901,13 @@ static int qwen38_gpu_alloc_tensor(ds4_gpu_tensor **out, uint64_t count,
 }
 
 static void qwen38_gpu_state_free(ds4_qwen38_gpu_state *st) {
+    /* Kernels in this engine launch on several streams, and cudaFree orders
+     * against in-flight work on other streams only by luck of the driver
+     * version.  A teardown that frees while the decode stream is still working
+     * is a use-after-free that surfaces as Xid 13 Out Of Range, rare and
+     * timing-dependent (docs/CUDA_XID_INCIDENT.md).  Teardown is rare, so pay
+     * the full-device sync unconditionally. */
+    (void)ds4_gpu_synchronize();
     for (uint32_t i = 0; i < 48; i++) {
         ds4_gpu_tensor_free(st->ssm_layer[i]);
         ds4_gpu_tensor_free(st->conv_layer[i]);
@@ -8044,6 +8051,7 @@ static int qwen38_gpu_state_zero(ds4_qwen38_gpu_state *st) {
 }
 
 static void qwen38_mtp_gpu_state_free(ds4_qwen38_mtp_gpu_state *st) {
+    (void)ds4_gpu_synchronize();
     for (uint32_t i = 0; i < QWEN38_MTP_MAX_ROWS; i++) {
         ds4_gpu_tensor_free(st->head_row[i]);
         ds4_gpu_tensor_free(st->tok_row[i]);
