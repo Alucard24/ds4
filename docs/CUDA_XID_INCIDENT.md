@@ -258,3 +258,22 @@ two bash runs, reply), each appending KV to the live session. It ran to
 completion and produced every artifact. Sanitizer: **4 errors, all four the
 `cudaHostRegister` / `cudaGetLastError` API notices** - no `Invalid`, no
 `out-of-bounds`, no kernel named.
+
+## Remaining surfaces driven: MTP and vision (same day)
+
+- `tests/test_qwen38_mtp` (NVFP4 sidecar draft + trunk, 48 tokens, trunk path
+  bit-identical): **PASS**, sanitizer reported 10 errors, all ten the known
+  `cudaHostRegister` / `cudaGetLastError` API notices, verified in the log text.
+- `tests/test_qwen3vl_vision` (BF16 tower + mmproj, embedded fixture):
+  **PASS** (`temporal frame merge`), **ERROR SUMMARY: 0 errors**.
+
+Nothing this project can execute has produced an invalid access under
+compute-sanitizer: fragments, spikes, attention and widening in three KV formats,
+GDN, elementwise, the quantized matmul family, the state flow, the agent flow, deep
+prefill, the MTP draft path and the vision tower. The two Xid 13 reports of
+15 September are therefore not reproducible by any harness built so far, and the
+19xx-line incident stands as follows: either a state or an ordering no harness
+reproduces (long context crossing chunk boundaries in a dirty cache, a payload
+written and restored across a configuration change, a driver already degrading), or
+the September 12 burst and the two later events have different causes, the first
+belonging to code that was committed, measured wrong and then replaced.
