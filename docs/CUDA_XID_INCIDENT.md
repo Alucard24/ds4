@@ -239,3 +239,14 @@ boundaries, a payload written and restored across a format or configuration chan
 sequence of many turns), the f16/BF16 projection paths, the vision tower, the MTP
 draft block, or a fault whose trigger is not in this project at all - which the Xid 79
 reports would allow but the Xid 13 attribution to `ds4` argues against.
+
+## Deep multi-chunk prefill via one agent turn, under memcheck (same day)
+
+The two sessions that faulted both accumulated several turns before the Xid;
+no harness so far had driven a deep context in a single process. This run did:
+one `ds4-agent` turn at `-c 4096` with a ~1400-token prompt (three prefill chunks),
+a native Qwen tool call executed, KV payload saved, answer returned correctly.
+
+Sanitizer: **4 errors, all four the `cudaHostRegister` / `cudaGetLastError` API
+notices** - no `Invalid`, no `out-of-bounds`, no kernel named. The turn is
+functionally intact (VERDE was read from the tool result and printed back).
