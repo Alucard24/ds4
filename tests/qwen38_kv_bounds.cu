@@ -87,7 +87,7 @@ static void drive(const void *map, uint64_t map_size, uint32_t ctx,
         const int s4 = s3 ? (ds4_gpu_synchronize() != 0) : 0;
         const int ok = s4;
         printf("  ctx=%u start=%u tokens=%u fmt=%s prepare=%d chunk=%d decode=%d sync=%d\n",
-               ctx, start_pos, n_tokens, fmt ? "q8_0" : "f16", s1, s2, s3, s4);
+               ctx, start_pos, n_tokens, fmt == 2 ? "q4_0" : fmt ? "q8_0" : "f16", s1, s2, s3, s4);
         if (!ok) failures++;
         ds4_gpu_tensor_free(k_cache); ds4_gpu_tensor_free(v_cache);
         ds4_gpu_tensor_free(q_full); ds4_gpu_tensor_free(k);

@@ -143,7 +143,7 @@ does not support, which the engine already prints and skips - not memory faults.
 
 So candidate 1 (launch-time indexing of the prefill path) and the fragment layout
 (candidate 1's inner form, clean in its own test) are both ruled out for these
-shapes.  What the harness does not cover, and what the next pass has to: the GDN
+shapes. The same drive was later extended to **q4_0** (11 shapes x 3 formats = 33 launches, widening included): every shape ran, memcheck reported nothing but the two known API notices, verified in the log text.  What the harness does not cover, and what the next pass has to: the GDN
 half of the layers (`ds4_gpu_qwen38_gdn_chunk` / `gdn_decode`), the MTP draft path,
 and the agent-shaped flow (many short turns, a KV payload save per turn, rewind and
 re-prefill) that produced both 15 September events.
