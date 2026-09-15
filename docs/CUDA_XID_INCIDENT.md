@@ -277,3 +277,13 @@ reproduces (long context crossing chunk boundaries in a dirty cache, a payload
 written and restored across a configuration change, a driver already degrading), or
 the September 12 burst and the two later events have different causes, the first
 belonging to code that was committed, measured wrong and then replaced.
+
+## BF16 projections driven standalone (same day)
+
+The only dense path never driven on its own: the model file holds **zero F16
+tensors**, so `ds4_gpu_matmul_f16_tensor` is dead code for this model, and 96 BF16
+tensors (`ssm_alpha`/`ssm_beta`, 5120x48). A minimal probe called the BF16 matmul
+on the real `blk.0.ssm_alpha.weight` with 1, 7, 16, 17 and 64 rows under memcheck:
+all ran, and the two log entries are again the `cudaHostRegister` /
+`cudaGetLastError` notices. (The same kernel also runs inside every model execution
+already driven clean; this closes the standalone gap, including row tails.)
