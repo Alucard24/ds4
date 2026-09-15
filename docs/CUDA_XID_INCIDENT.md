@@ -67,9 +67,26 @@ Candidate shapes worth checking first, in order:
 
 ## How to find it, and the rule
 
-`compute-sanitizer` is the right tool and is **not installed here**. It needs the
-GPU, so reproducing is a deliberate, supervised act on hardware the owner chooses,
-not something an agent launches.
+`compute-sanitizer` is the right tool. It was not installed with the Arch `cuda`
+12.8.1-3 package, and installing the repository's `cuda` 13.3.1 would have replaced
+the toolkit this project builds with. Instead the 13.3.1 package was downloaded
+without installing it, only `opt/cuda/bin/compute-sanitizer` and
+`opt/cuda/compute-sanitizer/` were extracted, and they live under the owner's home
+at `~/opt/cuda-cs/`; the toolkit is still 12.8. Version reported:
+`2026.2.1.0`. Reproducing is still a deliberate, supervised act on hardware the
+owner chooses, not something an agent launches on its own.
+
+First sanitizer result, same day: the FA-2 fragment self-test
+(`tests/qwen38_mma_frag_test.cu`, tiny allocations, the MMA layout the attention
+depends on) ran under `--tool memcheck` with **0 errors** and all 128 values correct
+for both m16n8k16 and m16n8k8.  The fragment code is clean, so the fault is
+elsewhere: the next targets are the other spike
+(`tests/qwen38_mma_qk_spike.cu`), then a small synthetic harness that drives the
+real prefill and widening kernels through the public GPU entry points with boundary
+shapes (`start_pos + n_tokens == ctx_size`, tails of 1..7 positions, both KV
+formats), which is what covers launch-time indexing rather than the fragment
+layout.  A full-model run under memcheck is unlikely to fit a 16 GiB card: memcheck
+keeps shadow state for every tracked allocation next to the 10.95 GiB of weights.
 
 Rules that follow from this incident, and that apply to any agent working in this
 repository:
