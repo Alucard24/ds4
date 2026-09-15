@@ -7866,7 +7866,7 @@ static const char *metal_graph_debug_prefix_for(const char *name, uint32_t il, u
 static void qwen38_dump_activation(const char *name, const ds4_gpu_tensor *t,
                                    uint32_t il, uint32_t pos, uint32_t rows) {
     const char *prefix = metal_graph_debug_prefix_for(name, il, pos);
-    if (!t || !prefix) return;
+    if (!t || !prefix || rows == 0) return;
     if (ds4_gpu_synchronize() == 0) {
         fprintf(stderr, "ds4: failed to synchronize before dumping %s layer %u\n",
                 name, il);

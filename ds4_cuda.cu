@@ -28334,6 +28334,16 @@ __global__ static void qwen38_ga_kv_widen_kernel(
     }
 }
 
+/* Bytes a single position occupies in one GA KV cache tensor, per format.  The
+ * f16 figure is the head count times the head width times two, and the quantized
+ * ones are 32-value blocks: 32 * 34 for q8_0 and 32 * 18 for q4_0. */
+static uint64_t qwen38_kv_row_bytes(int kv_fmt) {
+    const uint64_t values = (uint64_t)QWEN38_CUDA_GA_HEADS_KV * QWEN38_CUDA_GA_HEAD_DIM;
+    if (kv_fmt == 2) return (values / 32u) * 18u;
+    if (kv_fmt == 1) return (values / 32u) * 34u;
+    return values * sizeof(__half);
+}
+
 /* Format of the Qwen3.8 GA KV cache, set once when the engine opens and never
  * changed: 0 is f16, the release path, and 1 is q8_0.  The f16 kernels do not
  * read this. */
@@ -28698,6 +28708,19 @@ extern "C" int ds4_gpu_qwen38_ga_chunk(
              * head and the tensor-core body is cheap enough to expose it. */
             const int kv_fmt = g_qwen38_kv_q4 ? 2 : 1;
             const uint32_t positions = start_pos + n_tokens;
+            /* A reader that assumes the wrong bytes per position reads about twice
+             * the allocation, which the driver reports as an out-of-range kernel
+             * fault (Xid 13) rather than as an error.  Check the rows against the
+             * tensors the widener is about to read before launching it. */
+            const uint64_t kv_row_bytes = qwen38_kv_row_bytes(kv_fmt);
+            if ((uint64_t)positions * kv_row_bytes > ds4_gpu_tensor_bytes(k_cache) ||
+                (uint64_t)positions * kv_row_bytes > ds4_gpu_tensor_bytes(v_cache)) {
+                fprintf(stderr,
+                        "ds4: Qwen KV widen refused: %u positions need %llu bytes per "
+                        "cache tensor, which holds less\n",
+                        positions, (unsigned long long)((uint64_t)positions * kv_row_bytes));
+                return 0;
+            }
             const uint64_t wide_bytes = (uint64_t)positions *
                 QWEN38_CUDA_GA_HEADS_KV * QWEN38_CUDA_GA_HEAD_DIM * sizeof(__half);
             /* One allocation, two halves: the scratch is a single f16 mirror of
