@@ -287,3 +287,15 @@ on the real `blk.0.ssm_alpha.weight` with 1, 7, 16, 17 and 64 rows under memchec
 all ran, and the two log entries are again the `cudaHostRegister` /
 `cudaGetLastError` notices. (The same kernel also runs inside every model execution
 already driven clean; this closes the standalone gap, including row tails.)
+
+## Compaction under memcheck (same day)
+
+The remaining shape was a session that outgrows its context: prompt sized so that
+prompt plus system prompt cross the 4096-token limit mid-answer. The trace confirms
+it engaged (`compaction summary prefix=3373 total=3531 retained_unsummarized=158`,
+followed by rewind and re-prefill), all under `--tool memcheck`.
+
+Sanitizer up to the point the run was stopped: **0 `Invalid`, 0 `out-of-bounds`**.
+The run itself was killed by timeout at 30 minutes (long instrumented decode), so
+this covers the compaction event, not a full long generation - stated plainly
+instead of as a complete pass. No Xid anywhere in the boot, GPU healthy after.
