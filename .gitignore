@@ -58,6 +58,9 @@ __pycache__/
 .DS_Store
 /tests/test_qwen38_mtp
 /tests/test_qwen38_session_cuda
+/tests/test_qwen38_cuda
+/tests/test_qwen38_steering
+/tests/test_qwen38_steering_cpu
 /tests/test_qwen38_cuda_perf
 /tests/test_qwen3vl_vision
 /tests/test_qwen3vl_session
