@@ -218,3 +218,24 @@ paths, the vision tower and the MTP draft block.  If those are clean as well, th
 honest reading is no longer "an index is wrong somewhere" but "a state or an
 ordering none of these harnesses reproduces", and the next step becomes a
 reproduction strategy rather than another sweep.
+
+## The agent flow itself, under memcheck (same day)
+
+The shape that produced both 15 September reports, executed with instrumentation: one
+`ds4-agent` turn at `-c 2048`, the model loaded, the KV payload saved for the session,
+a tool call issued and executed (`report.txt` read, its contents returned correctly).
+
+Sanitizer result: **4 errors, and all four are the `cudaHostRegister` /
+`cudaGetLastError` API notices** this device produces - no `Invalid`, no
+`out-of-bounds`, no kernel named.  The memory shadow fit next to the weights, so the
+flow really executed under instrumentation rather than failing cleanly.
+
+That is the eighth surface driven clean, and the only one that reproduces the shape of
+the two crashes.  The honest reading now: no straightforward out-of-range index has
+been found in any kernel family that has been driven, including the flow that failed.
+What remains possible, and has to be probed differently rather than swept again: a
+state or ordering the harnesses do not reproduce (a long context crossing chunk
+boundaries, a payload written and restored across a format or configuration change, a
+sequence of many turns), the f16/BF16 projection paths, the vision tower, the MTP
+draft block, or a fault whose trigger is not in this project at all - which the Xid 79
+reports would allow but the Xid 13 attribution to `ds4` argues against.
