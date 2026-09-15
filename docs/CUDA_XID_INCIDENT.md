@@ -185,3 +185,20 @@ Xid 13 reports themselves.  Kernel surface not yet driven: the quantized matmul
 family (partly covered by `tests/test_qwen38_cuda`, which compares against ggml and
 can be run under the sanitizer the same way) and the elementwise norm/rope/SwiGLU
 family.
+
+## Quantized matmul family under memcheck (same day)
+
+`tests/test_qwen38_cuda` (q2_K, q4_K, iq2_xxs, iq2_xs, iq3_xxs, iq3_s, iq2_s, iq4_xs
+at batch 16, each compared against a ggml dot) under `--tool memcheck`: every case
+PASS with max_abs between 0.012 and 0.43, and **ERROR SUMMARY: 0 errors** - not even
+the cudaHostRegister notices appear in this one.
+
+Measured and eliminated, in order: the fragment layout, the attention and widening
+launch shapes in both KV formats, the GDN recurrence and output, the payload /
+rewrite / replay state path, and now the quantized matmul family.  The two Xid 13
+reports remain unexplained, and the kernel surface not yet driven is down to the
+elementwise family (rms_norm, rope, SwiGLU, add), the f16/BF16 projection paths, the
+vision tower and the MTP draft block.  The elementwise harness is the next single
+attempt; if it is clean too, the honest conclusion shifts from "an index is wrong in
+a kernel" to "a state none of these harnesses reproduces", which changes what should
+be probed next rather than closing the incident.
