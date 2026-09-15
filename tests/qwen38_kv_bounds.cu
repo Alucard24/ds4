@@ -45,7 +45,7 @@ static uint64_t g_qnorm = 1607885600, g_knorm = 1578127136;
 
 static void drive(const void *map, uint64_t map_size, uint32_t ctx,
                   uint32_t start_pos, uint32_t n_tokens) {
-    for (int fmt = 0; fmt <= 1; fmt++) {
+    for (int fmt = 0; fmt <= 2; fmt++) {
         ds4_gpu_qwen38_set_kv_fmt(fmt);
         const uint64_t row = kv_row_bytes(fmt);
         ds4_gpu_tensor *k_cache = ds4_gpu_tensor_alloc((uint64_t)ctx * row);
