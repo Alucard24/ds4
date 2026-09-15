@@ -147,3 +147,19 @@ shapes.  What the harness does not cover, and what the next pass has to: the GDN
 half of the layers (`ds4_gpu_qwen38_gdn_chunk` / `gdn_decode`), the MTP draft path,
 and the agent-shaped flow (many short turns, a KV payload save per turn, rewind and
 re-prefill) that produced both 15 September events.
+
+## GDN half driven too (same day)
+
+The harness now also drives `ds4_gpu_qwen38_gdn_chunk` and `_gdn_decode` with token
+counts 1, 7, 16, 17 and 512 and the real weight offsets of block 0 (conv1d, a, dt,
+norm).  Every shape ran and memcheck reported **no invalid access**; the only log
+entries remain the `cudaHostRegister` API notices.
+
+Covered so far, all clean: the attention/cache path at 22 boundary shapes in both KV
+formats, the fragment layout in its own test, and now the GDN recurrence and output.
+Not covered yet: the MTP draft path (it reaches the same GA entry points with its
+own tensors, so it is partly exercised already) and the **agent-shaped flow** - many
+short turns, a KV payload save per turn, rewind and re-prefill - which is where both
+15 September reports came from.  The next single attempt is that flow under
+memcheck: if the sanitizer's shadow memory does not fit next to the 10.95 GiB of
+weights it fails cleanly with an allocation error, which is itself the result.

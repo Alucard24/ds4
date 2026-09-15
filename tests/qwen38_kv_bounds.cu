@@ -96,6 +96,49 @@ static void drive(const void *map, uint64_t map_size, uint32_t ctx,
     }
 }
 
+
+/* The GDN half of the layers: same recipe, boundary token counts, and the four
+ * real weight offsets of block 0 (conv1d, a, dt, norm) read from the model file. */
+static void drive_gdn(const void *map, uint64_t map_size, uint64_t conv_off,
+                      uint64_t a_off, uint64_t dt_off, uint64_t norm_off) {
+    const uint32_t shapes[] = { 1u, 7u, 16u, 17u, 512u };
+    const uint64_t conv_dim = 10240u, z_dim = 6144u;
+    for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+        const uint32_t n = shapes[i];
+        ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)n * z_dim * sizeof(float));
+        ds4_gpu_tensor *conv = ds4_gpu_tensor_alloc(3ull * conv_dim * sizeof(float));
+        ds4_gpu_tensor *state = ds4_gpu_tensor_alloc(48ull * 128ull * 128ull * sizeof(float));
+        ds4_gpu_tensor *qkv = ds4_gpu_tensor_alloc((uint64_t)n * conv_dim * sizeof(float));
+        ds4_gpu_tensor *z = ds4_gpu_tensor_alloc((uint64_t)n * z_dim * sizeof(float));
+        ds4_gpu_tensor *alpha = ds4_gpu_tensor_alloc((uint64_t)n * 48u * sizeof(float));
+        ds4_gpu_tensor *beta = ds4_gpu_tensor_alloc((uint64_t)n * 48u * sizeof(float));
+        float *buf = (float *)malloc((size_t)n * conv_dim * sizeof(float));
+        if (!out || !conv || !state || !qkv || !z || !alpha || !beta || !buf) {
+            printf("  GDN alloc failed n=%u\n", n);
+            failures++;
+            return;
+        }
+        for (size_t j = 0; j < (size_t)n * conv_dim; j++) buf[j] = 0.25f;
+        ds4_gpu_tensor_write(qkv, 0, buf, (uint64_t)n * conv_dim * sizeof(float));
+        ds4_gpu_tensor_write(z, 0, buf, (uint64_t)n * z_dim * sizeof(float));
+        ds4_gpu_tensor_write(alpha, 0, buf, (uint64_t)n * 48u * sizeof(float));
+        ds4_gpu_tensor_write(beta, 0, buf, (uint64_t)n * 48u * sizeof(float));
+        free(buf);
+        const int s1 = ds4_gpu_qwen38_gdn_chunk(out, conv, state, qkv, z, alpha, beta,
+                                                map, map_size, conv_off, a_off, dt_off,
+                                                norm_off, n);
+        const int s2 = s1 ? ds4_gpu_qwen38_gdn_decode(out, conv, state, qkv, z, alpha,
+                                                      beta, map, map_size, conv_off,
+                                                      a_off, dt_off, norm_off) : 0;
+        const int s3 = s2 ? (ds4_gpu_synchronize() != 0) : 0;
+        printf("  GDN tokens=%u chunk=%d decode=%d sync=%d\n", n, s1, s2, s3);
+        if (!s3) failures++;
+        ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(conv); ds4_gpu_tensor_free(state);
+        ds4_gpu_tensor_free(qkv); ds4_gpu_tensor_free(z);
+        ds4_gpu_tensor_free(alpha); ds4_gpu_tensor_free(beta);
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) { fprintf(stderr, "usage: %s MODEL.gguf\n", argv[0]); return 2; }
     int fd = open(argv[1], O_RDONLY);
@@ -116,6 +159,8 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++)
         drive(map, (uint64_t)st.st_size, shapes[i][0], shapes[i][1], shapes[i][2]);
 
+    drive_gdn(map, (uint64_t)st.st_size, 1256301920ull, 1255318688ull,
+              1256465760ull, 1256465952ull);
     printf("kv bounds drive done, %d failures\n", failures);
     munmap(map, (size_t)st.st_size);
     close(fd);
