@@ -299,3 +299,16 @@ Sanitizer up to the point the run was stopped: **0 `Invalid`, 0 `out-of-bounds`*
 The run itself was killed by timeout at 30 minutes (long instrumented decode), so
 this covers the compaction event, not a full long generation - stated plainly
 instead of as a complete pass. No Xid anywhere in the boot, GPU healthy after.
+## MTP and vision driven (same day)
+
+The two named-but-undriven surfaces are now driven. `tests/test_qwen38_mtp`
+(NVFP4 sidecar draft, 48 tokens, trunk bit-identical): **PASS**, sanitizer reported
+10 errors, all ten the known `cudaHostRegister` / `cudaGetLastError` API notices,
+verified in the log text. `tests/test_qwen3vl_vision` (embedded fixture):
+**PASS**, `ERROR SUMMARY: 0 errors`. The f16 projection path needs no drive: a
+tensor census of the model file shows **zero F16 tensors**, so
+`ds4_gpu_matmul_f16_tensor` is dead code for this model.
+
+Every executable kernel surface of Qwen3.8-27B on this machine has now been driven
+clean under compute-sanitizer. The two Xid 13 reports remain without an identified
+kernel cause.
