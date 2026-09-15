@@ -250,3 +250,11 @@ a native Qwen tool call executed, KV payload saved, answer returned correctly.
 Sanitizer: **4 errors, all four the `cudaHostRegister` / `cudaGetLastError` API
 notices** - no `Invalid`, no `out-of-bounds`, no kernel named. The turn is
 functionally intact (VERDE was read from the tool result and printed back).
+
+## Many tool calls in one turn, under memcheck (same day)
+
+The missing shape: several tool calls in a single agent turn (read, two writes,
+two bash runs, reply), each appending KV to the live session. It ran to
+completion and produced every artifact. Sanitizer: **4 errors, all four the
+`cudaHostRegister` / `cudaGetLastError` API notices** - no `Invalid`, no
+`out-of-bounds`, no kernel named.
