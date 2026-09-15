@@ -127,3 +127,23 @@ turn, possible rewind and re-prefill) and the 12 September burst came from the
 quantized-prefill work; neither shape was exercised here.  The offending kernel is
 still unidentified, and the guards of Phase A are still the agreed route to find it
 without risking the card again.
+
+## Boundary harness result (same day)
+
+`tests/qwen38_kv_bounds.cu` drives the real prefill and decode entry points with
+tiny tensors (ctx 256 and 512) and boundary shapes: tails of 1, 4, 7, 15, 17, 507
+and 512 positions, `start_pos + n_tokens` landing exactly on the last cache
+position, and both KV formats (f16 and q8_0, so the widening path runs too), under
+`--tool memcheck` with the layer's real norm-weight offsets.
+
+Result: every shape ran (`prepare`, `chunk`, `decode`, `sync` all succeeded) and
+**no invalid access was reported**.  The only two entries in the sanitizer log are
+`cudaErrorNotSupported` from `cudaHostRegister` - the host registration this device
+does not support, which the engine already prints and skips - not memory faults.
+
+So candidate 1 (launch-time indexing of the prefill path) and the fragment layout
+(candidate 1's inner form, clean in its own test) are both ruled out for these
+shapes.  What the harness does not cover, and what the next pass has to: the GDN
+half of the layers (`ds4_gpu_qwen38_gdn_chunk` / `gdn_decode`), the MTP draft path,
+and the agent-shaped flow (many short turns, a KV payload save per turn, rewind and
+re-prefill) that produced both 15 September events.
