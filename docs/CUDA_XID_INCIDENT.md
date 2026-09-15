@@ -163,3 +163,25 @@ short turns, a KV payload save per turn, rewind and re-prefill - which is where 
 15 September reports came from.  The next single attempt is that flow under
 memcheck: if the sanitizer's shadow memory does not fit next to the 10.95 GiB of
 weights it fails cleanly with an allocation error, which is itself the result.
+
+## The agent-shaped state flow under memcheck (same day)
+
+`tests/test_qwen38_session_cuda` under `--tool memcheck`: prefill, a rewrite to a
+different first token and back, a shorten-and-extend replay, a payload save, a
+continue, a restore and a truncated-payload rejection - the state operations an
+agent turn performs, minus the tools.
+
+- the test passed with the pinned trunk NLL **1.80954673** and
+  `Qwen CUDA session PASS`, so the flow is functionally intact under the sanitizer;
+- the sanitizer reported **4 errors, all four `cudaErrorNotSupported`** from
+  `cudaHostRegister` / `cudaGetLastError` - the API notices this device already
+  produces - and **no invalid access, no kernel named**.  Shadow memory fit next to
+  the weights, so the flow really did execute under instrumentation.
+
+Eliminated so far, all measured, not assumed: the fragment layout, the launch-time
+shapes of the attention and widening path in both KV formats, the GDN recurrence and
+output, and now the payload/rewrite/replay state path.  Still unexplained: the two
+Xid 13 reports themselves.  Kernel surface not yet driven: the quantized matmul
+family (partly covered by `tests/test_qwen38_cuda`, which compares against ggml and
+can be run under the sanitizer the same way) and the elementwise norm/rope/SwiGLU
+family.
