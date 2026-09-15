@@ -7950,11 +7950,18 @@ static int qwen38_gpu_state_init(ds4_qwen38_gpu_state *st, uint32_t ctx_size) {
     if (getenv("DS4_KV_Q4") != NULL) kv_fmt = 2;
     ds4_gpu_qwen38_set_kv_fmt(kv_fmt);
     const uint64_t kv_pos_bytes = session_qwen38_kv_pos_bytes(false);
+    /* One spare position row per layer.  A kernel that rounds a vector load up at
+     * the end of a row reads a few bytes past the last one; inside the allocation
+     * that is invisible, past it the driver reports an out-of-range kernel fault
+     * and on this card the escalation took the GPU off the bus
+     * (docs/CUDA_XID_INCIDENT.md).  The slack costs one row per layer and keeps
+     * that class of overread inside the allocation. */
+    const uint64_t kv_stride = (uint64_t)(ctx_size + 1) * kv_pos_bytes;
 
     if (!qwen38_gpu_alloc_bytes(&st->attn_k,
-            16ull * ctx_size * kv_pos_bytes, "attn_k")) goto fail;
+            16ull * kv_stride, "attn_k")) goto fail;
     if (!qwen38_gpu_alloc_bytes(&st->attn_v,
-            16ull * ctx_size * kv_pos_bytes, "attn_v")) goto fail;
+            16ull * kv_stride, "attn_v")) goto fail;
     QWEN38_GPU_ALLOC(hidden, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_N_EMBD);
     QWEN38_GPU_ALLOC(xnorm, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_N_EMBD);
     QWEN38_GPU_ALLOC(qkv, QWEN38_CUDA_PREFILL_CHUNK * QWEN38_CONV_DIM);
@@ -8010,11 +8017,11 @@ static int qwen38_gpu_state_init(ds4_qwen38_gpu_state *st, uint32_t ctx_size) {
     }
     for (uint32_t i = 0; i < 16; i++) {
         st->attn_k_layer[i] = ds4_gpu_tensor_view(st->attn_k,
-            i * ((uint64_t)ctx_size * kv_pos_bytes),
-            (uint64_t)ctx_size * kv_pos_bytes);
+            i * kv_stride,
+            kv_stride);
         st->attn_v_layer[i] = ds4_gpu_tensor_view(st->attn_v,
-            i * ((uint64_t)ctx_size * kv_pos_bytes),
-            (uint64_t)ctx_size * kv_pos_bytes);
+            i * kv_stride,
+            kv_stride);
         if (!st->attn_k_layer[i] || !st->attn_v_layer[i]) goto fail;
     }
     if (!ds4_gpu_tensor_fill_f32(st->ssm_state, 0.0f, 48ull * 48 * 128 * 128) ||

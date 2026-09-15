@@ -28725,7 +28725,10 @@ extern "C" int ds4_gpu_qwen38_ga_chunk(
                 QWEN38_CUDA_GA_HEADS_KV * QWEN38_CUDA_GA_HEAD_DIM * sizeof(__half);
             /* One allocation, two halves: the scratch is a single f16 mirror of
              * the cache with K first and V after it. */
-            __half *wide = qwen38_kv_widen_scratch(2u * wide_bytes);
+            /* The same one-row-and-a-bit of padding as the cache itself: the f16
+             * kernel that reads this mirror must not be able to leave it. */
+            const uint64_t wide_pad = 4096u;
+            __half *wide = qwen38_kv_widen_scratch(2u * (wide_bytes + wide_pad));
             if (!wide) return 0;
             __half *wide_k = wide;
             __half *wide_v = wide + (uint64_t)positions * QWEN38_CUDA_GA_HEADS_KV *

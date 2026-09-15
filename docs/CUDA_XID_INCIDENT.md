@@ -92,3 +92,21 @@ So that a wrong size or position becomes an error instead of a fault:
   from `rows - 1`.
 
 These are guards, not a fix. The fault itself is still open.
+
+## First supervised run after the guards (2026-09-15)
+
+One run, watched, single process, on the f16 prefill path that faulted earlier:
+`ds4 -c 4096 --raw --temp 0 --dump-logprobs /tmp/xid-check.json --logprobs-top-k 1`,
+17 input tokens, one chunk.
+
+- first-token logit **16.5558395**, the value the regression pins for this prompt:
+  the spare row added to the KV stride did not change the addressing;
+- **0 Xid** in the kernel log afterwards, GPU alive at 44 C.
+
+What this establishes: this shape is clean and the padding is functionally neutral.
+What it does not establish: that the fault is gone.  One run, one shape.  The two
+events of 15 September came from agent runs (many short turns, a KV payload save per
+turn, possible rewind and re-prefill) and the 12 September burst came from the
+quantized-prefill work; neither shape was exercised here.  The offending kernel is
+still unidentified, and the guards of Phase A are still the agreed route to find it
+without risking the card again.
