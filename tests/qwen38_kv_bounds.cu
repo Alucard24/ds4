@@ -139,6 +139,38 @@ static void drive_gdn(const void *map, uint64_t map_size, uint64_t conv_off,
     }
 }
 
+
+/* The elementwise family: norm rows, SwiGLU and the residual add, with widths and
+ * row counts at and around the vector widths the kernels block on.  The norm weight
+ * offset passed is a real tensor in the file (256 floats) while n is 5120, so the
+ * weight read lands inside the mapping with nonsense values: this probe is about
+ * the in/out tensors' bounds, not about the arithmetic. */
+static void drive_elementwise(const void *map, uint64_t map_size, uint64_t norm_off) {
+    const uint32_t rows[] = { 1u, 7u, 16u, 17u, 512u };
+    const uint32_t n = 5120u;
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+        const uint64_t count = (uint64_t)n * rows[i];
+        ds4_gpu_tensor *a = ds4_gpu_tensor_alloc(count * sizeof(float));
+        ds4_gpu_tensor *b = ds4_gpu_tensor_alloc(count * sizeof(float));
+        ds4_gpu_tensor *o = ds4_gpu_tensor_alloc(count * sizeof(float));
+        float *buf = (float *)malloc((size_t)count * sizeof(float));
+        if (!a || !b || !o || !buf) { printf("  elem alloc failed rows=%u\n", rows[i]); failures++; return; }
+        for (uint64_t j = 0; j < count; j++) buf[j] = 0.25f;
+        ds4_gpu_tensor_write(a, 0, buf, count * sizeof(float));
+        ds4_gpu_tensor_write(b, 0, buf, count * sizeof(float));
+        free(buf);
+        const int s1 = ds4_gpu_add_tensor(o, a, b, (uint32_t)count);
+        const int s2 = s1 ? ds4_gpu_swiglu_tensor(o, a, b, (uint32_t)count, 0.0f, 1.0f) : 0;
+        const int s3 = s2 ? ds4_gpu_rms_norm_weight_rows_tensor(o, a, map, map_size,
+                                                                norm_off, n, rows[i],
+                                                                1.0e-6f) : 0;
+        const int s4 = s3 ? (ds4_gpu_synchronize() != 0) : 0;
+        printf("  ELEM rows=%u n=%u add=%d swiglu=%d norm=%d sync=%d\n", rows[i], n, s1, s2, s3, s4);
+        if (!s4) failures++;
+        ds4_gpu_tensor_free(a); ds4_gpu_tensor_free(b); ds4_gpu_tensor_free(o);
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) { fprintf(stderr, "usage: %s MODEL.gguf\n", argv[0]); return 2; }
     int fd = open(argv[1], O_RDONLY);
@@ -161,6 +193,7 @@ int main(int argc, char **argv) {
 
     drive_gdn(map, (uint64_t)st.st_size, 1256301920ull, 1255318688ull,
               1256465760ull, 1256465952ull);
+    drive_elementwise(map, (uint64_t)st.st_size, g_qnorm);
     printf("kv bounds drive done, %d failures\n", failures);
     munmap(map, (size_t)st.st_size);
     close(fd);

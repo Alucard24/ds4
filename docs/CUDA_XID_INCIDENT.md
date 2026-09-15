@@ -202,3 +202,19 @@ vision tower and the MTP draft block.  The elementwise harness is the next singl
 attempt; if it is clean too, the honest conclusion shifts from "an index is wrong in
 a kernel" to "a state none of these harnesses reproduces", which changes what should
 be probed next rather than closing the incident.
+
+## Elementwise family driven too (same day)
+
+The harness now also drives `ds4_gpu_add_tensor`, `ds4_gpu_swiglu_tensor` and
+`ds4_gpu_rms_norm_weight_rows_tensor` at 5120-wide rows of 1, 7, 16, 17 and 512
+under memcheck.  Every shape ran, no invalid access, and the two log entries are the
+same `cudaHostRegister` / `cudaGetLastError` API notices seen in the other runs.
+
+Seven kernel families measured clean: fragments, the QK spike, attention and
+widening at boundary shapes in both KV formats, GDN recurrence and output, the
+payload/rewrite/replay state path, the quantized matmul family, and now the
+elementwise family.  What is left un-driven is narrow: the f16/BF16 projection
+paths, the vision tower and the MTP draft block.  If those are clean as well, the
+honest reading is no longer "an index is wrong somewhere" but "a state or an
+ordering none of these harnesses reproduces", and the next step becomes a
+reproduction strategy rather than another sweep.
