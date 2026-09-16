@@ -42,7 +42,7 @@ EOF
 [ "$#" -le 1 ] || { usage >&2; exit 2; }
 PROFILE=${1:-merged}
 case "$PROFILE" in -h|--help|help) usage; exit 0 ;; esac
-M=${DS4_QWEN_MODEL_DIR:-/home/diegom/AI-Projects/llama.cpp/build/bin/models/Qwen3.8-27B}
+M=${DS4_QWEN_MODEL_DIR:-/home/diegom/models/Qwen3.8-27B}
 HOST=${DS4_HOST:-127.0.0.1}
 PORT=${DS4_PORT:-8080}
 KV=${DS4_KV_DIR:-$HOME/.ds4/server-kv}

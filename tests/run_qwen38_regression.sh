@@ -13,7 +13,7 @@
 # runs on a tree whose models live somewhere else.
 set -e
 
-MODEL_DIR=${DS4_QWEN_REGRESSION_MODEL_DIR:-/home/diegom/AI-Projects/llama.cpp/build/bin/models/Qwen3.8-27B}
+MODEL_DIR=${DS4_QWEN_REGRESSION_MODEL_DIR:-/home/diegom/models/Qwen3.8-27B}
 MODEL=${DS4_QWEN_TEST_MODEL:-$MODEL_DIR/Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf}
 MTP=${DS4_QWEN_TEST_MTP:-$MODEL_DIR/Qwen3.8-27B-NVFP4-MTP-HIGHEST.gguf}
 MMPROJ=${DS4_QWEN_TEST_MMPROJ:-$MODEL_DIR/mmproj-Qwen3.8-27B-BF16.gguf}

@@ -24,7 +24,7 @@ were incorrect or unverified. Local GGUFs and llama.cpp source are the evidence.
 
 ## Actual files and shape
 
-Directory: `/home/diegom/AI-Projects/llama.cpp/build/bin/models/Qwen3.8-27B/`.
+Directory: `/home/diegom/models/Qwen3.8-27B/`.
 
 - `Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf`: architecture `qwen35`, 851 tensors,
   approximately 11.7 GB / 10.95 GiB. No `blk.64+` MTP block.
