@@ -961,6 +961,18 @@ per run, not guaranteed by construction: acceptance only ever confirms the
 batched trunk's own argmax, so a near-tie between two logits can still flip when
 the chunk and token reduction orders disagree.
 
+With a quantized KV cache the flip stops being hypothetical: the verify chunk
+widens the native q8_0/q4_0 cache into an f16 mirror for FA-2 while single-token
+decode reads the quantized values directly, so the two paths disagree by
+quantization noise on top of the reduction-order difference. Measured with q8_0
+on the release trunk, on the same prompt the gate uses: plain 13:21.6413 vs
+11:21.6041 at the divergence (margin 0.037), chunk path 13:21.5926 vs 11:21.5772.
+The gate therefore stays strict for f16 and tolerates, under DS4_KV_Q8/DS4_KV_Q4
+only, a first divergence whose plain-path logits are at most 0.10 apart — about
+twice the observed perturbation. No shipped profile combines MTP with a quantized
+KV cache by default, so this affects only explicit `--mtp-model` + `-ctk/-ctv`
+combinations; committed tokens remain trunk-verified either way.
+
 ## Video containers (ffmpeg, optional)
 
 A container is an input convenience, never a second preparation path: ffmpeg
