@@ -442,11 +442,6 @@ static bool agent_tool_syntax_assistant_turn_uses_eos(agent_tool_syntax syntax) 
     return syntax != AGENT_TOOL_SYNTAX_GLM;
 }
 
-/* GLM and Qwen both open a call with <tool_call> and render as chat messages */
-static bool agent_syntax_is_xml_tool_call(agent_tool_syntax syntax) {
-    return syntax == AGENT_TOOL_SYNTAX_GLM || syntax == AGENT_TOOL_SYNTAX_QWEN;
-}
-
 static void agent_worker_append_assistant_turn_end(agent_worker *w) {
     if (agent_tool_syntax_assistant_turn_uses_eos(
             agent_tool_syntax_for_engine(w->engine)))
@@ -1392,11 +1387,7 @@ static const char agent_qwen_tools_prompt_intro[] =
     "You may call one or more functions to assist with the user query.\n\n"
     "You are provided with function signatures within <tools></tools> XML tags:\n"
     "<tools>";
-
-static const char agent_qwen_tools_prompt_after_schemas[] =
-    "\n</tools>\n\n"
-    AGENT_TOOL_CONTRACTS
-    "Inside argument values only, escape a literal </parameter> as &lt;/parameter>. "
+/parameter>. "
     "To write that escaped spelling literally, use &amp;lt;/parameter>. Other HTML entities are unchanged.\n\n"
     "If you choose to call a function, reply with the function call and nothing after it, in exactly this format:\n"
     "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
@@ -1466,10 +1457,7 @@ static char *agent_build_glm_tools_prompt(bool edit_upto, bool vision) {
     memcpy(out + a + b + c + d, agent_glm_tools_prompt_rules_tail, e + 1);
     return out;
 }
-
-static const char agent_qwen_tools_prompt_intro[] =
-    "You are a coding agent running in a local workspace. Use tools for local file and system work. "
-    "Avoid printing large file contents or large code blocks as answers; create or edit files with tools, "
+ create or edit files with tools, "
     "then summarize results briefly.\n\n"
     "# Tools\n\n"
     "You have access to the following functions:\n\n"
@@ -1499,8 +1487,6 @@ static const char agent_qwen_tools_prompt_after_schemas[] =
     "- " AGENT_EDIT_TARGET_RULE "\n";
 
 /* the GLM schema list, each line wrapped as {"type": "function", "function": ...} */
-static char *agent_build_qwen_tools_prompt(bool edit_upto, bool vision) {
-    static const char wrap[] = "\n{\"type\": \"function\", \"function\": ";
     const char *edit = edit_upto ? agent_glm_tools_prompt_edit_upto
                                  : agent_glm_tools_prompt_edit_exact;
     size_t lines = 1;

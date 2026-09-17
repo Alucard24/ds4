@@ -82203,6 +82203,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         return 0;
     }
 #endif
+#ifndef DS4_NO_GPU
     if (ds4_session_is_qwen38(s)) {
         if (!s->qwen38_gpu_ready ||
             (uint32_t)s->checkpoint.len >= s->qwen38_gpu_state.ctx_size) {
@@ -82354,6 +82355,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                       probe_mtp,
                                       mtp_probe_log);
     return 0;
+#endif
 }
 
 /* TP-aware eval: mirrors the eval to the worker, runs it locally with the
