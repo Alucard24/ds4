@@ -19,6 +19,8 @@ The file shape depends on the model:
 - Qwen3.8 Flash Next: `48 x 2560`. FFN steering is applied to each
   hyper-connection branch of the residual; dumps average those branches
   at the last prompt token.
+- Qwen3.8-27B: `64 x 5120` (1,310,720 bytes). CPU reference and CUDA runtime;
+  the separate/embedded MTP block 64 is omitted.
 
 GLM 5.2 steering is not implemented.
 
@@ -33,6 +35,72 @@ GLM 5.2 steering is not implemented.
 The FFN output is usually the best first target because it is late enough in
 each layer to represent behavior, style, and topic signals. Attention steering
 is available for experiments, but it can be more fragile.
+
+## Qwen3.8-27B (CUDA)
+
+IQ3_S remains the default. Steering is optional, does not edit the GGUF, and is
+also executable on IQ3_XXS. Build a direction using the exact target quantization
+and evaluate its effect rather than assuming a direction transfers unchanged.
+
+```sh
+MODEL=/path/to/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
+python3 dir-steering/tools/build_direction.py \
+  --profile qwen3.8-27b --ds4 ./ds4 --model "$MODEL" \
+  --good-file dir-steering/examples/succinct.txt \
+  --bad-file dir-steering/examples/verbose.txt \
+  --component ffn_out --ctx 512 --out dir-steering/out/qwen-style.json
+
+./ds4 -m "$MODEL" --ctx 2048 --nothink --temp 0 -n 160 \
+  --dir-steering-file dir-steering/out/qwen-style.f32 \
+  --dir-steering-ffn -0.5 -p "Explain why databases use indexes."
+
+# Server: same IQ3_S default profile, with an isolated steering cache namespace.
+DS4_STEERING_FILE="$PWD/dir-steering/out/qwen-style.f32" \
+DS4_STEERING_FFN=-0.5 ./run-qwen-server.sh
+# Normal mode: leave the DS4_STEERING_* variables unset.
+```
+
+Both `ffn_out` and `attn_out` capture/edit the sublayer output **before** residual
+addition, across decode and chunk prefill. Attention includes GDN output
+projection as well as full-attention output projection. The tool captures the
+**last prompt row of the final chunk**. Qwen dump filenames use the chunk-start
+position; each file holds its last row. The initial `stable-29` dump captured
+only row zero of the first chunk: its file sizes/norms did not establish a valid
+prompt-conditioned direction. Rebuild directions made with that version.
+
+Directions must have the exact shape and finite float32 values; scales must be
+finite and within [-100, 100]. Use normalized rows (the builder normalizes them).
+Zero rows are allowed for no-op diagnostics. A file with both scales zero is
+still validated/loaded, but no projection is launched. The existing live FFN
+setter is session-local for Qwen and invalidates KV/GDN and MTP history on a
+scale change: callers must sync the full prompt again before decoding.
+
+**MTP correctness:** the draft head is unedited; the trunk is steered. A style
+fixture exposed a batch-verify/ordinary-decode greedy divergence. Active steering
+therefore verifies drafts on the ordinary token path. This preserved the tested
+greedy stream, but **does not retain the unsteered batched MTP speedup**. No-file
+and zero-scale timelines retain the existing MTP path. Sampled Qwen decoding
+continues to use its existing one-token verification fallback.
+
+**Cache compatibility:** unsteered/zero-scale payloads retain their previous
+layout. Steered payloads carry a versioned extension with the exact direction
+bytes, both scales, and a conservative local GGUF identity (device, inode, size,
+mtime and ctime). Mismatches are rejected before live state is changed; copied
+or touched GGUFs require rebuilding steered caches. This is local compatibility
+checking, not a cryptographic content identity for portable model files. Legacy
+unsteered caches still lack a same-family weight-file identity; use different
+cache directories for different GGUFs when bypassing the launcher.
+
+`run-qwen-server.sh` places steered caches beneath
+`$DS4_KV_DIR/steered/<hash>` (default root `~/.ds4/server-kv`), separated by
+model path, direction content, scales and KV format. A shared directory passed
+directly to the server remains safe against steering mismatch, but an existing
+incompatible text-key entry can prevent useful new saves: use separate dirs.
+Trace/cache text remains plaintext; steering does not change privacy behavior.
+
+These checks establish runtime wiring and bounded regression behavior, not
+preservation of every capability or a guaranteed style/refusal effect. Evaluate
+held-out prompts and quality before relying on a direction.
 
 ## GLM 5.3 Example
 

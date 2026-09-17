@@ -1,6 +1,12 @@
 #ifndef DS4_H
 #define DS4_H
 
+/* -ctk / -ctv: the attention KV cache type, by the names llama.cpp uses.
+ * Returns 0 for an unknown name (q4_0 is not implemented yet) and writes the
+ * boolean into *q8_out. */
+int ds4_kv_type_from_name(const char *name, int *q8_out);
+
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -153,6 +159,10 @@ typedef struct {
     bool quality;
     bool glm_mtp;
     bool glm_mtp_timing;
+    /* -ctk / -ctv: attention KV cache type, 0 for f16 (the default) and 1 for
+     * q8_0.  K and V must match; a mixed pair is refused at open. */
+    int ctk_q8;
+    int ctv_q8;
     bool dspark;
     bool dspark_strict;
     bool dspark_exact_sampling;
@@ -184,6 +194,7 @@ typedef struct {
     uint32_t layout;
     uint32_t grid_width;
     uint32_t grid_height;
+    uint32_t grid_time; /* 1 for images; ceil(frame_count/2) for Qwen video. */
     uint32_t width;
     uint32_t height;
     uint32_t content_width;
@@ -273,6 +284,31 @@ int ds4_engine_vision_encode_memory(ds4_engine *e,
                                     ds4_vision_embedding *out,
                                     char *error,
                                     size_t error_cap);
+/* Qwen3-VL temporal merge consumes adjacent frame pairs. Frames must have
+ * equal source dimensions; an odd final frame is paired with itself. */
+/* Decode a video container with ffmpeg and encode it as one temporal frame
+ * sequence.  `max_frames` is the sampling policy (2..128); the same file always
+ * yields the same frames.  Fails with a message when ffmpeg/ffprobe are not in
+ * PATH, so callers can fall back to the frame-list entry points below. */
+int ds4_engine_vision_encode_video_file(ds4_engine *e,
+                                        const char *path,
+                                        uint32_t max_frames,
+                                        ds4_vision_embedding *out,
+                                        char *error,
+                                        size_t error_cap);
+int ds4_engine_vision_encode_frame_files(ds4_engine *e,
+                                         const char *const *paths,
+                                         size_t frame_count,
+                                         ds4_vision_embedding *out,
+                                         char *error,
+                                         size_t error_cap);
+int ds4_engine_vision_encode_frame_memory(ds4_engine *e,
+                                          const uint8_t *const *encoded,
+                                          const size_t *encoded_len,
+                                          size_t frame_count,
+                                          ds4_vision_embedding *out,
+                                          char *error,
+                                          size_t error_cap);
 void ds4_vision_embedding_free(ds4_vision_embedding *embedding);
 int ds4_prompt_append_vision(ds4_engine *e,
                              ds4_tokens *tokens,
@@ -305,11 +341,16 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
  * KV files with the previously-zero reserved byte remain Flash-compatible;
  * Pro and later shapes must use nonzero ids. */
 int ds4_engine_model_id(ds4_engine *e);
+/* Stable model id of the dense Qwen3.8-27B trunk (= its DS4_VARIANT_QWEN38
+ * value in ds4.c). The kvstore keys checkpoints on (model_id, quant_bits),
+ * so this number must never be reused once shipped. */
+#define DS4_MODEL_ID_QWEN38 7
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 bool ds4_engine_is_glm53(ds4_engine *e);
 bool ds4_engine_is_qwen4(ds4_engine *e);
 /* Qwen3.8 reasoning-effort system instruction for a think mode (NULL when none) */
 const char *ds4_qwen4_reasoning_effort_text(ds4_think_mode mode);
+bool ds4_engine_is_qwen38(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 int ds4_think_mode_level(ds4_think_mode mode);
@@ -408,8 +449,9 @@ void ds4_session_free(ds4_session *s);
 int ds4_session_power(ds4_session *s);
 int ds4_session_set_power(ds4_session *s, int power_percent);
 float ds4_session_directional_steering_ffn(ds4_session *s);
-/* Change steering for future evaluation without rebuilding the existing KV
- * state. Live changes are currently limited to non-distributed sessions. */
+/* Live changes are limited to non-distributed sessions. Qwen changes are
+ * session-local and invalidate KV/GDN history: call sync(full_prompt) before
+ * further evaluation. Other families retain their existing future-only edit. */
 int ds4_session_set_directional_steering_ffn(ds4_session *s, float scale);
 bool ds4_session_is_distributed(ds4_session *s);
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
@@ -580,6 +622,19 @@ int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
+/* Qwen3.8 MTP draft head (sidecar GGUF, CUDA only).  The proposal is the
+ * draft block's argmax for the position after the last committed token, which
+ * is the same quantity the trunk head predicts; it is only a proposal and is
+ * never committed without verification. */
+bool ds4_engine_has_qwen38_mtp(ds4_engine *e);
+bool ds4_session_qwen38_mtp_proposal(const ds4_session *s, int *out_token);
+/* One greedy speculative round: evaluates `token`, drafts up to three further
+ * tokens with the MTP head, verifies them with a single batched trunk pass and
+ * commits the accepted prefix.  out_tokens[0] is `token` itself. */
+int ds4_session_qwen38_spec_step(ds4_session *s, int token,
+                                 int *out_tokens, uint32_t cap,
+                                 uint32_t *out_count, char *err,
+                                 size_t errlen);
 bool ds4_engine_mtp_exact_sampling(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 

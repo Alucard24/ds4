@@ -6842,7 +6842,7 @@ static bool test_generate_chat_turn(ds4_engine *engine, ds4_session *session,
         &turn->content,
         &turn->reasoning,
         &turn->calls,
-        &recovered, &r->tool_orders);
+&recovered, &r->tool_orders);
     if (turn->calls.len > 0) turn->finish = "tool_calls";
     if (!parsed) {
         fprintf(stderr,

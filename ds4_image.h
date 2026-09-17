@@ -73,6 +73,19 @@ int ds4_image_decode_file(
         size_t error_cap);
 
 void ds4_image_free(ds4_image *image);
+void ds4_image_fingerprint_sequence(uint8_t out[32],
+                                    const ds4_image *images,
+                                    size_t image_count);
+
+/* Name the video/animation container a buffer starts with, or NULL when it is
+ * not one. ds4 decodes still JPEG/PNG only: a container must be reported as
+ * such instead of being offered to the decoder or, worse, read as text. */
+const char *ds4_image_container_kind(const uint8_t *encoded, size_t encoded_len);
+
+/* Fingerprint a decoded RGB buffer.  Used by the container path, which never
+ * has encoded bytes to hash. */
+void ds4_image_fingerprint_pixels(uint8_t out[32], const uint8_t *rgb,
+                                  uint32_t width, uint32_t height);
 
 int ds4_image_preprocess_glm53(
         ds4_image_patches *out,
@@ -85,6 +98,16 @@ int ds4_image_preprocess_glm53(
 /* Qwen3-VL style: resize to multiples of 32 within the token budget, normalize
  * with mean/std 0.5, emit 3*16*16 patches in 2x2 merge-window order. */
 int ds4_image_preprocess_qwen4(
+        ds4_image_patches *out,
+        const ds4_image   *image,
+        uint32_t           min_image_tokens,
+        uint32_t           max_image_tokens,
+        char              *error,
+        size_t             error_cap);
+/* Qwen3-VL dynamic-resolution preprocessing. The image is aspect-preserved
+ * on a centered black canvas; normalized RGB 16x16 patches use 2x2
+ * merge-tile order, matching the qwen3vl merger GGUF. */
+int ds4_image_preprocess_qwen3vl(
         ds4_image_patches *out,
         const ds4_image   *image,
         uint32_t           min_image_tokens,

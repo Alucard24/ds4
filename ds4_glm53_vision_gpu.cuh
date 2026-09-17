@@ -89,7 +89,7 @@ __global__ static void glm53_vision_rms_kernel(
         if (tid < stride) partial[tid] += partial[tid + stride];
         __syncthreads();
     }
-    const float inv = rsqrtf(partial[0] / (float)width + eps);
+    const float inv = ds4_cuda_rsqrtf(partial[0] / (float)width + eps);
     for (uint32_t d = tid; d < width; d += blockDim.x) {
         yr[d] = xr[d] * inv * glm53_vision_bf16(weight + d);
     }
@@ -136,8 +136,8 @@ __global__ static void glm53_vision_qkv_rope_kernel(
         }
         __syncthreads();
     }
-    const float qinv = rsqrtf(qsum[0] / 64.0f + eps);
-    const float kinv = rsqrtf(ksum[0] / 64.0f + eps);
+    const float qinv = ds4_cuda_rsqrtf(qsum[0] / 64.0f + eps);
+    const float kinv = ds4_cuda_rsqrtf(ksum[0] / 64.0f + eps);
     q0 *= qinv * glm53_vision_bf16(q_weight + lane);
     q1 *= qinv * glm53_vision_bf16(q_weight + lane + 32u);
     k0 *= kinv * glm53_vision_bf16(k_weight + lane);
@@ -273,7 +273,7 @@ __global__ static void glm53_vision_layernorm_gelu_kernel(
         if (tid < stride) partial[tid] += partial[tid + stride];
         __syncthreads();
     }
-    const float inv = rsqrtf(partial[0] / (float)width + eps);
+    const float inv = ds4_cuda_rsqrtf(partial[0] / (float)width + eps);
     const float inv_sqrt2 = 0.7071067811865475f;
     for (uint32_t d = tid; d < width; d += blockDim.x) {
         float value = (xr[d] - mean) * inv * glm53_vision_bf16(weight + d) +

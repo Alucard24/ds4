@@ -59,7 +59,7 @@ __global__ void attn_prep(float *qout, float *gate, __half *kc, __half *vc,
     const unsigned npt = dim / 32;
     float ss = 0;
     for (unsigned i = 0; i < npt; i++) { const float v = src[lane * npt + i]; ss += v * v; }
-    const float inv = rsqrtf(sum(ss) / dim + eps);
+    const float inv = ds4_cuda_rsqrtf(sum(ss) / dim + eps);
     for (unsigned i = lane; i < dim; i += 32) row[i] = src[i] * inv * gamma[i];
     __syncwarp();
     apply_rope(row, pos3 + (uint64_t)pos * 4, rp);
@@ -85,7 +85,7 @@ __global__ void block_key(__half *out, const float *ik, const uint32_t *pos3,
         v[i] = a / ratio;
         ss += v[i] * v[i];
     }
-    const float inv = rsqrtf(sum(ss) / D + eps);
+    const float inv = ds4_cuda_rsqrtf(sum(ss) / D + eps);
     for (unsigned i = 0; i < npt; i++) row[lane * npt + i] = v[i] * inv * gamma[lane * npt + i];
     __syncwarp();
     apply_rope(row, pos3 + (uint64_t)b * ratio * 4, rp);
@@ -1391,7 +1391,7 @@ __global__ void mtp_stage(float *cat, const float *e, const float *R,
     __shared__ float red[32];
     float ss = 0;
     for (unsigned i = tid; i < n; i += blockDim.x) ss += rs[i] * rs[i];
-    const float inv = rsqrtf(block_sum(ss, red) / n + eps);
+    const float inv = ds4_cuda_rsqrtf(block_sum(ss, red) / n + eps);
     const float *src = emb ? e : R + (uint64_t)(row - 1) * E;
     const float *g = emb ? ge : gh + (uint64_t)(row - 1) * E;
     float *o = cat + (uint64_t)row * 2 * E;
@@ -1444,7 +1444,7 @@ __global__ void vis_norm(float *out, const float *x, const float *w, const float
     const float mean = block_sum(v, red) / E;
     v = 0;
     for (unsigned i = tid; i < E; i += blockDim.x) { const float d = x[base + i] - mean; v += d*d; }
-    const float inv = rsqrtf(block_sum(v, red) / E + eps);
+    const float inv = ds4_cuda_rsqrtf(block_sum(v, red) / E + eps);
     for (unsigned i = tid; i < E; i += blockDim.x) out[base + i] = (x[base + i] - mean) * inv * w[i] + b[i];
 }
 
@@ -1480,7 +1480,7 @@ __global__ void vis_attention(float *out, const float *q, const float *k, const 
         const uint64_t kb = (uint64_t)p*E + h*D;
         float score = 0;
         for (unsigned j = 0; j < 3; j++) if (lane+j*32 < D) score += query[j]*k[kb+lane+j*32];
-        score = sum(score) * rsqrtf((float)D);
+        score = sum(score) * ds4_cuda_rsqrtf((float)D);
         const float nm = fmaxf(mx, score), old = expf(mx-nm), prob = expf(score-nm);
         denom = denom*old + prob;
         for (unsigned j = 0; j < 3; j++) if (lane+j*32 < D) acc[j] = acc[j]*old + prob*v[kb+lane+j*32];
@@ -1508,7 +1508,7 @@ __global__ void hc_norm(float *xn, float *inj, const float *R, const float *gamm
     __shared__ float red[32];
     float ss = 0;
     for (unsigned i = tid; i < E; i += blockDim.x) ss += R[base + i] * R[base + i];
-    const float inv = rsqrtf(block_sum(ss, red) / E + eps);
+    const float inv = ds4_cuda_rsqrtf(block_sum(ss, red) / E + eps);
     float acc[4] = {};
     const unsigned per = (E + 7) / 8, end = min(E, (chunk + 1) * per);
     for (unsigned i = chunk * per + tid; i < end; i += blockDim.x) {
@@ -1537,7 +1537,7 @@ __global__ void hc_norm_prefill(float *xn, float *inj, const float *R,
     float ss = 0;
     if (tid < 128) for (unsigned i = tid; i < E; i += 128)
         ss += R[base+i] * R[base+i];
-    const float inv = rsqrtf(block_sum(ss,red) / E + eps);
+    const float inv = ds4_cuda_rsqrtf(block_sum(ss,red) / E + eps);
     float acc[4][4] = {};
     const unsigned end = min(E,(chunk+1)*per);
     #pragma unroll
@@ -1657,8 +1657,8 @@ __global__ void gdn_prep(float *qkv, float *a, float *b, const float *A, const f
     float *q = qkv + (uint64_t)t * C + h * D + lane * npt, *k = q + Hk * D;
     float qs = 0, ks = 0;
     for (unsigned i = 0; i < npt; i++) { qs += q[i] * q[i]; ks += k[i] * k[i]; }
-    qs = rsqrtf(sum(qs) + 1e-6f) * rsqrtf((float)D);
-    ks = rsqrtf(sum(ks) + 1e-6f);
+    qs = ds4_cuda_rsqrtf(sum(qs) + 1e-6f) * ds4_cuda_rsqrtf((float)D);
+    ks = ds4_cuda_rsqrtf(sum(ks) + 1e-6f);
     for (unsigned i = 0; i < npt; i++) { q[i] *= qs; k[i] *= ks; }
     if (!h) for (unsigned j = lane; j < Hv; j += 32) {
         const uint64_t p = (uint64_t)t * Hv + j;
@@ -1714,7 +1714,7 @@ __global__ void gdn_out(float *o, const float *z, const float *w, unsigned H, un
     const uint64_t idx = ((uint64_t)t * H + h) * D + k0;
     float ss = 0;
     for (unsigned i = 0; i < npt; i++) ss += o[idx + i] * o[idx + i];
-    const float r = rsqrtf(sum(ss) / D + eps);
+    const float r = ds4_cuda_rsqrtf(sum(ss) / D + eps);
     for (unsigned i = 0; i < npt; i++) o[idx + i] = o[idx + i] * r * w[k0 + i] * sigmoid(z[idx + i]);
 }
 
@@ -1726,12 +1726,12 @@ __global__ void ngram_gate(float *gated, float *normed, const float *R, const fl
     __shared__ float red[32];
     float sk = 0, sq = 0;
     for (unsigned i = tid; i < E; i += blockDim.x) { sk += key[base + i] * key[base + i]; sq += R[base + i] * R[base + i]; }
-    const float ik = rsqrtf(block_sum(sk, red) / E + eps);
-    const float iq = rsqrtf(block_sum(sq, red) / E + eps);
+    const float ik = ds4_cuda_rsqrtf(block_sum(sk, red) / E + eps);
+    const float iq = ds4_cuda_rsqrtf(block_sum(sq, red) / E + eps);
     float dot = 0;
     for (unsigned i = tid; i < E; i += blockDim.x)
         dot += (key[base + i] * ik * gk[s * E + i]) * (R[base + i] * iq * gq[s * E + i]);
-    const float a = block_sum(dot, red) * rsqrtf((float)E);
+    const float a = block_sum(dot, red) * ds4_cuda_rsqrtf((float)E);
     const float mag = sqrtf(fmaxf(fabsf(a), 1e-6f));
     const float gate = sigmoid(a > 0 ? mag : a < 0 ? -mag : 0);
     float ss = 0;
@@ -1740,7 +1740,7 @@ __global__ void ngram_gate(float *gated, float *normed, const float *R, const fl
         gated[base + i] = v;
         ss += v * v;
     }
-    const float inv = rsqrtf(block_sum(ss, red) / E + eps);
+    const float inv = ds4_cuda_rsqrtf(block_sum(ss, red) / E + eps);
     for (unsigned i = tid; i < E; i += blockDim.x) normed[base + i] = gated[base + i] * inv * gc[s * E + i];
 }
 

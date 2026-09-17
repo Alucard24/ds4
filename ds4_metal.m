@@ -4647,6 +4647,20 @@ void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
     g_stream_expert_cache_expert_bytes = bytes;
 }
 
+void ds4_gpu_phase_reset(void) { }
+int ds4_gpu_phase_mark(int group) { (void)group; return 0; }
+int ds4_gpu_phase_finish(float *totals, int groups) {
+    (void)totals; (void)groups; return 0;
+}
+
+int ds4_gpu_memory_info(uint64_t *free_bytes, uint64_t *total_bytes) {
+    /* Metal sizes from its own allocation budget rather than from a free-VRAM
+     * query, and the Qwen3.8 draft head is CUDA-only. */
+    if (free_bytes) *free_bytes = 0;
+    if (total_bytes) *total_bytes = 0;
+    return 0;
+}
+
 uint64_t ds4_gpu_recommended_working_set_size(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!g_device) return 0;
@@ -46541,6 +46555,74 @@ int ds4_gpu_glm53_matmul_bf16(
     }
 }
 
+int ds4_gpu_qwen38_gdn_decode(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *conv_state,
+        ds4_gpu_tensor *recurrent_state, ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *z, const ds4_gpu_tensor *alpha,
+        const ds4_gpu_tensor *beta, const void *model_map, uint64_t model_size,
+        uint64_t conv_weight_offset, uint64_t a_offset, uint64_t dt_offset,
+        uint64_t norm_offset) {
+    (void)out; (void)conv_state; (void)recurrent_state; (void)qkv;
+    (void)z; (void)alpha; (void)beta; (void)model_map; (void)model_size;
+    (void)conv_weight_offset; (void)a_offset; (void)dt_offset; (void)norm_offset;
+    return 0;
+}
+
+int ds4_gpu_qwen38_gdn_chunk(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *conv_state,
+        ds4_gpu_tensor *recurrent_state, ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *z, const ds4_gpu_tensor *alpha,
+        const ds4_gpu_tensor *beta, const void *model_map, uint64_t model_size,
+        uint64_t conv_weight_offset, uint64_t a_offset, uint64_t dt_offset,
+        uint64_t norm_offset, uint32_t n_tokens) {
+    (void)out; (void)conv_state; (void)recurrent_state; (void)qkv;
+    (void)z; (void)alpha; (void)beta; (void)model_map; (void)model_size;
+    (void)conv_weight_offset; (void)a_offset; (void)dt_offset; (void)norm_offset;
+    (void)n_tokens;
+    return 0;
+}
+
+int ds4_gpu_qwen38_ga_prepare(
+        ds4_gpu_tensor *q_full, ds4_gpu_tensor *k_cache,
+        ds4_gpu_tensor *v_cache, ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
+        const void *model_map, uint64_t model_size, uint64_t q_norm_offset,
+        uint64_t k_norm_offset, uint32_t pos, uint32_t ctx_size) {
+    (void)q_full; (void)k_cache; (void)v_cache; (void)k; (void)v;
+    (void)model_map; (void)model_size; (void)q_norm_offset;
+    (void)k_norm_offset; (void)pos; (void)ctx_size;
+    return 0;
+}
+
+int ds4_gpu_qwen38_ga_prepare_chunk(
+        ds4_gpu_tensor *q_full, ds4_gpu_tensor *k_cache,
+        ds4_gpu_tensor *v_cache, ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
+        const void *model_map, uint64_t model_size, uint64_t q_norm_offset,
+        uint64_t k_norm_offset, uint32_t start_pos, uint32_t n_tokens,
+        uint32_t ctx_size) {
+    (void)q_full; (void)k_cache; (void)v_cache; (void)k; (void)v;
+    (void)model_map; (void)model_size; (void)q_norm_offset;
+    (void)k_norm_offset; (void)start_pos; (void)n_tokens; (void)ctx_size;
+    return 0;
+}
+
+int ds4_gpu_qwen38_ga_decode(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q_full,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        uint32_t pos, uint32_t ctx_size) {
+    (void)out; (void)q_full; (void)k_cache; (void)v_cache;
+    (void)pos; (void)ctx_size;
+    return 0;
+}
+
+int ds4_gpu_qwen38_ga_chunk(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q_full,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        uint32_t start_pos, uint32_t n_tokens, uint32_t ctx_size) {
+    (void)out; (void)q_full; (void)k_cache; (void)v_cache;
+    (void)start_pos; (void)n_tokens; (void)ctx_size;
+    return 0;
+}
+
 int ds4_gpu_glm53_matmul_bf16_qkv(
         ds4_gpu_tensor       *out_q,
         ds4_gpu_tensor       *out_k,
@@ -47232,6 +47314,31 @@ static int deepseek4_vision_debug_dump(
     free(data);
     if (resume && !ds4_gpu_begin_commands()) ok = 0;
     return ok;
+}
+
+int ds4_gpu_qwen3vl_vision_encode_pair(
+        float *out, const float *patches_0, const float *patches_1,
+        uint32_t grid_h, uint32_t grid_w, const void *model_map,
+        uint64_t model_size, const ds4_qwen3vl_vision_weights *weights) {
+    (void)out; (void)patches_0; (void)patches_1;
+    (void)grid_h; (void)grid_w; (void)model_map; (void)model_size;
+    (void)weights;
+    fprintf(stderr, "ds4: Qwen3-VL vision is currently CUDA-only\n");
+    return 0;
+}
+
+int ds4_gpu_qwen3vl_vision_encode(
+        float                            *out,
+        const float                      *patches,
+        uint32_t                          grid_h,
+        uint32_t                          grid_w,
+        const void                       *model_map,
+        uint64_t                          model_size,
+        const ds4_qwen3vl_vision_weights *weights) {
+    (void)out; (void)patches; (void)grid_h; (void)grid_w;
+    (void)model_map; (void)model_size; (void)weights;
+    fprintf(stderr, "ds4: Qwen3-VL vision is currently CUDA-only\n");
+    return 0;
 }
 
 int ds4_gpu_deepseek4_vision_encode(

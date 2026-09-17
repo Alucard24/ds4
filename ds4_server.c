@@ -4,6 +4,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
+#include "ds4_prompt_prefix.h"
 #include "ds4_tp.h"
 #include "rax.h"
 
@@ -437,10 +438,14 @@ static char *json_minify_raw_value(const char *json) {
 
 #define SERVER_IMAGE_MARKER_BYTES 64
 
+/* One media input.  An image carries a single frame; a video carries the
+ * ordered frames its client sent, because the engine's video path merges
+ * adjacent frames and must see one sequence rather than separate images. */
 typedef struct {
     char marker[SERVER_IMAGE_MARKER_BYTES];
-    uint8_t *encoded;
-    size_t encoded_len;
+    uint8_t **frames;
+    size_t *frame_lens;
+    size_t frame_count;
 } server_image_input;
 
 typedef struct {
@@ -451,9 +456,47 @@ typedef struct {
 
 static void server_image_inputs_free(server_image_inputs *images) {
     if (!images) return;
-    for (size_t i = 0; i < images->len; i++) free(images->v[i].encoded);
+    for (size_t i = 0; i < images->len; i++) {
+        server_image_input *input = &images->v[i];
+        for (size_t f = 0; f < input->frame_count; f++)
+            free(input->frames[f]);
+        free(input->frames);
+        free(input->frame_lens);
+    }
     free(images->v);
     memset(images, 0, sizeof(*images));
+}
+
+/* Marker generation, shared by the image and video pushes. */
+static void server_image_marker_new(char marker[SERVER_IMAGE_MARKER_BYTES]) {
+    unsigned char nonce[12];
+    if (!random_bytes(nonce, sizeof(nonce))) {
+        uint64_t fallback = (uint64_t)time(NULL) ^
+                            ((uint64_t)getpid() << 32) ^
+                            (uint64_t)(uintptr_t)marker;
+        memcpy(nonce, &fallback, sizeof(fallback));
+        memset(nonce + sizeof(fallback), 0, sizeof(nonce) - sizeof(fallback));
+    }
+    static const char hex[] = "0123456789abcdef";
+    size_t pos = (size_t)snprintf(marker, SERVER_IMAGE_MARKER_BYTES,
+                                  "\036" "DS4_IMAGE_");
+    for (size_t i = 0; i < sizeof(nonce) && pos + 2 < SERVER_IMAGE_MARKER_BYTES;
+         i++) {
+        marker[pos++] = hex[nonce[i] >> 4];
+        marker[pos++] = hex[nonce[i] & 15];
+    }
+    marker[pos++] = '\x1f';
+    marker[pos] = '\0';
+}
+
+static void server_image_inputs_append(server_image_inputs *images,
+                                       server_image_input *input) {
+    if (images->len == images->cap) {
+        size_t cap = images->cap ? images->cap * 2 : 2;
+        images->v = xrealloc(images->v, cap * sizeof(images->v[0]));
+        images->cap = cap;
+    }
+    images->v[images->len++] = *input;
 }
 
 static int base64_value(unsigned char c) {
@@ -508,32 +551,57 @@ static bool server_image_inputs_push_base64(server_image_inputs *images,
                                             char marker[SERVER_IMAGE_MARKER_BYTES]) {
     if (!server_image_media_type(media_type)) return false;
     server_image_input image = {0};
-    if (!server_decode_base64(base64, &image.encoded, &image.encoded_len))
+    image.frames = xmalloc(sizeof(image.frames[0]));
+    image.frame_lens = xmalloc(sizeof(image.frame_lens[0]));
+    if (!server_decode_base64(base64, &image.frames[0], &image.frame_lens[0])) {
+        free(image.frames);
+        free(image.frame_lens);
         return false;
-    unsigned char nonce[12];
-    if (!random_bytes(nonce, sizeof(nonce))) {
-        uint64_t fallback = (uint64_t)time(NULL) ^
-                            ((uint64_t)getpid() << 32) ^
-                            (uint64_t)(uintptr_t)images;
-        memcpy(nonce, &fallback, sizeof(fallback));
-        memset(nonce + sizeof(fallback), 0, sizeof(nonce) - sizeof(fallback));
     }
-    static const char hex[] = "0123456789abcdef";
-    size_t pos = (size_t)snprintf(image.marker, sizeof(image.marker),
-                                  "\036" "DS4_IMAGE_");
-    for (size_t i = 0; i < sizeof(nonce) && pos + 2 < sizeof(image.marker); i++) {
-        image.marker[pos++] = hex[nonce[i] >> 4];
-        image.marker[pos++] = hex[nonce[i] & 15];
-    }
-    image.marker[pos++] = '\x1f';
-    image.marker[pos] = '\0';
-    if (images->len == images->cap) {
-        size_t cap = images->cap ? images->cap * 2 : 2;
-        images->v = xrealloc(images->v, cap * sizeof(images->v[0]));
-        images->cap = cap;
-    }
-    images->v[images->len++] = image;
+    image.frame_count = 1;
+    server_image_marker_new(image.marker);
+    server_image_inputs_append(images, &image);
     snprintf(marker, SERVER_IMAGE_MARKER_BYTES, "%s", image.marker);
+    return true;
+}
+
+/* Push an ordered frame list as one video input.
+ *
+ * Deliberately data URIs only: a request must never name a path on the host,
+ * which would turn the endpoint into a file-read primitive. */
+static bool server_image_inputs_push_video(
+        server_image_inputs *images,
+        const char *const *data_uris,
+        size_t frame_count,
+        char marker[SERVER_IMAGE_MARKER_BYTES]) {
+    static const char png[] = "data:image/png;base64,";
+    static const char jpeg[] = "data:image/jpeg;base64,";
+    static const char jpg[] = "data:image/jpg;base64,";
+    if (!data_uris || frame_count < 2u || frame_count > 128u) return false;
+    server_image_input video = {0};
+    video.frames = xmalloc(frame_count * sizeof(video.frames[0]));
+    video.frame_lens = xmalloc(frame_count * sizeof(video.frame_lens[0]));
+    for (size_t i = 0; i < frame_count; i++) {
+        const char *uri = data_uris[i];
+        const char *payload = NULL;
+        if (uri && !strncmp(uri, png, sizeof(png) - 1u))
+            payload = uri + sizeof(png) - 1u;
+        else if (uri && !strncmp(uri, jpeg, sizeof(jpeg) - 1u))
+            payload = uri + sizeof(jpeg) - 1u;
+        else if (uri && !strncmp(uri, jpg, sizeof(jpg) - 1u))
+            payload = uri + sizeof(jpg) - 1u;
+        if (!payload || !server_decode_base64(payload, &video.frames[i],
+                                              &video.frame_lens[i])) {
+            for (size_t f = 0; f < i; f++) free(video.frames[f]);
+            free(video.frames);
+            free(video.frame_lens);
+            return false;
+        }
+        video.frame_count = i + 1u;
+    }
+    server_image_marker_new(video.marker);
+    server_image_inputs_append(images, &video);
+    snprintf(marker, SERVER_IMAGE_MARKER_BYTES, "%s", video.marker);
     return true;
 }
 
@@ -739,6 +807,8 @@ typedef struct {
      * happens to be named "tool_search". */
     bool responses_tool_search;
     char **prop;
+    /* Each property's raw schema.  A Qwen tool call carries no type of its own,
+     * so a declared "string" has to outrank the value-shape guess. */
     char **prop_schema;
     int len;
     int cap;
@@ -1197,7 +1267,8 @@ static bool model_alias_disables_thinking(const char *model) {
             !strcmp(model, "glm-5.3-flash-chat") ||
             !strcmp(model, "glm-5.3-flash-no-think") ||
             !strcmp(model, "glm-5.3-flash-nothink") ||
-            !strcmp(model, "zai/glm-5.3-flash-chat"));
+            !strcmp(model, "zai/glm-5.3-flash-chat") ||
+            !strcmp(model, "qwen3.8-27b-chat"));
 }
 
 static bool model_alias_enables_thinking(const char *model) {
@@ -1208,11 +1279,13 @@ static bool model_alias_enables_thinking(const char *model) {
             !strcmp(model, "glm-5.2-reasoner") ||
             !strcmp(model, "zai/glm-5.2-reasoner") ||
             !strcmp(model, "glm-5.3-flash-reasoner") ||
-            !strcmp(model, "zai/glm-5.3-flash-reasoner"));
+            !strcmp(model, "zai/glm-5.3-flash-reasoner") ||
+            !strcmp(model, "qwen3.8-27b-reasoner"));
 }
 
 static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
     if (ds4_engine_is_qwen4(engine)) return SERVER_MODEL_SYNTAX_QWEN;
+    if (ds4_engine_model_id(engine) == DS4_MODEL_ID_QWEN38) return SERVER_MODEL_SYNTAX_QWEN;
     return ds4_engine_is_glm_dsa(engine) ?
            SERVER_MODEL_SYNTAX_GLM : ds4_engine_is_deepseek41(engine) ?
            SERVER_MODEL_SYNTAX_DEEPSEEK41 : SERVER_MODEL_SYNTAX_DEEPSEEK;
@@ -1223,6 +1296,7 @@ static const char *server_model_id_from_engine(ds4_engine *engine) {
     if (ds4_engine_is_qwen4(engine)) return "qwen3.8-flash-next";
     if (ds4_engine_is_glm53(engine)) return "glm-5.3-flash";
     if (ds4_engine_is_glm_dsa(engine)) return "glm-5.2";
+    if (ds4_engine_model_id(engine) == DS4_MODEL_ID_QWEN38) return "qwen3.8-27b";
     return ds4_engine_model_id(engine) == 1 ?
            "deepseek-v4-pro" : "deepseek-v4-flash";
 }
@@ -1255,7 +1329,10 @@ static bool server_model_alias_known(const char *id) {
             !strcmp(id, "glm-5.3-flash-reasoner") ||
             !strcmp(id, "zai/glm-5.3-flash") ||
             !strcmp(id, "zai/glm-5.3-flash-chat") ||
-            !strcmp(id, "zai/glm-5.3-flash-reasoner"));
+            !strcmp(id, "zai/glm-5.3-flash-reasoner") ||
+            !strcmp(id, "qwen3.8-27b") ||
+            !strcmp(id, "qwen3.8-27b-chat") ||
+            !strcmp(id, "qwen3.8-27b-reasoner"));
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -1939,6 +2016,62 @@ bad:
     return false;
 }
 
+/* Parse a JSON array of data URI strings, used by the video content parts.
+ * The array is owned by the caller (strings plus the pointer array). */
+typedef struct {
+    char **v;
+    size_t len;
+    size_t cap;
+} server_uri_list;
+
+static void server_uri_list_free(server_uri_list *list) {
+    if (!list) return;
+    for (size_t i = 0; i < list->len; i++) free(list->v[i]);
+    free(list->v);
+    memset(list, 0, sizeof(*list));
+}
+
+static bool server_uri_list_push(server_uri_list *list, char *owned) {
+    if (list->len == list->cap) {
+        size_t cap = list->cap ? list->cap * 2u : 4u;
+        list->v = xrealloc(list->v, cap * sizeof(list->v[0]));
+        list->cap = cap;
+    }
+    list->v[list->len++] = owned;
+    return true;
+}
+
+static bool parse_data_uri_array(const char **p, server_uri_list *out) {
+    if (!p || !out) return false;
+    json_ws(p);
+    if (!json_lit(p, "[")) return false;
+    json_ws(p);
+    if (**p == ']') {
+        (*p)++;
+        return true;
+    }
+    for (;;) {
+        char *uri = NULL;
+        json_ws(p);
+        if (**p != '"' || !json_string(p, &uri)) {
+            free(uri);
+            return false;
+        }
+        server_uri_list_push(out, uri);
+        if (out->len > 128u) return false;
+        json_ws(p);
+        if (**p == ',') {
+            (*p)++;
+            continue;
+        }
+        if (**p == ']') {
+            (*p)++;
+            return true;
+        }
+        return false;
+    }
+}
+
 static bool parse_image_url_value(const char **p, char **url) {
     json_ws(p);
     if (**p == '"') return json_string(p, url);
@@ -1982,6 +2115,7 @@ static bool parse_openai_content_object(const char **p, chat_msg *msg) {
     char *type = NULL;
     char *text = NULL;
     char *image_url = NULL;
+    server_uri_list frames = {0};
     json_ws(p);
     while (**p && **p != '}') {
         char *key = NULL;
@@ -1997,6 +2131,10 @@ static bool parse_openai_content_object(const char **p, chat_msg *msg) {
             ok = json_string_replace(p, &type);
         else if (!strcmp(key, "text"))
             ok = json_content_replace(p, &text);
+        else if (!strcmp(key, "frames"))
+            ok = parse_data_uri_array(p, &frames);
+        else if (!strcmp(key, "video_frames"))
+            ok = parse_data_uri_array(p, &frames);
         else if (!strcmp(key, "image_url")) {
             free(image_url);
             image_url = NULL;
@@ -2012,7 +2150,15 @@ static bool parse_openai_content_object(const char **p, chat_msg *msg) {
     if (**p != '}') goto bad;
     (*p)++;
 
-    if (type && (!strcmp(type, "image_url") || !strcmp(type, "input_image"))) {
+    if (type && !strcmp(type, "video") && frames.len) {
+        char marker[SERVER_IMAGE_MARKER_BYTES];
+        if (!server_image_inputs_push_video(
+                &msg->images, (const char *const *)frames.v, frames.len,
+                marker))
+            goto bad;
+        append_owned_text(&msg->content, marker);
+    } else if (type && (!strcmp(type, "image_url") ||
+                        !strcmp(type, "input_image"))) {
         char marker[SERVER_IMAGE_MARKER_BYTES];
         if (!server_image_inputs_push_data_uri(&msg->images, image_url, marker))
             goto bad;
@@ -2023,11 +2169,13 @@ static bool parse_openai_content_object(const char **p, chat_msg *msg) {
     free(type);
     free(text);
     free(image_url);
+    server_uri_list_free(&frames);
     return true;
 bad:
     free(type);
     free(text);
     free(image_url);
+    server_uri_list_free(&frames);
     return false;
 }
 
@@ -2839,6 +2987,40 @@ static void append_glm_tool_result_message(buf *b, const chat_msg *m) {
     append_glm_tool_response(b, content, strlen(content));
 }
 
+static void append_qwen_tool_response(buf *b, const char *text, size_t len) {
+    char *body = xstrndup(text ? text : "", len);
+    buf_puts(b, "<tool_response>\n");
+    append_glm_tool_response_text(b, body);
+    buf_puts(b, "\n</tool_response>");
+    free(body);
+}
+
+static void append_qwen_tool_result_message(buf *b, const chat_msg *m) {
+    const char *content = m && m->content ? m->content : "";
+    if (m && m->role && !strcmp(m->role, "user") &&
+        m->tool_call_ids_len > 0) {
+        static const char open[] = "<tool_result>";
+        static const char close[] = "</tool_result>";
+        const char *p = content;
+        bool found = false;
+        while ((p = strstr(p, open)) != NULL) {
+            const char *body = p + sizeof(open) - 1u;
+            const char *end = strstr(body, close);
+            if (!end) break;
+            while (body < end && isspace((unsigned char)*body)) body++;
+            while (end > body && isspace((unsigned char)end[-1])) end--;
+            append_qwen_tool_response(b, body, (size_t)(end - body));
+            found = true;
+            p = end + sizeof(close) - 1u;
+        }
+        if (found) return;
+    }
+    const char *end = content + strlen(content);
+    while (content < end && isspace((unsigned char)*content)) content++;
+    while (end > content && isspace((unsigned char)end[-1])) end--;
+    append_qwen_tool_response(b, content, (size_t)(end - content));
+}
+
 static void append_tool_result_text(buf *b, const char *s) {
     /* Tool output is data.  DeepSeek's renderer keeps it as ordinary text inside
      * <tool_result>...</tool_result>, so preserving literal '<', '>' and '&' is
@@ -3476,33 +3658,7 @@ static void append_qwen_tools_prompt_text(buf *b, const char *tool_schemas) {
         "do not tell the user about function calls\n</IMPORTANT>");
 }
 
-static void append_qwen_tool_response(buf *b, const char *text, size_t len) {
-    char *body = xstrndup(text ? text : "", len);
-    buf_puts(b, "\n<tool_response>\n");
-    append_glm_tag_body_text(b, body, "</tool_response>");
-    buf_puts(b, "\n</tool_response>");
-    free(body);
-}
 
-static void append_qwen_tool_result_message(buf *b, const chat_msg *m) {
-    const char *content = m && m->content ? m->content : "";
-    if (m && m->role && !strcmp(m->role, "user") && m->tool_call_ids_len > 0) {
-        static const char open[] = "<tool_result>";
-        static const char close[] = "</tool_result>";
-        const char *p = content;
-        bool found = false;
-        while ((p = strstr(p, open)) != NULL) {
-            const char *body = p + sizeof(open) - 1;
-            const char *end = strstr(body, close);
-            if (!end) break;
-            append_qwen_tool_response(b, body, (size_t)(end - body));
-            found = true;
-            p = end + sizeof(close) - 1;
-        }
-        if (found) return;
-    }
-    append_qwen_tool_response(b, content, strlen(content));
-}
 
 static void append_qwen_assistant_message(buf *out, const chat_msg *m,
                                           const tool_schema_orders *tool_orders) {
@@ -4094,6 +4250,37 @@ static void anthropic_prepare_live_continuation(server *s, request *r,
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
  * prompt plus the small amount of protocol state needed to translate the reply. */
+/* Prompt overrides for every request the server handles.  --system TEXT is pushed
+ * as a system-role message so each renderer hoists it into its own system region,
+ * after the client's own text and the tool schemas; --prefix-file turns are
+ * prepended as ordinary messages, which is where few-shot examples belong.  Without
+ * either option both are no-ops and the request is rendered exactly as before. */
+static const char *g_system_extra;
+static ds4_prompt_prefix g_prompt_prefix;
+
+static void server_apply_prompt_overrides(chat_msgs *msgs) {
+    if (g_prompt_prefix.count) {
+        const int n = (int)g_prompt_prefix.count;
+        for (int k = n - 1; k >= 0; k--) {
+            chat_msg turn = {0};
+            turn.role = xstrdup(g_prompt_prefix.turns[k].role == DS4_PROMPT_PREFIX_ASSISTANT
+                                ? "assistant" : "user");
+            turn.content = xstrdup(g_prompt_prefix.turns[k].content);
+            chat_msgs_push(msgs, (chat_msg){0});        /* make room at the end */
+            for (int j = msgs->len - 1; j > 0; j--)     /* shift right, in place */
+                msgs->v[j] = msgs->v[j - 1];
+            msgs->v[0] = turn;
+        }
+    }
+    if (g_system_extra && g_system_extra[0]) {
+        chat_msg sysmsg = {0};
+        sysmsg.role = xstrdup("system");
+        sysmsg.content = xstrdup(g_system_extra);
+        chat_msgs_push(msgs, sysmsg);
+    }
+}
+
+
 static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
@@ -4271,6 +4458,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
+    server_apply_prompt_overrides(&msgs);
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
@@ -4498,6 +4686,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
+    server_apply_prompt_overrides(&msgs);
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
@@ -5528,6 +5717,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     responses_prepare_live_continuation(s, r, &msgs);
+    server_apply_prompt_overrides(&msgs);
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
@@ -5727,6 +5917,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     user_msg.content = prompt;
     prompt = NULL;
     chat_msgs_push(&msgs, user_msg);
+    server_apply_prompt_overrides(&msgs);
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, NULL, NULL, r->think_mode);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
@@ -6481,6 +6672,14 @@ static bool qwen_param_value_is_json(const char *s) {
     return *p == '\0';
 }
 
+static bool qwen_parameter_is_json_literal(const char *value) {
+    if (!value || !value[0]) return false;
+    const char *p = value;
+    if (!json_skip_value(&p)) return false;
+    json_ws(&p);
+    return *p == '\0';
+}
+
 static char *qwen_strip_value_newlines(const char *start, const char *end) {
     if (start < end && *start == '\n') start++;
     if (end > start && end[-1] == '\n') end--;
@@ -6505,19 +6704,26 @@ static void qwen_trim_split(char **content_out, char **reasoning_out) {
     }
 }
 
+
+/* A Qwen tool call carries no argument types, so the value shape used to be the
+ * only clue: "12345" reached the client as the number 12345 and "3.10" as 3.1.
+ * When the request's schema declares the property as a string, the text is what
+ * must be sent; the guess stays for properties the schema does not describe. */
 static bool qwen_param_declared_string(const tool_schema_orders *orders,
                                        const char *name, const char *key) {
     const tool_schema_order *order = tool_schema_orders_find(orders, name);
-    if (!order) return false;
+    if (!order || !key) return false;
     for (int i = 0; i < order->len; i++) {
         if (strcmp(order->prop[i], key)) continue;
-        json_args schema = {0};
         bool is_string = false;
+        json_args schema = {0};
         if (json_args_parse(order->prop_schema[i], &schema)) {
             for (int j = 0; j < schema.len; j++) {
                 const json_arg *arg = &schema.v[j];
-                if (!strcmp(arg->key, "type") && arg->is_string && !strcmp(arg->value, "string"))
+                if (arg->is_string && !strcmp(arg->key, "type") &&
+                    !strcmp(arg->value, "string")) {
                     is_string = true;
+                }
             }
         }
         json_args_free(&schema);
@@ -6796,15 +7002,18 @@ static bool parse_generated_message_for_response_for_syntax(server_model_syntax 
                                                             const tool_schema_orders *orders) {
     if (recovered_out) *recovered_out = false;
 
+    /* Only this parse sees the request's tool schemas; the incremental ones keep
+     * the value-shape guess, so the Qwen case is dispatched here directly. */
     bool parsed_ok = syntax == SERVER_MODEL_SYNTAX_QWEN ?
-        parse_qwen_generated_message_ex(text, require_thinking_closed,
-                                         content_out, reasoning_out, calls, orders) :
+        parse_qwen_generated_message_ex(text ? text : "",
+                                        require_thinking_closed,
+                                        content_out, reasoning_out, calls, orders) :
         parse_generated_message_ex_for_syntax(syntax,
-                                                           text ? text : "",
-                                                           require_thinking_closed,
-                                                           content_out,
-                                                           reasoning_out,
-                                                           calls);
+                                              text ? text : "",
+                                              require_thinking_closed,
+                                              content_out,
+                                              reasoning_out,
+                                              calls);
     if (parsed_ok) return true;
 
     free(*content_out);
@@ -7172,6 +7381,12 @@ typedef struct {
     bool args_open;
     bool first_param;
     bool param_is_string;
+    bool qwen_style;
+    char *param_name;
+    /* The Qwen wire carries no argument types; the request schema does.  The
+     * name of the tool being streamed selects the order that describes it. */
+    const tool_schema_orders *orders;
+    char *tool_name;
     char **ids;
     int ids_cap;
 } openai_tool_stream;
@@ -7199,7 +7414,11 @@ static void openai_tool_stream_free(openai_tool_stream *ts) {
     if (!ts) return;
     for (int i = 0; i < ts->ids_cap; i++) free(ts->ids[i]);
     free(ts->ids);
+    free(ts->param_name);
+    free(ts->tool_name);
     ts->ids = NULL;
+    ts->param_name = NULL;
+    ts->tool_name = NULL;
     ts->ids_cap = 0;
 }
 
@@ -7394,6 +7613,7 @@ typedef struct {
     size_t pos;
     bool json_in_string;
     bool json_escaped;
+    bool saw_tool_end;
     server_model_syntax model_syntax;
 } dsml_decode_tracker;
 
@@ -7683,9 +7903,14 @@ structural:
             }
 
             if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->tool_calls_end)) {
-                dt->mode = DSML_TRACK_DONE;
                 dt->pos += strlen(dt->syn->tool_calls_end);
+                dt->saw_tool_end = true;
                 dt->decode = DSML_DECODE_OUTSIDE;
+                if (dt->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
+                    dt->mode = DSML_TRACK_SEARCH;
+                } else {
+                    dt->mode = DSML_TRACK_DONE;
+                }
                 return;
             }
             if (raw_full_lit(raw, raw_len, dt->pos, dt->syn->invoke_end)) {
@@ -7750,7 +7975,7 @@ static void observe_tool_markers(const dsml_decode_tracker *tracker,
                                  const char *scan, bool *saw_start,
                                  bool *saw_end, bool *orphan_end) {
     if (tracker->syn) *saw_start = true;
-    if (tracker->mode == DSML_TRACK_DONE) *saw_end = true;
+    if (tracker->saw_tool_end || tracker->mode == DSML_TRACK_DONE) *saw_end = true;
     else if (!*saw_start && scan && find_any_tool_end(scan) && orphan_end)
         *orphan_end = true;
 }
@@ -7813,10 +8038,14 @@ static bool openai_tool_emit_param_prefix(int fd, const request *r, const char *
     return ok;
 }
 
-static bool openai_tool_stream_init(openai_tool_stream *ts, const char *raw,
-                                    size_t raw_len, size_t pos) {
+static bool openai_tool_stream_init(openai_tool_stream *ts, const request *r,
+                                    const char *raw, size_t raw_len,
+                                    size_t pos) {
     openai_tool_stream_free(ts);
     memset(ts, 0, sizeof(*ts));
+    /* The wire projection needs the request schema to tell a declared string
+     * from a JSON literal when the Qwen text carries no type. */
+    ts->orders = r ? &r->tool_orders : NULL;
     ts->active = true;
     ts->state = DSML_TOOL_BETWEEN_INVOKES;
     ts->parse_pos = pos;
@@ -7848,6 +8077,15 @@ static bool openai_tool_stream_init(openai_tool_stream *ts, const char *raw,
         ts->invoke_end = "</invoke>";
         ts->param_start = "<parameter";
         ts->param_end = "</parameter>";
+    } else if (r && r->model_syntax == SERVER_MODEL_SYNTAX_QWEN &&
+               raw_full_lit(raw, raw_len, pos, "<tool_call>")) {
+        ts->parse_pos += strlen("<tool_call>");
+        ts->tool_calls_end = "</tool_call>";
+        ts->invoke_start = "<function=";
+        ts->invoke_end = "</function>";
+        ts->param_start = "<parameter=";
+        ts->param_end = "</parameter>";
+        ts->qwen_style = true;
     } else {
         ts->active = false;
         ts->state = DSML_TOOL_ERROR;
@@ -7862,20 +8100,38 @@ static bool openai_tool_stream_fail(openai_tool_stream *ts) {
     return true;
 }
 
+static char *qwen_stream_assignment_name(const char *raw, size_t pos,
+                                          const char *prefix,
+                                          const char *tag_end) {
+    const char *start = raw + pos + strlen(prefix);
+    const char *end = tag_end;
+    trim_const_span(&start, &end);
+    return start < end ? xstrndup(start, (size_t)(end - start)) : NULL;
+}
+
 static bool openai_tool_start_invoke(int fd, server *s, const request *r, const char *id,
                                      openai_tool_stream *ts,
                                      const char *raw, size_t raw_len) {
     const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
     if (!tag_end) return true;
-    char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
-    char *name = dsml_attr(tag, "name");
-    free(tag);
+    char *name = NULL;
+    if (ts->qwen_style) {
+        name = qwen_stream_assignment_name(raw, ts->parse_pos,
+                                            ts->invoke_start, tag_end);
+    } else {
+        char *tag = xstrndup(raw + ts->parse_pos,
+            (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+        name = dsml_attr(tag, "name");
+        free(tag);
+    }
     if (!name) return openai_tool_stream_fail(ts);
 
     const char *tool_id = openai_tool_stream_id(s, ts, ts->index);
     bool ok = sse_chat_tool_call_start_delta(fd, r, id, ts->index, tool_id, name) &&
               openai_tool_emit_args_fragment(fd, r, id, ts, "{", 1);
-    free(name);
+    /* Keep the name: the schema lookup for each parameter needs it. */
+    free(ts->tool_name);
+    ts->tool_name = name;
     if (!ok) return false;
 
     ts->emitted_any = true;
@@ -7891,7 +8147,17 @@ static bool openai_tool_start_param(int fd, const request *r, const char *id,
                                     const char *raw, size_t raw_len) {
     const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
     if (!tag_end) return true;
-    char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+    if (ts->qwen_style) {
+        free(ts->param_name);
+        ts->param_name = qwen_stream_assignment_name(
+            raw, ts->parse_pos, ts->param_start, tag_end);
+        if (!ts->param_name) return openai_tool_stream_fail(ts);
+        ts->parse_pos = (size_t)(tag_end - raw) + 1;
+        ts->state = DSML_TOOL_PARAM_VALUE;
+        return true;
+    }
+    char *tag = xstrndup(raw + ts->parse_pos,
+        (size_t)(tag_end - (raw + ts->parse_pos) + 1));
     char *name = dsml_attr(tag, "name");
     char *is_string = dsml_attr(tag, "string");
     free(tag);
@@ -7915,6 +8181,34 @@ static bool openai_tool_start_param(int fd, const request *r, const char *id,
 static bool openai_tool_finish_param(int fd, const request *r, const char *id,
                                      openai_tool_stream *ts,
                                      const char *raw, size_t value_end) {
+    if (ts->qwen_style) {
+        const size_t close_pos = value_end;
+        size_t value_start = ts->parse_pos;
+        if (value_start < value_end && raw[value_start] == '\n') value_start++;
+        if (value_end > value_start && raw[value_end - 1u] == '\n') value_end--;
+        char *value = xstrndup(raw + value_start, value_end - value_start);
+        ds4_tool_text_unescape(value, ts->param_end);
+        const bool string_value =
+            qwen_param_declared_string(ts->orders, ts->tool_name, ts->param_name) ||
+            !qwen_parameter_is_json_literal(value);
+        bool ok = openai_tool_emit_param_prefix(
+            fd, r, id, ts, ts->param_name, string_value);
+        if (ok && value[0]) {
+            ok = string_value ?
+                openai_tool_emit_string_value(fd, r, id, ts,
+                                              value, strlen(value)) :
+                openai_tool_emit_args_fragment(fd, r, id, ts,
+                                               value, strlen(value));
+        }
+        if (ok && string_value)
+            ok = openai_tool_emit_args_fragment(fd, r, id, ts, "\"", 1);
+        free(value);
+        free(ts->param_name);
+        ts->param_name = NULL;
+        ts->parse_pos = close_pos + strlen(ts->param_end);
+        ts->state = DSML_TOOL_BETWEEN_PARAMS;
+        return ok;
+    }
     if (value_end > ts->parse_pos) {
         bool ok = ts->param_is_string ?
             openai_tool_emit_string_value(fd, r, id, ts, raw + ts->parse_pos,
@@ -7939,11 +8233,23 @@ static bool openai_tool_stream_update(int fd, server *s, const request *r, const
             if (ts->parse_pos >= raw_len) return true;
             if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->tool_calls_end)) {
                 ts->parse_pos += strlen(ts->tool_calls_end);
-                ts->active = false;
-                ts->state = DSML_TOOL_DONE;
-                return true;
+                if (!ts->qwen_style) {
+                    ts->active = false;
+                    ts->state = DSML_TOOL_DONE;
+                    return true;
+                }
+                continue;
             }
-            if (raw_partial_any(raw, raw_len, ts->parse_pos, ts->tool_calls_end, ts->invoke_start)) return true;
+            if (ts->qwen_style &&
+                raw_full_lit(raw, raw_len, ts->parse_pos,
+                             "<tool_call>")) {
+                ts->parse_pos += strlen("<tool_call>");
+                continue;
+            }
+            if (raw_partial_any(raw, raw_len, ts->parse_pos,
+                                ts->tool_calls_end, ts->invoke_start) ||
+                (ts->qwen_style && raw_partial_lit(
+                    raw, raw_len, ts->parse_pos, "<tool_call>"))) return true;
             if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->invoke_start)) {
                 size_t before_pos = ts->parse_pos;
                 dsml_tool_stream_state before_state = ts->state;
@@ -7986,6 +8292,7 @@ static bool openai_tool_stream_update(int fd, server *s, const request *r, const
                                               (size_t)(end - raw))) return false;
                 continue;
             }
+            if (ts->qwen_style) return true;
             size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos,
                                                             raw_len, ts->param_end,
                                                             ts->param_is_string);
@@ -8107,7 +8414,8 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
 
         if (tool) {
             st->emit_pos = (size_t)(tool - raw);
-            if (openai_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
+            if (openai_tool_stream_init(&st->tool, r, raw, raw_len,
+                                         st->emit_pos)) {
                 st->mode = OPENAI_STREAM_TOOL;
             } else {
                 st->mode = OPENAI_STREAM_SUPPRESS;
@@ -9159,6 +9467,11 @@ typedef struct {
     bool args_open;
     bool first_param;
     bool param_is_string;
+    bool qwen_style;
+    char *param_name;
+    /* Same as the OpenAI streamer: the schema decides a declared string. */
+    const tool_schema_orders *orders;
+    char *tool_name;
     char **ids;
     int ids_cap;
 } anthropic_tool_stream;
@@ -9209,7 +9522,11 @@ static void anthropic_tool_stream_free(anthropic_tool_stream *ts) {
     if (!ts) return;
     for (int i = 0; i < ts->ids_cap; i++) free(ts->ids[i]);
     free(ts->ids);
+    free(ts->param_name);
+    free(ts->tool_name);
     ts->ids = NULL;
+    ts->param_name = NULL;
+    ts->tool_name = NULL;
     ts->ids_cap = 0;
 }
 
@@ -9413,12 +9730,21 @@ static bool anthropic_tool_emit_param_prefix(int fd, anthropic_stream *st,
  * it would hide the different block/stop semantics that make this code easy to
  * audit when a client reports a streaming regression. */
 static bool anthropic_tool_stream_init(anthropic_tool_stream *ts,
+                                       const request *r,
                                        const char *raw, size_t raw_len,
                                        size_t pos) {
     anthropic_tool_stream_free(ts);
     memset(ts, 0, sizeof(*ts));
+    ts->orders = r ? &r->tool_orders : NULL;
     ts->active = true;
     ts->state = DSML_TOOL_BETWEEN_INVOKES;
+    if (r && r->model_syntax == SERVER_MODEL_SYNTAX_QWEN &&
+        raw_full_lit(raw, raw_len, pos, qwen_tool_syntax.tool_calls_start)) {
+        ts->syn = &qwen_tool_syntax;
+        ts->parse_pos = pos + strlen(qwen_tool_syntax.tool_calls_start);
+        ts->qwen_style = true;
+        return true;
+    }
     for (size_t i = 0; i < sizeof(dsml_syntaxes) / sizeof(dsml_syntaxes[0]); i++) {
         const dsml_syntax *syn = &dsml_syntaxes[i];
         if (raw_full_lit(raw, raw_len, pos, syn->tool_calls_start)) {
@@ -9443,10 +9769,16 @@ static bool anthropic_tool_start_invoke(int fd, server *s, anthropic_stream *st,
     anthropic_tool_stream *ts = &st->tool;
     const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
     if (!tag_end) return true;
-    char *tag = xstrndup(raw + ts->parse_pos,
-                         (size_t)(tag_end - (raw + ts->parse_pos) + 1));
-    char *name = dsml_attr(tag, "name");
-    free(tag);
+    char *name = NULL;
+    if (ts->qwen_style) {
+        name = qwen_stream_assignment_name(raw, ts->parse_pos,
+                                            ts->syn->invoke_start, tag_end);
+    } else {
+        char *tag = xstrndup(raw + ts->parse_pos,
+                             (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+        name = dsml_attr(tag, "name");
+        free(tag);
+    }
     if (!name) return anthropic_tool_stream_fail(ts);
 
     /* This id is already visible to the client.  After final parsing,
@@ -9456,7 +9788,9 @@ static bool anthropic_tool_start_invoke(int fd, server *s, anthropic_stream *st,
     const char *tool_id = anthropic_tool_stream_id(s, ts, ts->index);
     bool ok = anthropic_sse_open_tool_block(fd, st, tool_id, name) &&
               anthropic_tool_emit_args_fragment(fd, st, "{", 1);
-    free(name);
+    /* Keep the name: the schema lookup for each parameter needs it. */
+    free(ts->tool_name);
+    ts->tool_name = name;
     if (!ok) return false;
 
     ts->emitted_any = true;
@@ -9472,6 +9806,15 @@ static bool anthropic_tool_start_param(int fd, anthropic_stream *st,
     anthropic_tool_stream *ts = &st->tool;
     const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
     if (!tag_end) return true;
+    if (ts->qwen_style) {
+        free(ts->param_name);
+        ts->param_name = qwen_stream_assignment_name(
+            raw, ts->parse_pos, ts->syn->param_start, tag_end);
+        if (!ts->param_name) return anthropic_tool_stream_fail(ts);
+        ts->parse_pos = (size_t)(tag_end - raw) + 1;
+        ts->state = DSML_TOOL_PARAM_VALUE;
+        return true;
+    }
     char *tag = xstrndup(raw + ts->parse_pos,
                          (size_t)(tag_end - (raw + ts->parse_pos) + 1));
     char *name = dsml_attr(tag, "name");
@@ -9497,6 +9840,34 @@ static bool anthropic_tool_start_param(int fd, anthropic_stream *st,
 static bool anthropic_tool_finish_param(int fd, anthropic_stream *st,
                                         const char *raw, size_t value_end) {
     anthropic_tool_stream *ts = &st->tool;
+    if (ts->qwen_style) {
+        const size_t close_pos = value_end;
+        size_t value_start = ts->parse_pos;
+        if (value_start < value_end && raw[value_start] == '\n') value_start++;
+        if (value_end > value_start && raw[value_end - 1u] == '\n') value_end--;
+        char *value = xstrndup(raw + value_start, value_end - value_start);
+        ds4_tool_text_unescape(value, ts->syn->param_end);
+        const bool string_value =
+            qwen_param_declared_string(ts->orders, ts->tool_name, ts->param_name) ||
+            !qwen_parameter_is_json_literal(value);
+        bool ok = anthropic_tool_emit_param_prefix(
+            fd, st, ts->param_name, string_value);
+        if (ok && value[0]) {
+            ok = string_value ?
+                anthropic_tool_emit_string_value(fd, st,
+                                                 value, strlen(value)) :
+                anthropic_tool_emit_args_fragment(fd, st,
+                                                  value, strlen(value));
+        }
+        if (ok && string_value)
+            ok = anthropic_tool_emit_args_fragment(fd, st, "\"", 1);
+        free(value);
+        free(ts->param_name);
+        ts->param_name = NULL;
+        ts->parse_pos = close_pos + strlen(ts->syn->param_end);
+        ts->state = DSML_TOOL_BETWEEN_PARAMS;
+        return ok;
+    }
     if (value_end > ts->parse_pos) {
         bool ok = ts->param_is_string ?
             anthropic_tool_emit_string_value(fd, st, raw + ts->parse_pos,
@@ -9522,12 +9893,24 @@ static bool anthropic_tool_stream_update(int fd, server *s, const char *id,
             if (ts->parse_pos >= raw_len) return true;
             if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->tool_calls_end)) {
                 ts->parse_pos += strlen(ts->syn->tool_calls_end);
-                ts->active = false;
-                ts->state = DSML_TOOL_DONE;
-                return true;
+                if (!ts->qwen_style) {
+                    ts->active = false;
+                    ts->state = DSML_TOOL_DONE;
+                    return true;
+                }
+                continue;
+            }
+            if (ts->qwen_style && raw_full_lit(
+                    raw, raw_len, ts->parse_pos,
+                    ts->syn->tool_calls_start)) {
+                ts->parse_pos += strlen(ts->syn->tool_calls_start);
+                continue;
             }
             if (raw_partial_any(raw, raw_len, ts->parse_pos,
-                                ts->syn->tool_calls_end, ts->syn->invoke_start)) return true;
+                                ts->syn->tool_calls_end, ts->syn->invoke_start) ||
+                (ts->qwen_style && raw_partial_lit(
+                    raw, raw_len, ts->parse_pos,
+                    ts->syn->tool_calls_start))) return true;
             if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->invoke_start)) {
                 size_t before_pos = ts->parse_pos;
                 dsml_tool_stream_state before_state = ts->state;
@@ -9572,6 +9955,7 @@ static bool anthropic_tool_stream_update(int fd, server *s, const char *id,
                                                  (size_t)(end - raw))) return false;
                 continue;
             }
+            if (ts->qwen_style) return true;
             size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos,
                                                             raw_len,
                                                             ts->syn->param_end,
@@ -9750,7 +10134,8 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
              * final catch-up from plain text, leave the block for the existing
              * final emitter so old non-incremental behavior stays unchanged. */
             if (!final &&
-                anthropic_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
+                anthropic_tool_stream_init(&st->tool, r, raw, raw_len,
+                                           st->emit_pos)) {
                 st->mode = ANTH_STREAM_TOOL;
             } else {
                 st->mode = ANTH_STREAM_SUPPRESS;
@@ -10060,10 +10445,14 @@ static void server_image_cache_clear(server_image_cache *cache) {
 static bool server_image_cache_get(server_image_cache *cache,
                                    const server_image_input *input,
                                    ds4_vision_embedding *out) {
+    /* Only single-frame inputs are cached: a video's identity is its whole
+     * frame sequence, and the prompt-level cache covers reuse. */
+    if (input->frame_count != 1u) return false;
     for (size_t i = 0; i < SERVER_IMAGE_CACHE_ENTRIES; i++) {
         server_image_cache_entry *entry = &cache->entries[i];
-        if (!entry->encoded || entry->encoded_len != input->encoded_len ||
-            memcmp(entry->encoded, input->encoded, input->encoded_len)) continue;
+        if (!entry->encoded || entry->encoded_len != input->frame_lens[0] ||
+            memcmp(entry->encoded, input->frames[0], input->frame_lens[0]))
+            continue;
         float *data = malloc(entry->data_bytes);
         if (!data) return false;
         memcpy(data, entry->embedding.data, entry->data_bytes);
@@ -10082,11 +10471,11 @@ static void server_image_cache_put(server_image_cache *cache,
                                    const ds4_vision_embedding *embedding,
                                    uint32_t dim, size_t budget) {
     if (!embedding->data || !dim || !embedding->token_count ||
-        !input->encoded_len ||
+        input->frame_count != 1u || !input->frame_lens[0] ||
         embedding->token_count > budget / sizeof(float) / dim) return;
     size_t bytes = (size_t)embedding->token_count * dim * sizeof(float);
-    if (input->encoded_len > budget - bytes) return;
-    size_t total = input->encoded_len + bytes;
+    if (input->frame_lens[0] > budget - bytes) return;
+    size_t total = input->frame_lens[0] + bytes;
     server_image_cache_entry *dest;
     for (;;) {
         dest = &cache->entries[0];
@@ -10103,17 +10492,17 @@ static void server_image_cache_put(server_image_cache *cache,
         }
         server_image_cache_remove(cache, dest);
     }
-    uint8_t *encoded = malloc(input->encoded_len);
+    uint8_t *encoded = malloc(input->frame_lens[0]);
     float *data = malloc((size_t)bytes);
     if (!encoded || !data) {
         free(encoded);
         free(data);
         return;
     }
-    memcpy(encoded, input->encoded, input->encoded_len);
+    memcpy(encoded, input->frames[0], input->frame_lens[0]);
     memcpy(data, embedding->data, (size_t)bytes);
     *dest = (server_image_cache_entry) {
-        .encoded = encoded, .encoded_len = input->encoded_len,
+        .encoded = encoded, .encoded_len = input->frame_lens[0],
         .embedding = *embedding, .data_bytes = (size_t)bytes,
         .used = ++cache->clock,
     };
@@ -10179,12 +10568,17 @@ static bool server_encode_image(server *s, const server_image_input *input,
         server_log(DS4_LOG_KVCACHE, "ds4-server: vision embedding cache hit");
         return true;
     }
-    if (!ds4_engine_vision_encode_memory(s->engine, input->encoded,
-                                         input->encoded_len, out, err, errlen))
-        return false;
     /* Row width must match the encoder's allocation: the mmproj projection
      * dim is validated to equal the model's n_embd at load (Qwen3.8 is
      * 2560-wide, not 4096; a wrong width over-reads the source in put). */
+    const bool encoded_ok = input->frame_count > 1u
+        ? ds4_engine_vision_encode_frame_memory(
+              s->engine, (const uint8_t *const *)input->frames,
+              input->frame_lens, input->frame_count, out, err, errlen)
+        : ds4_engine_vision_encode_memory(s->engine, input->frames[0],
+                                          input->frame_lens[0], out, err,
+                                          errlen);
+    if (!encoded_ok) return false;
     server_image_cache_put(&s->image_cache, input, out,
                             (uint32_t)ds4_engine_embd_dim(s->engine),
                             SERVER_IMAGE_CACHE_BYTES);
@@ -12708,7 +13102,9 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
     buf_puts(&suffix, content ? content : "");
     append_tool_calls_text_for_syntax(&suffix, syntax, calls,
                                       r ? &r->tool_orders : NULL);
-    if (syntax != SERVER_MODEL_SYNTAX_GLM) {
+    if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
+        buf_puts(&suffix, "<|im_end|>\n");
+    } else if (syntax != SERVER_MODEL_SYNTAX_GLM) {
         buf_puts(&suffix, "<｜end▁of▁sentence｜>");
     }
     return buf_take(&suffix);
@@ -12742,7 +13138,9 @@ static char *build_responses_visible_assistant_suffix(const request *r,
     buf_puts(&suffix, content ? content : "");
     append_tool_calls_text_for_syntax(&suffix, syntax, calls,
                                       r ? &r->tool_orders : NULL);
-    if (syntax != SERVER_MODEL_SYNTAX_GLM) {
+    if (syntax == SERVER_MODEL_SYNTAX_QWEN) {
+        buf_puts(&suffix, "<|im_end|>\n");
+    } else if (syntax != SERVER_MODEL_SYNTAX_GLM) {
         buf_puts(&suffix, "<｜end▁of▁sentence｜>");
     }
     return buf_take(&suffix);
@@ -12767,20 +13165,8 @@ static char *build_thinking_visible_text(const request *r,
     if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
 
     size_t pt_len = strlen(r->prompt_text);
-    if (r->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
-        /* the next request renders this turn as an empty think block plus the
-         * trimmed content, closed by <|im_end|> */
-        const char *gen = "<|im_start|>assistant\n<think>\n";
-        const size_t gen_len = strlen(gen);
-        if (pt_len < gen_len || memcmp(r->prompt_text + pt_len - gen_len, gen, gen_len) != 0) return NULL;
-        buf visible = {0};
-        buf_append(&visible, r->prompt_text, pt_len);
-        buf_puts(&visible, "\n</think>\n\n");
-        append_trimmed_text(&visible, content ? content : "");
-        buf_puts(&visible, "<|im_end|>\n");
-        return buf_take(&visible);
-    }
-    const char *think_tag = "<think>";
+    const char *think_tag = r->model_syntax == SERVER_MODEL_SYNTAX_QWEN ?
+        "<think>\n" : "<think>";
     size_t tag_len = strlen(think_tag);
     if (pt_len < tag_len ||
         memcmp(r->prompt_text + pt_len - tag_len, think_tag, tag_len) != 0) {
@@ -12792,6 +13178,9 @@ static char *build_thinking_visible_text(const request *r,
     if (r->model_syntax == SERVER_MODEL_SYNTAX_GLM) {
         buf_puts(&visible, "<think></think>");
         append_trimmed_text(&visible, content);
+    } else if (r->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
+        buf_puts(&visible, content ? content : "");
+        buf_puts(&visible, "<|im_end|>\n");
     } else {
         buf_puts(&visible, "</think>");
         buf_puts(&visible, content ? content : "");
@@ -14131,7 +14520,8 @@ decode_again:
     {
         server_log(DS4_LOG_WARNING,
                    "ds4-server: incomplete %s tool call: stop=%s token=%d generated=%d limit=%d room=%d",
-                   j->req.model_syntax == SERVER_MODEL_SYNTAX_GLM ? "GLM" : "DeepSeek",
+                   j->req.model_syntax == SERVER_MODEL_SYNTAX_GLM ? "GLM" :
+                   j->req.model_syntax == SERVER_MODEL_SYNTAX_QWEN ? "Qwen" : "DeepSeek",
                    stop_detail, stop_token, completion, max_tokens, room);
         trace_event(s, trace_id, "incomplete tool call: stop=%s token=%d generated=%d limit=%d room=%d",
                     stop_detail, stop_token, completion, max_tokens, room);
@@ -14954,6 +15344,12 @@ static bool send_models(server *s, int fd) {
         append_model_json(&b, s, "glm-5.2-chat");
         buf_putc(&b, ',');
         append_model_json(&b, s, "glm-5.2-reasoner");
+    } else if (ds4_engine_model_id(s->engine) == DS4_MODEL_ID_QWEN38) {
+        append_model_json(&b, s, "qwen3.8-27b");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "qwen3.8-27b-chat");
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "qwen3.8-27b-reasoner");
     } else {
         append_model_json(&b, s, "deepseek-v4-flash");
         buf_putc(&b, ',');
@@ -15086,18 +15482,173 @@ static void *client_main(void *arg) {
         goto done;
     }
 
-    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
+    /* Route normalization, and the probes clients make before they show
+     * anything.
+     *
+     * OpenAI clients are configured either with the service root or with the
+     * /v1 base.  A UI that gets it wrong - base URL without /v1 - posts to
+     * /chat/completions and used to read "unknown endpoint" from a server that
+     * was up and answering, which is exactly how this was found.  The /v1
+     * prefix is optional from here on.  /health, /props and /api/tags are
+     * answered too, in the shapes llama.cpp and Ollama front-ends probe with;
+     * they are small, and a client that cannot discover the server cannot be
+     * pointed at it either. */
+    const char *route = hr.path;
+    if (!strncmp(route, "/v1/", 4u)) route += 3;
+
+/* Landing page for the root path.  A browser pointed at the address this server
+ * was started with used to answer `unknown endpoint` in JSON, which reads as a
+ * broken server to anyone who did not arrive with curl; the endpoint list is
+ * worth a page.  Nothing dynamic is embedded -- the model name and the context
+ * size come from /props at load time -- so there is no escaping to get wrong
+ * here.  Single quotes only in the markup, so the C literal needs no escapes. */
+static const char ds4_server_index_html[] =
+"<!DOCTYPE html>\n"
+"<html lang='en'><head><meta charset='utf-8'>\n"
+"<meta name='viewport' content='width=device-width, initial-scale=1'>\n"
+"<title>ds4-server</title>\n"
+"<style>\n"
+" body{font:15px/1.55 system-ui,sans-serif;margin:0;background:#101216;color:#e8eaf0}\n"
+" main{max-width:44rem;margin:0 auto;padding:2rem 1rem 4rem}\n"
+" h1{font-size:1.35rem;margin:0 0 .2rem}\n"
+" h2{font-size:1.05rem;margin:2rem 0 .6rem;color:#cfd4e0}\n"
+" .sub{color:#98a0b0}\n"
+" textarea{width:100%;box-sizing:border-box;background:#171a20;color:#e8eaf0;\n"
+" border:1px solid #2b303a;border-radius:8px;padding:.6rem;font:inherit}\n"
+" button{margin-top:.6rem;padding:.55rem 1.1rem;border:0;border-radius:8px;\n"
+" background:#3b6ef6;color:#fff;font:inherit;cursor:pointer}\n"
+" button:disabled{opacity:.5;cursor:default}\n"
+" pre{background:#171a20;border:1px solid #2b303a;border-radius:8px;padding:.75rem;\n"
+" overflow-x:auto;white-space:pre-wrap;font-size:13px}\n"
+" .row{display:flex;gap:.8rem;padding:.25rem 0;align-items:baseline}\n"
+" .row span{min-width:11rem;color:#98a0b0}\n"
+" code{font-family:ui-monospace,monospace;font-size:13px;color:#cfe0ff}\n"
+"</style></head><body><main>\n"
+"<h1>ds4-server</h1>\n"
+"<div class='sub'>OpenAI-compatible endpoint for <b id='model'>loading</b>,\n"
+" context <span id='ctx'>&mdash;</span>.</div>\n"
+"<h2>Chat</h2>\n"
+"<textarea id='prompt' rows='3'>Write one sentence about the sea.</textarea>\n"
+"<button id='send'>Send</button>\n"
+"<pre id='out' hidden></pre>\n"
+"<h2>Endpoints</h2>\n"
+"<div class='row'><span>Chat completions</span><code>POST /v1/chat/completions</code></div>\n"
+"<div class='row'><span>Anthropic messages</span><code>POST /v1/messages</code></div>\n"
+"<div class='row'><span>Responses</span><code>POST /v1/responses</code></div>\n"
+"<div class='row'><span>Completions</span><code>POST /v1/completions</code></div>\n"
+"<div class='row'><span>Models</span><code>GET /v1/models</code></div>\n"
+"<div class='row'><span>Props</span><code>GET /props</code></div>\n"
+"<div class='row'><span>Health</span><code>GET /health</code></div>\n"
+"<h2>curl</h2><pre id='curl'></pre>\n"
+"<script>\n"
+"const g = id => document.getElementById(id);\n"
+"const q = String.fromCharCode(39);\n"
+"g('curl').textContent = 'curl -s http://' + location.host +\n"
+"  '/v1/chat/completions -H ' + q + 'Content-Type: application/json' + q +\n"
+"  ' -d ' + q + '{' + q + 'messages' + q + ':[' + q + 'role' + q + ':' + q +\n"
+"  'user' + q + ',' + q + 'content' + q + ':' + q + 'hi' + q + '}]}' + q;\n"
+"fetch('/props').then(r => r.json()).then(p => {\n"
+"  g('model').textContent = p.model_path || 'unknown';\n"
+"  g('ctx').textContent = p.n_ctx ? p.n_ctx + ' tokens' : 'unknown';\n"
+"}).catch(() => { g('model').textContent = 'unknown'; });\n"
+"g('send').onclick = async () => {\n"
+"  const b = g('send'), out = g('out');\n"
+"  b.disabled = true;\n"
+"  out.hidden = false;\n"
+"  out.textContent = '';\n"
+"  let think = '', answer = '';\n"
+"  const paint = () => {\n"
+"    // Streaming, so the thinking appears as it is produced; this model spends a\n"
+"    // long time there and an empty box looks like a failure.\n"
+"    out.textContent = think + (think ? '\\n\\n---\\n\\n' : '') + answer;\n"
+"  };\n"
+"  try {\n"
+"    const r = await fetch('/v1/chat/completions', {method: 'POST',\n"
+"      headers: {'Content-Type': 'application/json'},\n"
+"      body: JSON.stringify({messages: [{role: 'user', content: g('prompt').value}],\n"
+"                            stream: true})});\n"
+"    if (!r.body) throw new Error('no stream in this browser');\n"
+"    const reader = r.body.getReader();\n"
+"    const dec = new TextDecoder();\n"
+"    let buf = '';\n"
+"    for (;;) {\n"
+"      const {done, value} = await reader.read();\n"
+"      if (done) break;\n"
+"      buf += dec.decode(value, {stream: true});\n"
+"      const lines = buf.split('\\n');\n"
+"      buf = lines.pop();\n"
+"      for (const line of lines) {\n"
+"        if (!line.startsWith('data: ')) continue;\n"
+"        const payload = line.slice(6).trim();\n"
+"        if (payload === '[DONE]') continue;\n"
+"        let j = null;\n"
+"        try { j = JSON.parse(payload); } catch (e) { continue; }\n"
+"        const d = j.choices && j.choices[0] && j.choices[0].delta;\n"
+"        if (!d) continue;\n"
+"        if (d.reasoning_content) think += d.reasoning_content;\n"
+"        if (d.content) answer += d.content;\n"
+"        paint();\n"
+"      }\n"
+"    }\n"
+"    if (!think && !answer) out.textContent = 'No answer (see the server log).';\n"
+"  } catch (e) { out.textContent = String(e); }\n"
+"  b.disabled = false;\n"
+"};\n"
+"</script></main></body></html>\n";
+
+    if (!strcmp(hr.method, "GET") &&
+        (!strcmp(hr.path, "/") || !strcmp(hr.path, "/ui") ||
+         !strcmp(hr.path, "/index.html"))) {
+        (void)http_response(fd, s->enable_cors, 200,
+                            "text/html; charset=utf-8", ds4_server_index_html);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(route, "/health")) {
+        (void)http_response(fd, s->enable_cors, 200, "application/json",
+                            "{\"status\":\"ok\"}\n");
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(route, "/props")) {
+        char body[512];
+        snprintf(body, sizeof(body),
+                 "{\"model_path\":\"%s\",\"n_ctx\":%d,"
+                 "\"default_generation_settings\":{\"n_ctx\":%d,"
+                 "\"n_predict\":%d,\"temperature\":0.0,\"top_p\":1.0}}\n",
+                 ds4_engine_model_name(s->engine), s->ctx_size, s->ctx_size,
+                 s->default_tokens);
+        (void)http_response(fd, s->enable_cors, 200, "application/json", body);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(route, "/api/tags")) {
+        char body[512];
+        snprintf(body, sizeof(body),
+                 "{\"models\":[{\"name\":\"%s\",\"model\":\"%s\","
+                 "\"modified_at\":\"\",\"size\":0,\"digest\":\"\","
+                 "\"details\":{\"family\":\"qwen3.8\","
+                 "\"parameter_size\":\"27B\","
+                 "\"quantization_level\":\"IQ3_S\"}}]}\n",
+                 ds4_engine_model_name(s->engine),
+                 ds4_engine_model_name(s->engine));
+        (void)http_response(fd, s->enable_cors, 200, "application/json", body);
+        http_request_free(&hr);
+        goto done;
+    }
+
+    if (!strcmp(hr.method, "GET") && !strcmp(route, "/models")) {
         send_models(s, fd);
         http_request_free(&hr);
         goto done;
     }
-    const char *model_path_prefix = "/v1/models/";
+    const char *model_path_prefix = "/models/";
     const size_t model_path_prefix_len = strlen(model_path_prefix);
     if (!strcmp(hr.method, "GET") &&
-        !strncmp(hr.path, model_path_prefix, model_path_prefix_len) &&
-        server_model_alias_known(hr.path + model_path_prefix_len))
+        !strncmp(route, model_path_prefix, model_path_prefix_len) &&
+        server_model_alias_known(route + model_path_prefix_len))
     {
-        send_model(s, fd, hr.path + model_path_prefix_len);
+        send_model(s, fd, route + model_path_prefix_len);
         http_request_free(&hr);
         goto done;
     }
@@ -15106,16 +15657,16 @@ static void *client_main(void *arg) {
     char err[160];
     bool ok = false;
     const int ctx_size = s->ctx_size;
-    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
+    if (!strcmp(hr.method, "POST") && !strcmp(route, "/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
-    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
+    } else if (!strcmp(hr.method, "POST") && !strcmp(route, "/chat/completions")) {
         ok = parse_chat_request(s->engine, s, hr.body, s->default_tokens,
                                 ctx_size, &req, err, sizeof(err));
-    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/responses")) {
+    } else if (!strcmp(hr.method, "POST") && !strcmp(route, "/responses")) {
         ok = parse_responses_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
-    } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/completions")) {
+    } else if (!strcmp(hr.method, "POST") && !strcmp(route, "/completions")) {
         ok = parse_completion_request(s->engine, hr.body, s->default_tokens,
                                       ctx_size, &req, err, sizeof(err));
     } else {
@@ -15430,6 +15981,18 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.glm_mtp = true;
         } else if (!strcmp(arg, "--mtp-model")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "-ctk") || !strcmp(arg, "--cache-type-k")) {
+            if (!ds4_kv_type_from_name(need_arg(&i, argc, argv, arg),
+                                       &c.engine.ctk_q8)) {
+                fprintf(stderr, "ds4-server: %s accepts f16 or q8_0\n", arg);
+                exit(1);
+            }
+        } else if (!strcmp(arg, "-ctv") || !strcmp(arg, "--cache-type-v")) {
+            if (!ds4_kv_type_from_name(need_arg(&i, argc, argv, arg),
+                                       &c.engine.ctv_q8)) {
+                fprintf(stderr, "ds4-server: %s accepts f16 or q8_0\n", arg);
+                exit(1);
+            }
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
@@ -15463,6 +16026,16 @@ static server_config parse_options(int argc, char **argv) {
             c.port = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cors")) {
             c.enable_cors = true;
+          } else if (!strcmp(arg, "--system")) {
+              g_system_extra = need_arg(&i, argc, argv, arg);
+          } else if (!strcmp(arg, "--prefix-file")) {
+              char perr[256] = {0};
+              if (ds4_prompt_prefix_load(&g_prompt_prefix, need_arg(&i, argc, argv, arg),
+                                         perr, sizeof(perr)) != 0) {
+                  fprintf(stderr, "ds4-server: %s\n",
+                          perr[0] ? perr : "invalid prefix file");
+                  exit(2);
+              }
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batched-session")) {
@@ -17379,6 +17952,11 @@ static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(server_model_alias_known("glm-5.3-flash"));
     TEST_ASSERT(server_model_alias_known("glm-5.3-flash-chat"));
     TEST_ASSERT(server_model_alias_known("glm-5.3-flash-reasoner"));
+    TEST_ASSERT(model_alias_disables_thinking("qwen3.8-27b-chat"));
+    TEST_ASSERT(model_alias_enables_thinking("qwen3.8-27b-reasoner"));
+    TEST_ASSERT(server_model_alias_known("qwen3.8-27b"));
+    TEST_ASSERT(server_model_alias_known("qwen3.8-27b-chat"));
+    TEST_ASSERT(server_model_alias_known("qwen3.8-27b-reasoner"));
 }
 
 static void test_api_thinking_controls_parse(void) {
@@ -17720,6 +18298,14 @@ static void test_parse_qwen_tool_call_message(void) {
         "<parameter=opts>\n{\"a\": [1, 2]}\n</parameter>\n"
         "</function>\n</tool_call>\n"
         "<tool_call>\n<function=read>\n<parameter=path>\n/tmp/x\n</parameter>\n</function>\n</tool_call>";
+    chat_msgs_free(&msgs);
+
+    const char *raw =
+        "<think>\nreason\n</think>\n\n"
+        "<tool_call>\n<function=bash>\n"
+        "<parameter=command>\nprintf hi\n</parameter>\n"
+        "<parameter=timeout>\n3\n</parameter>\n"
+        "</function>\n</tool_call>";
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls calls = {0};
@@ -18089,6 +18675,268 @@ static void test_qwen_plain_answer_keeps_trailing_whitespace(void) {
         "<parameter=command>\nls\n</parameter>\n</function>\n</tool_call><|im_end|>\n"));
     buf_free(&out);
     chat_msg_free(&with_call);
+        SERVER_MODEL_SYNTAX_QWEN, raw, true, &content, &reasoning, &calls));
+    TEST_ASSERT(content && content[0] == '\0');
+    TEST_ASSERT(reasoning && strstr(reasoning, "reason") != NULL);
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(!strcmp(calls.v[0].name, "bash"));
+    json_args parsed = {0};
+    TEST_ASSERT(json_args_parse(calls.v[0].arguments, &parsed));
+    int command = json_args_find_unused(&parsed, "command");
+    int timeout = json_args_find_unused(&parsed, "timeout");
+    TEST_ASSERT(command >= 0 && parsed.v[command].is_string &&
+                !strcmp(parsed.v[command].value, "printf hi"));
+    TEST_ASSERT(timeout >= 0 && !parsed.v[timeout].is_string &&
+                !strcmp(parsed.v[timeout].value, "3"));
+    json_args_free(&parsed);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_render_qwen_template_history(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("  first question  ");
+    chat_msgs_push(&msgs, user);
+
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.reasoning = xstrdup("  checked  ");
+    assistant.content = xstrdup("  result  ");
+    tool_call call = {0};
+    call.name = xstrdup("bash");
+    call.arguments = xstrdup("{\"command\":\"pwd\",\"timeout\":3}");
+    tool_calls_push(&assistant.calls, call);
+    chat_msgs_push(&msgs, assistant);
+
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.content = xstrdup("  /tmp  ");
+    chat_msgs_push(&msgs, tool);
+
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, &msgs,
+        "{\"input_schema\":{\"type\":\"object\",\"properties\":{}},"
+        "\"description\":\"run\",\"name\":\"bash\"}", NULL,
+        DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    char prompt_sha[41];
+    sha1_bytes_hex(prompt, strlen(prompt), prompt_sha);
+    TEST_ASSERT(!strcmp(prompt_sha, "bda362f23ad229cf90a8274c276b0507d322f064"));
+    TEST_ASSERT(strstr(prompt,
+        "<tools>\n{\"type\": \"function\", \"function\": {"
+        "\"name\": \"bash\", \"description\": \"run\", \"parameters\": "
+        "{\"type\": \"object\", \"properties\": {}}}}\n</tools>") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "If you choose to call a function ONLY reply in the following format "
+        "with NO suffix:") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|im_start|>user\nfirst question<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\nchecked\n</think>\n\nresult\n\n"
+        "<tool_call>\n<function=bash>\n"
+        "<parameter=command>\npwd\n</parameter>\n"
+        "<parameter=timeout>\n3\n</parameter>\n"
+        "</function>\n</tool_call><|im_end|>\n"
+        "<|im_start|>user\n<tool_response>\n/tmp\n</tool_response>"
+        "<|im_end|>\n<|im_start|>assistant\n<think>\n") != NULL);
+    free(prompt);
+    chat_msgs_free(&msgs);
+
+    chat_msg first = {.role = xstrdup("user"), .content = xstrdup("q")};
+    chat_msgs_push(&msgs, first);
+    chat_msg old = {.role = xstrdup("assistant"),
+                    .content = xstrdup("<think>\nlegacy\n</think>\nanswer")};
+    chat_msgs_push(&msgs, old);
+    chat_msg next = {.role = xstrdup("user"), .content = xstrdup("next")};
+    chat_msgs_push(&msgs, next);
+    prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, &msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(strstr(prompt,
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        "<think>\nlegacy\n</think>\nanswer<|im_end|>\n") != NULL);
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
+static void test_qwen_openai_tool_stream(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw =
+        "<tool_call>\n<function=bash>\n"
+        "<parameter=command>\nprintf hi\n</parameter>\n"
+        "<parameter=timeout>\n3\n</parameter>\n"
+        "</function>\n</tool_call>\n"
+        "<tool_call>\n<function=read_file>\n"
+        "<parameter=path>\n/tmp/a\n</parameter>\n"
+        "</function>\n</tool_call>";
+    char *visible = NULL;
+    char *reasoning = NULL;
+    tool_calls parsed = {0};
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, raw, false,
+        &visible, &reasoning, &parsed));
+    TEST_ASSERT(parsed.len == 2);
+    json_args args0 = {0};
+    json_args args1 = {0};
+    TEST_ASSERT(json_args_parse(parsed.v[0].arguments, &args0));
+    TEST_ASSERT(json_args_parse(parsed.v[1].arguments, &args1));
+    int command = json_args_find_unused(&args0, "command");
+    int timeout = json_args_find_unused(&args0, "timeout");
+    int path = json_args_find_unused(&args1, "path");
+    TEST_ASSERT(command >= 0 && args0.v[command].is_string &&
+                !strcmp(args0.v[command].value, "printf hi"));
+    TEST_ASSERT(timeout >= 0 && !args0.v[timeout].is_string &&
+                !strcmp(args0.v[timeout].value, "3"));
+    TEST_ASSERT(path >= 0 && args1.v[path].is_string &&
+                !strcmp(args1.v[path].value, "/tmp/a"));
+    json_args_free(&args0);
+    json_args_free(&args1);
+    free(visible);
+    free(reasoning);
+    tool_calls_free(&parsed);
+
+    const size_t cuts[] = {
+        strlen("<tool_call>\n<fun"),
+        (size_t)(strstr(raw, "printf hi") - raw) + 4u,
+        (size_t)(strstr(raw, "</parameter>") - raw) + 5u,
+    };
+    for (size_t i = 0; i < sizeof(cuts) / sizeof(cuts[0]); i++) {
+        TEST_ASSERT(openai_sse_stream_update(
+            sv[0], NULL, &r, "chatcmpl_qwen_tool", &st,
+            raw, cuts[i], false));
+    }
+    TEST_ASSERT(openai_sse_stream_update(
+        sv[0], NULL, &r, "chatcmpl_qwen_tool", &st,
+        raw, strlen(raw), false));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"name\":\"bash\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"name\":\"read_file\"") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"command\\\":\\\"") != NULL);
+    TEST_ASSERT(strstr(out, "printf hi") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"timeout\\\":") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"path\\\":\\\"") != NULL);
+    TEST_ASSERT(strstr(out, "<tool_call>") == NULL);
+
+    free(out);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_qwen_anthropic_tool_stream(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+
+    anthropic_stream st;
+    TEST_ASSERT(anthropic_sse_start_live(
+        sv[0], &r, "msg_qwen_tool", 0, &st));
+    const char *raw =
+        "<tool_call>\n<function=bash>\n"
+        "<parameter=command>\nprintf hi\n</parameter>\n"
+        "<parameter=timeout>\n3\n</parameter>\n"
+        "</function>\n</tool_call>";
+    TEST_ASSERT(anthropic_sse_stream_update(
+        sv[0], NULL, &r, "msg_qwen_tool", &st,
+        raw, strlen(raw), false));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"type\":\"tool_use\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"name\":\"bash\"") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"command\\\":\\\"") != NULL);
+    TEST_ASSERT(strstr(out, "printf hi") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"timeout\\\":") != NULL);
+    TEST_ASSERT(strstr(out, "<tool_call>") == NULL);
+
+    free(out);
+    anthropic_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+
+/* The SSE argument streamer makes the same string-or-literal decision as the
+ * final parse, so the schema has to reach it too: a client reading deltas would
+ * otherwise still see "code":12345 for a parameter declared as a string. */
+static void test_qwen_stream_schema_string_argument(void) {
+    static const char function_json[] =
+        "{\"name\":\"save_code\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"code\":{\"type\":\"string\"}},"
+        "\"required\":[\"code\"]}}";
+    static const char raw[] =
+        "<tool_call>\n<function=save_code>\n"
+        "<parameter=code>\n12345\n</parameter>\n"
+        "</function>\n</tool_call>";
+    for (int anthropic = 0; anthropic < 2; anthropic++) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        if (sv[0] < 0 || sv[1] < 0) return;
+
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = anthropic ? API_ANTHROPIC : API_OPENAI;
+        r.stream = true;
+        r.think_mode = DS4_THINK_NONE;
+        r.has_tools = true;
+        r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+        tool_schema_orders_add_json(&r.tool_orders, function_json);
+
+        if (anthropic) {
+            anthropic_stream st;
+            TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_schema", 0, &st));
+            TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_schema", &st,
+                                                    raw, strlen(raw), false));
+            shutdown(sv[0], SHUT_WR);
+            char *out = read_socket_text(sv[1]);
+            /* The value arrives in its own delta: what distinguishes a declared
+             * string is the opening quote the prefix carries with it. */
+            TEST_ASSERT(strstr(out, "\\\"code\\\":\\\"") != NULL);
+            free(out);
+            anthropic_stream_free(&st);
+        } else {
+            openai_stream st;
+            openai_stream_start(&r, &st);
+            TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_schema", &st,
+                                                 raw, strlen(raw), false));
+            shutdown(sv[0], SHUT_WR);
+            char *out = read_socket_text(sv[1]);
+            /* The value arrives in its own delta: what distinguishes a declared
+             * string is the opening quote the prefix carries with it. */
+            TEST_ASSERT(strstr(out, "\\\"code\\\":\\\"") != NULL);
+            free(out);
+            openai_stream_free(&st);
+        }
+        request_free(&r);
+        close(sv[0]);
+        close(sv[1]);
+    }
 }
 
 static void test_render_glm_chat_prompt_text(void) {
@@ -19702,6 +20550,57 @@ static void test_glm_decode_tracker_boundaries(void) {
     }
 }
 
+static void test_qwen_decode_tracker_boundaries(void) {
+    const char *parts[] = {
+        "prose <tool_call>\n<function=write>\n<parameter=content>\n",
+        "printf '<html>'",
+        "\n<",
+        "/parameter",
+        ">",
+        "\n</function>\n</tool_call>",
+    };
+    const dsml_decode_state expected[] = {
+        DSML_DECODE_STRING_BODY, DSML_DECODE_STRING_BODY,
+        DSML_DECODE_STRING_BODY, DSML_DECODE_STRUCTURAL,
+        DSML_DECODE_STRUCTURAL, DSML_DECODE_OUTSIDE,
+    };
+    for (int bytewise = 0; bytewise <= 1; bytewise++) {
+        dsml_decode_tracker tracker;
+        dsml_decode_tracker_init(&tracker);
+        tracker.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+        buf raw = {0};
+        for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+            if (bytewise) {
+                for (const char *p = parts[i]; *p; p++) {
+                    buf_putc(&raw, *p);
+                    dsml_decode_tracker_update(&tracker, raw.ptr, raw.len);
+                }
+            } else {
+                buf_puts(&raw, parts[i]);
+                dsml_decode_tracker_update(&tracker, raw.ptr, raw.len);
+            }
+            TEST_ASSERT(tracker.decode == expected[i]);
+        }
+        buf_free(&raw);
+    }
+
+    const char *multiple =
+        "<tool_call><function=a></function></tool_call>\n"
+        "<tool_call><function=b><parameter=x>y</parameter>"
+        "</function></tool_call>";
+    dsml_decode_tracker tracker;
+    dsml_decode_tracker_init(&tracker);
+    tracker.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    for (size_t n = 1; n <= strlen(multiple); n++)
+        dsml_decode_tracker_update(&tracker, multiple, n);
+    bool saw_start = false;
+    bool saw_end = false;
+    bool orphan = false;
+    observe_tool_markers(&tracker, multiple, &saw_start, &saw_end, &orphan);
+    TEST_ASSERT(saw_start && saw_end && !orphan);
+    TEST_ASSERT(tracker.decode == DSML_DECODE_OUTSIDE);
+}
+
 static void test_tool_control_text_inside_arguments(void) {
     const char *body = "literal </tool_call> " DS4_TOOL_CALLS_END " </think> <think>";
     for (int glm = 0; glm <= 1; glm++) {
@@ -20724,6 +21623,33 @@ static void test_sha1_bytes_hex_matches_known_vector(void) {
     TEST_ASSERT(!strcmp(sha, "a9993e364706816aba3e25717850c26c9cd0d89d"));
 }
 
+static void test_kv_cache_accepts_qwen_dense_quant_tag(void) {
+    FILE *fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    if (!fp) return;
+
+    uint8_t h[KV_CACHE_FIXED_HEADER];
+    ds4_kvstore_fill_header(h, 4, 0, KV_REASON_COLD, 0,
+                            32, 0, 128, 100, 100, 0);
+    uint8_t text_len[4] = {0};
+    TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+    TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
+    TEST_ASSERT(fseek(fp, 0, SEEK_SET) == 0);
+    ds4_kvstore_entry entry = {0};
+    uint32_t text_bytes = 1;
+    TEST_ASSERT(ds4_kvstore_read_header(fp, &entry, &text_bytes));
+    TEST_ASSERT(entry.model_id == DS4_MODEL_ID_QWEN38 && entry.quant_bits == 0 && text_bytes == 0);
+
+    TEST_ASSERT(fseek(fp, 0, SEEK_SET) == 0);
+    ds4_kvstore_fill_header(h, 0, 0, KV_REASON_COLD, 0,
+                            32, 0, 128, 100, 100, 0);
+    TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+    TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
+    TEST_ASSERT(fseek(fp, 0, SEEK_SET) == 0);
+    TEST_ASSERT(!ds4_kvstore_read_header(fp, &entry, &text_bytes));
+    fclose(fp);
+}
+
 static void test_kv_stub_file(const char *dir, const char *sha,
                               uint8_t reason, uint32_t tokens, uint32_t hits,
                               uint64_t last_used, uint64_t payload_bytes) {
@@ -21637,10 +22563,64 @@ static void test_openai_inline_image_content(void) {
     TEST_ASSERT(msgs.v[0].images.len == 1);
     TEST_ASSERT(strstr(msgs.v[0].content, "describe ") == msgs.v[0].content);
     TEST_ASSERT(strstr(msgs.v[0].content, " please") != NULL);
-    TEST_ASSERT(msgs.v[0].images.v[0].encoded_len >= 8);
-    TEST_ASSERT(!memcmp(msgs.v[0].images.v[0].encoded, "\x89PNG\r\n\x1a\n", 8));
+    TEST_ASSERT(msgs.v[0].images.v[0].frame_count == 1);
+    TEST_ASSERT(msgs.v[0].images.v[0].frame_lens[0] >= 8);
+    TEST_ASSERT(!memcmp(msgs.v[0].images.v[0].frames[0], "\x89PNG\r\n\x1a\n", 8));
     chat_msgs_free(&msgs);
     buf_free(&json);
+}
+
+/* A video arrives as an ordered frame list and must become one media input, so
+ * the engine sees one sequence to merge instead of separate images. */
+static void test_openai_video_content(void) {
+    buf json = {0};
+    buf_puts(&json,
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"text\","
+        "\"text\":\"describe \"},{\"type\":\"video\",\"frames\":[");
+    for (int i = 0; i < 3; i++) {
+        if (i) buf_puts(&json, ",");
+        buf_puts(&json, "\"data:image/png;base64,");
+        buf_puts(&json, test_inline_png_base64);
+        buf_puts(&json, "\"");
+    }
+    buf_puts(&json, "]}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 1);
+    TEST_ASSERT(msgs.v[0].images.len == 1);
+    TEST_ASSERT(msgs.v[0].images.v[0].frame_count == 3);
+    TEST_ASSERT(!memcmp(msgs.v[0].images.v[0].frames[1], "\x89PNG\r\n\x1a\n", 8));
+    /* The marker stands in for the whole sequence, so the render inserts one
+     * span for the video rather than one per frame. */
+    TEST_ASSERT(strstr(msgs.v[0].content, "DS4_IMAGE_") != NULL);
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+
+    /* Malformed media fails the request instead of silently dropping it: a
+     * single frame is not a video, and a path must never be accepted (that
+     * would make the endpoint read host files on request). */
+    buf one = {0};
+    buf_puts(&one,
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"video\","
+        "\"frames\":[\"data:image/png;base64,");
+    buf_puts(&one, test_inline_png_base64);
+    buf_puts(&one, "\"]}]}]");
+    const char *q = one.ptr;
+    chat_msgs one_msgs = {0};
+    TEST_ASSERT(!parse_messages(&q, &one_msgs));
+    chat_msgs_free(&one_msgs);
+    buf_free(&one);
+
+    buf path = {0};
+    buf_puts(&path,
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"video\","
+        "\"frames\":[\"/tmp/a.png\",\"/tmp/b.png\"]}]}]");
+    const char *r = path.ptr;
+    chat_msgs path_msgs = {0};
+    TEST_ASSERT(!parse_messages(&r, &path_msgs));
+    chat_msgs_free(&path_msgs);
+    buf_free(&path);
 }
 
 static void test_http_image_paths_and_urls_are_rejected(void) {
@@ -21786,7 +22766,11 @@ static void test_server_image_embedding_cache(void) {
     server_image_cache cache = {0};
     uint8_t key = 1;
     float data[2] = {1.25f, -2.5f};
-    server_image_input input = {.encoded = &key, .encoded_len = 1};
+    uint8_t *frame = &key;
+    size_t frame_len = 1;
+    server_image_input input = {
+        .frames = &frame, .frame_lens = &frame_len, .frame_count = 1,
+    };
     ds4_vision_embedding src = {.data = data, .token_count = 1,
                                .width = 42, .fingerprint = {7}};
     ds4_vision_embedding out = {0};
@@ -22016,6 +23000,72 @@ static void test_deepseek41_live_result_order(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+/* The Qwen parser has no argument types in the model's output, so this pins the
+ * schema-driven decision and the shape guess that remains for undeclared
+ * properties: "12345" and "3.10" must stay text, an integer must stay a number. */
+static void test_qwen_schema_declared_string_argument(void) {
+    static const char function_json[] =
+        "{\"name\":\"save_code\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"code\":{\"type\":\"string\"},"
+        "\"version\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"}},"
+        "\"required\":[\"code\"]}}";
+    static const char raw[] =
+        "<tool_call>\n<function=save_code>\n"
+        "<parameter=code>\n12345\n</parameter>\n"
+        "<parameter=version>\n3.10\n</parameter>\n"
+        "<parameter=count>\n7\n</parameter>\n"
+        "</function>\n</tool_call>";
+    tool_schema_orders orders = {0};
+    tool_schema_orders_add_json(&orders, function_json);
+
+    char err[128] = {0};
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    bool recovered = false;
+    const char *finish = "tool_calls";
+    TEST_ASSERT(parse_generated_message_for_response_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, raw, true, true, false, &finish,
+        err, sizeof(err), &content, &reasoning, &calls, &recovered, &orders));
+    TEST_ASSERT(calls.len == 1);
+    json_args args = {0};
+    TEST_ASSERT(json_args_parse(calls.v[0].arguments, &args));
+    int code = json_args_find_unused(&args, "code");
+    int version = json_args_find_unused(&args, "version");
+    int count = json_args_find_unused(&args, "count");
+    TEST_ASSERT(code >= 0 && args.v[code].is_string &&
+                !strcmp(args.v[code].value, "12345"));
+    TEST_ASSERT(version >= 0 && args.v[version].is_string &&
+                !strcmp(args.v[version].value, "3.10"));
+    TEST_ASSERT(count >= 0 && !args.v[count].is_string &&
+                !strcmp(args.v[count].value, "7"));
+    json_args_free(&args);
+    tool_calls_free(&calls);
+    free(content);
+    free(reasoning);
+
+    /* No schema in hand: the shape guess still decides, which is the behaviour
+     * the incremental parses keep. */
+    content = NULL;
+    reasoning = NULL;
+    memset(&calls, 0, sizeof(calls));
+    finish = "tool_calls";
+    TEST_ASSERT(parse_generated_message_for_response_for_syntax(
+        SERVER_MODEL_SYNTAX_QWEN, raw, true, true, false, &finish,
+        err, sizeof(err), &content, &reasoning, &calls, &recovered, NULL));
+    TEST_ASSERT(calls.len == 1);
+    memset(&args, 0, sizeof(args));
+    TEST_ASSERT(json_args_parse(calls.v[0].arguments, &args));
+    code = json_args_find_unused(&args, "code");
+    TEST_ASSERT(code >= 0 && !args.v[code].is_string &&
+                !strcmp(args.v[code].value, "12345"));
+    json_args_free(&args);
+    tool_calls_free(&calls);
+    free(content);
+    free(reasoning);
+    tool_schema_orders_free(&orders);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_deepseek41_server_stream();
     test_deepseek41_server_tools();
@@ -22039,6 +23089,11 @@ static void ds4_server_unit_tests_run(void) {
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();
     test_render_chat_prompt_text_renders_tools_before_system();
+    test_render_qwen_template_history();
+    test_qwen_openai_tool_stream();
+    test_qwen_anthropic_tool_stream();
+    test_qwen_stream_schema_string_argument();
+    test_qwen_schema_declared_string_argument();
     test_render_glm_chat_prompt_text();
     test_render_qwen_chat_prompt_text();
     test_render_qwen_tool_round_trip();
@@ -22120,6 +23175,7 @@ static void ds4_server_unit_tests_run(void) {
     test_dsml_decode_state_separates_structure_and_payload();
     test_decode_tracker_split_parameter_close();
     test_glm_decode_tracker_boundaries();
+    test_qwen_decode_tracker_boundaries();
     test_tool_control_text_inside_arguments();
     test_tool_body_escape_round_trip();
     test_tool_memory_max_ids_prunes_oldest();
@@ -22131,6 +23187,7 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_canonical_with_tools_preserves_reasoning();
     test_thinking_canonical_non_thinking_mode_noop();
     test_openai_inline_image_content();
+    test_openai_video_content();
     test_http_image_paths_and_urls_are_rejected();
     test_anthropic_inline_image_content();
     test_responses_inline_image_content();
@@ -22165,6 +23222,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
+    test_kv_cache_accepts_qwen_dense_quant_tag();
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();

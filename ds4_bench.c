@@ -52,6 +52,8 @@ typedef struct {
     int step_incr;
     int gen_tokens;
     int power_percent;
+    int ctk_fmt;
+    int ctv_fmt;
     uint32_t prefill_chunk;
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
@@ -266,7 +268,19 @@ static bench_config parse_options(int argc, char **argv) {
         }
         if (tp_parse == DS4_TP_CLI_MATCHED) continue;
 
-        if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
+        if (!strcmp(arg, "-ctk") || !strcmp(arg, "--cache-type-k")) {
+            if (!ds4_kv_type_from_name(need_arg(&i, argc, argv, arg),
+                                       &c.ctk_fmt)) {
+                fprintf(stderr, "ds4-bench: %s accepts f16, q8_0 or q4_0\n", arg);
+                exit(1);
+            }
+        } else if (!strcmp(arg, "-ctv") || !strcmp(arg, "--cache-type-v")) {
+            if (!ds4_kv_type_from_name(need_arg(&i, argc, argv, arg),
+                                       &c.ctv_fmt)) {
+                fprintf(stderr, "ds4-bench: %s accepts f16, q8_0 or q4_0\n", arg);
+                exit(1);
+            }
+        } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-model")) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
@@ -658,6 +672,8 @@ int main(int argc, char **argv) {
         .ssd_streaming_preload_experts = cfg.ssd_streaming_preload_experts,
         .simulate_used_memory_bytes = cfg.simulate_used_memory_bytes,
         .power_percent = cfg.power_percent,
+        .ctk_q8 = cfg.ctk_fmt,
+        .ctv_q8 = cfg.ctv_fmt,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
         .dspark = cfg.dspark,

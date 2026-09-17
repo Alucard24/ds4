@@ -195,7 +195,7 @@ __global__ static void dsv41_engram_kernel(float *residual, const float *kv,
     h2 = __shfl_sync(0xffffffffu, warp_sum_f32(h2), 0);
     k2 = __shfl_sync(0xffffffffu, warp_sum_f32(k2), 0);
     dot = __shfl_sync(0xffffffffu, warp_sum_f32(dot), 0) *
-        rsqrtf(h2 / width + eps) * rsqrtf(k2 / width + eps) * rsqrtf(float(width));
+        ds4_cuda_rsqrtf(h2 / width + eps) * ds4_cuda_rsqrtf(k2 / width + eps) * ds4_cuda_rsqrtf(float(width));
     const float gate = 1.0f / (1.0f + expf(-copysignf(sqrtf(fmaxf(fabsf(dot), 1.0e-6f)), dot)));
     for (uint32_t i = lane; i < width; i += 32u)
         residual[offset + i] = dsv41_bf16(residual[offset + i] + gate * dsv41_bf16(kv[value + i]));

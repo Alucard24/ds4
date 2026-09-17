@@ -147,8 +147,21 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
                                 ds4_help_tool tool, bool full) {
     title(fp, c, "Model And Runtime");
     opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
-    if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
-        opt(fp, c, "--vision FILE", "Vision encoder GGUF for the selected model.");
+    if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT ||
+        tool == DS4_HELP_SERVER || tool == DS4_HELP_BENCH) {
+        if (tool != DS4_HELP_BENCH) {
+            opt(fp, c, "--vision FILE",
+                "Vision encoder GGUF for the selected model.");
+        }
+        opt(fp, c, "-ctk, -ctv TYPE",
+            "Attention KV cache type: f16 (default), q8_0 or q4_0.  Attention "
+            "K/V is 64 KiB per token as f16, which is what puts a long context "
+            "out of reach; q8_0 stores it at about half size and q4_0 at about "
+            "a quarter, and the prefill reads a quantized cache through an f16 "
+            "mirror, so the format costs memory and a few percent of decode "
+            "speed rather than the bandwidth it saves.  K and V must match.  On "
+            "Qwen3.8-27B the 16-token regression sentence reads NLL 1.80954673 "
+            "(f16), 1.80900178 (q8_0) and 1.82242633 (q4_0).");
     }
 #ifdef DS4_ROCM_BUILD
     opt(fp, c, "--metal | --rocm | --cpu", "Select the backend explicitly.");
@@ -345,19 +358,23 @@ static void print_agent_sessions(FILE *fp, const help_colors *c) {
 static void print_server_api(FILE *fp, const help_colors *c) {
     title(fp, c, "HTTP API");
     opt(fp, c, "--host HOST", "Bind address. Default: 127.0.0.1");
+    opt(fp, c, "--system TEXT",
+        "Append TEXT to every request's system message, after the client's own text.");
+    opt(fp, c, "--prefix-file FILE",
+        "Preload complete alternating USER:/ASSISTANT: turns before the live conversation.");
     opt(fp, c, "--port N", "Bind port. Default: 8000");
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
     opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128; GLM-5.3 minimum: 1024");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
-    para(fp, c, "Model endpoint aliases include deepseek-v4-flash and deepseek-v4-pro; both serve the loaded GGUF.");
+    para(fp, c, "Model endpoint aliases follow the loaded family: DeepSeek V4, GLM, or Qwen3.8-27B.");
     fputc('\n', fp);
 }
 
 static void print_server_thinking(FILE *fp, const help_colors *c) {
     title(fp, c, "Server Thinking Defaults");
-    para(fp, c, "DeepSeek-compatible chat requests default to high-effort thinking.");
+    para(fp, c, "Chat requests default to high-effort thinking when supported by the loaded model.");
     para(fp, c, "reasoning_effort=max or output_config.effort=max requests Think Max.");
     para(fp, c, "Think Max requires --ctx >= 393216; smaller contexts use high.");
     para(fp, c, "thinking={type:disabled}, think=false, or model=deepseek-chat selects non-thinking mode.");
@@ -566,7 +583,7 @@ static void print_topic(FILE *fp, const help_colors *c, ds4_help_tool tool, cons
     else if (tool == DS4_HELP_AGENT && streq(topic, "tools")) {
         title(fp, c, "Agent Tool System");
         para(fp, c, "The agent can read, search, write, edit, run bash, and browse through Chrome-backed web tools.");
-        para(fp, c, "DeepSeek-family models emit DSML tool calls; GLM models use native <tool_call> syntax. Both are rendered live in the terminal.");
+        para(fp, c, "DeepSeek-family models emit DSML tool calls; GLM and Qwen3.8 models use their native <tool_call> syntax. All are rendered live in the terminal.");
         para(fp, c, "Edit uses exact old/new replacement. --edit-upto enables anchored replacements between a unique head and tail.");
         fputc('\n', fp);
     } else if (tool == DS4_HELP_BENCH && streq(topic, "benchmark")) print_bench_specific(fp, c);

@@ -414,10 +414,17 @@ void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
     kv_le_put64(h + 40, payload_bytes);
 }
 
-/* routed-expert quantizations whose checkpoints the store keys on */
+/* routed-expert quantizations whose checkpoints the store keys on (main's
+ * set) plus the dense case: Qwen3.8 has no routed experts, so its stable
+ * model id carries compatibility and the quant tag is 0 (feat). */
 bool ds4_kvstore_quant_bits_supported(int quant_bits) {
     return quant_bits == 2 || quant_bits == 4 || quant_bits == 5 ||
            quant_bits == 6 || quant_bits == 8;
+}
+/* Model-aware form used at the internal call sites below. */
+static bool kv_cache_quant_tag_valid(int model_id, int quant_bits) {
+    return ds4_kvstore_quant_bits_supported(quant_bits) ||
+           (model_id == DS4_MODEL_ID_QWEN38 && quant_bits == 0);
 }
 
 bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
@@ -442,7 +449,8 @@ bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
     if (fread(tb, 1, sizeof(tb), fp) != sizeof(tb)) return false;
     *text_bytes = ds4_kvstore_le_get32(tb);
     e->text_bytes = *text_bytes;
-    return e->tokens != 0 && ds4_kvstore_quant_bits_supported(e->quant_bits);
+    return e->tokens != 0 &&
+           kv_cache_quant_tag_valid(e->model_id, e->quant_bits);
 }
 
 bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
@@ -946,11 +954,11 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     ds4_kvstore_tokens_copy_prefix(&store_tokens, tokens, store_len);
 
     const int quant_bits = ds4_engine_routed_quant_bits(engine);
-    if (!ds4_kvstore_quant_bits_supported(quant_bits)) {
+    const int model_id = ds4_engine_model_id(engine);
+    if (!kv_cache_quant_tag_valid(model_id, quant_bits)) {
         ds4_tokens_free(&store_tokens);
         return false;
     }
-    const int model_id = ds4_engine_model_id(engine);
 
     char save_err[160] = {0};
     const ds4_tokens *live_tokens = ds4_session_tokens(session);
@@ -1230,8 +1238,9 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     if (effective_prompt) effective_prompt->len = 0;
     if (!kc->enabled || !prompt_text) return 0;
     const int quant_bits = ds4_engine_routed_quant_bits(engine);
-    if (!ds4_kvstore_quant_bits_supported(quant_bits)) return 0;
+
     const int model_id = ds4_engine_model_id(engine);
+    if (!kv_cache_quant_tag_valid(model_id, quant_bits)) return 0;
     const size_t prompt_bytes = strlen(prompt_text);
     int idx = ds4_kvstore_find_text_prefix(kc, prompt_text, model_id, quant_bits,
                                            ds4_session_ctx(session));

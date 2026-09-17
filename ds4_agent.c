@@ -410,7 +410,8 @@ static int agent_read_default_lines(agent_worker *w);
 static int agent_compact_reserve_tokens(agent_worker *w);
 
 static agent_tool_syntax agent_tool_syntax_for_engine(ds4_engine *engine) {
-    if (ds4_engine_is_qwen4(engine)) return AGENT_TOOL_SYNTAX_QWEN;
+    if (ds4_engine_is_qwen4(engine) || ds4_engine_is_qwen38(engine))
+        return AGENT_TOOL_SYNTAX_QWEN;
     return ds4_engine_is_glm_dsa(engine) ? AGENT_TOOL_SYNTAX_GLM
          : ds4_engine_is_deepseek41(engine) ? AGENT_TOOL_SYNTAX_DSML41
                                            : AGENT_TOOL_SYNTAX_DSML;
@@ -430,6 +431,11 @@ static const char *agent_tool_start(agent_tool_syntax syntax) {
 
 static const char *agent_dsml_param_close(agent_tool_syntax syntax) {
     return syntax == AGENT_TOOL_SYNTAX_DSML41 ? "</｜DSML｜ parameter>" : "</｜DSML｜parameter>";
+}
+
+/* GLM and Qwen both open a call with <tool_call> and render as chat messages. */
+static bool agent_syntax_is_xml_tool_call(agent_tool_syntax syntax) {
+    return syntax == AGENT_TOOL_SYNTAX_GLM || syntax == AGENT_TOOL_SYNTAX_QWEN;
 }
 
 static bool agent_tool_syntax_assistant_turn_uses_eos(agent_tool_syntax syntax) {
@@ -826,6 +832,18 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.vision_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.glm_mtp = true;
+        } else if (!strcmp(arg, "-ctk") || !strcmp(arg, "--cache-type-k")) {
+            if (!ds4_kv_type_from_name(need_arg(&i, argc, argv, arg),
+                                       &c.engine.ctk_q8)) {
+                fprintf(stderr, "ds4-agent: %s accepts f16 or q8_0\n", arg);
+                exit(1);
+            }
+        } else if (!strcmp(arg, "-ctv") || !strcmp(arg, "--cache-type-v")) {
+            if (!ds4_kv_type_from_name(need_arg(&i, argc, argv, arg),
+                                       &c.engine.ctv_q8)) {
+                fprintf(stderr, "ds4-agent: %s accepts f16 or q8_0\n", arg);
+                exit(1);
+            }
         } else if (!strcmp(arg, "--mtp-model")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
@@ -1287,6 +1305,12 @@ static const char agent_tools_prompt_after_edit[] =
 
 static const char agent_vision_tool_schema[] =
     "{\"name\":\"view_image\",\"description\":\"Open a local PNG or JPEG as a visual observation.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}";
+/* Frames of one video must arrive together: the engine merges adjacent frames,
+ * so passing them one view_image call at a time would lose the temporal
+ * pairing.  A container is accepted too and decoded with ffmpeg when it is
+ * available. */
+static const char agent_video_tool_schema[] =
+    "{\"name\":\"view_video\",\"description\":\"Open a local video as one visual observation: either a container (decoded with ffmpeg) or 2..128 ordered PNG/JPEG frames.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"frames\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"max_frames\":{\"type\":\"integer\"}},\"required\":[]}}";
 
 static char *agent_build_dsml_tools_prompt(bool edit_upto, bool vision) {
     const char *edit = edit_upto ? agent_tools_prompt_edit_upto
@@ -1295,14 +1319,19 @@ static char *agent_build_dsml_tools_prompt(bool edit_upto, bool vision) {
     size_t b = strlen(edit);
     size_t c = strlen(agent_tools_prompt_after_edit);
     const char *vision_start = "\n{\"type\":\"function\",\"function\":";
-    size_t v = vision ? strlen(vision_start) + strlen(agent_vision_tool_schema) + 2 : 0;
+    size_t v = vision ? strlen(vision_start) + strlen(agent_vision_tool_schema) +
+                             strlen(agent_video_tool_schema) + 6 : 0;
     char *out = xmalloc(a + b + c + v + 1);
     memcpy(out, agent_tools_prompt_intro, a);
     memcpy(out + a, edit, b);
     const char *rules = strstr(agent_tools_prompt_after_edit, "\n# Rules\n");
     size_t schemas = (size_t)(rules - agent_tools_prompt_after_edit);
     memcpy(out + a + b, agent_tools_prompt_after_edit, schemas);
-    if (vision) snprintf(out + a + b + schemas, v + 1, "%s%s}\n", vision_start, agent_vision_tool_schema);
+    if (vision) {
+        snprintf(out + a + b + schemas, v + 1, "%s%s}%s%s}\n", vision_start,
+                 agent_vision_tool_schema, vision_start,
+                 agent_video_tool_schema);
+    }
     memcpy(out + a + b + schemas + v, rules, c - schemas + 1);
     return out;
 }
@@ -1355,13 +1384,72 @@ static const char agent_glm_tool_schemas[] =
     "{\"name\":\"search\",\"description\":\"Search files.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"mode\":{\"type\":\"string\",\"enum\":[\"literal\",\"regex\"]},\"glob\":{\"type\":\"string\"},\"context\":{\"type\":\"integer\"},\"max_results\":{\"type\":\"integer\"},\"case_sensitive\":{\"type\":\"boolean\"}},\"required\":[\"query\"]}}\n"
     "{\"name\":\"list\",\"description\":\"List one directory.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}}\n";
 
+static const char agent_qwen_tools_prompt_intro[] =
+    "You are a coding agent running in a local workspace. Use tools for local file and system work. "
+    "Avoid printing large file contents or large code blocks as answers; create or edit files with tools, "
+    "then summarize results briefly.\n\n"
+    "# Tools\n\n"
+    "You may call one or more functions to assist with the user query.\n\n"
+    "You are provided with function signatures within <tools></tools> XML tags:\n"
+    "<tools>";
+
+static const char agent_qwen_tools_prompt_after_schemas[] =
+    "\n</tools>\n\n"
+    AGENT_TOOL_CONTRACTS
+    "Inside argument values only, escape a literal </parameter> as &lt;/parameter>. "
+    "To write that escaped spelling literally, use &amp;lt;/parameter>. Other HTML entities are unchanged.\n\n"
+    "If you choose to call a function, reply with the function call and nothing after it, in exactly this format:\n"
+    "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+    "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n"
+    "</parameter>\n</function>\n</tool_call>\n\n"
+    "Tool calls are not allowed inside <think></think>; finish thinking before emitting <tool_call>.\n\n"
+    "# Rules\n\n"
+    "- Use strict native Qwen tool-call syntax with <tool_call>, <function=...> and <parameter=...> tags.\n"
+    "- read path alone returns a context-sized bounded chunk, not the whole file; for first looks at large files, prefer max_lines around 80-160.\n"
+    "- If read says more lines are available, call more with count=<lines> to read the next chunk.\n"
+    "- Use whole=true only when the user explicitly asks for the complete file contents or when bounded chunks are insufficient for the task; add raw=true only when line numbers would corrupt the payload.\n"
+    "- " AGENT_EDIT_TARGET_RULE "\n";
+
+/* The schema list above is one bare function object per line; Qwen's template
+ * shows them wrapped as OpenAI-style tool entries, so each line gets a wrapper
+ * instead of a second copy of every schema. */
+static char *agent_build_qwen_tools_prompt(bool edit_upto, bool vision) {
+    static const char wrap[] = "\n{\"type\": \"function\", \"function\": ";
+    const char *edit = edit_upto ? agent_glm_tools_prompt_edit_upto
+                                 : agent_glm_tools_prompt_edit_exact;
+    size_t lines = 1;
+    for (const char *q = agent_glm_tool_schemas; *q; q++) lines += *q == '\n';
+    size_t cap = strlen(agent_qwen_tools_prompt_intro) +
+                 strlen(agent_glm_tool_schemas) + lines * sizeof(wrap) +
+                 strlen(agent_qwen_tools_prompt_after_schemas) + strlen(edit) + 1;
+    const size_t vision_len = strlen(agent_vision_tool_schema) +
+                              strlen(agent_video_tool_schema) + 2;
+    if (vision) cap += strlen(wrap) + vision_len;
+    char *out = xmalloc(cap);
+    size_t n = (size_t)snprintf(out, cap, "%s", agent_qwen_tools_prompt_intro);
+    const char *p = agent_glm_tool_schemas;
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        if (len) n += (size_t)snprintf(out + n, cap - n, "%s%.*s}", wrap, (int)len, p);
+        p += len + (nl ? 1 : 0);
+    }
+    if (vision) {
+        n += (size_t)snprintf(out + n, cap - n, "%s%s}", wrap, agent_vision_tool_schema);
+        n += (size_t)snprintf(out + n, cap - n, "%s%s}", wrap, agent_video_tool_schema);
+    }
+    snprintf(out + n, cap - n, "%s%s", agent_qwen_tools_prompt_after_schemas, edit);
+    return out;
+}
+
 static char *agent_build_glm_tools_prompt(bool edit_upto, bool vision) {
     size_t schemas_len = strlen(agent_glm_tool_schemas);
     const char *schemas = agent_glm_tool_schemas;
     const char *edit = edit_upto ? agent_glm_tools_prompt_edit_upto
                                  : agent_glm_tools_prompt_edit_exact;
     size_t a = strlen(agent_glm_tools_prompt_intro);
-    size_t v = vision ? strlen(agent_vision_tool_schema) + 1 : 0;
+    size_t v = vision ? strlen(agent_vision_tool_schema) +
+                            strlen(agent_video_tool_schema) + 2 : 0;
     size_t b = schemas_len + v;
     size_t c = strlen(agent_glm_tools_prompt_after_schemas);
     size_t d = strlen(edit);
@@ -1369,7 +1457,10 @@ static char *agent_build_glm_tools_prompt(bool edit_upto, bool vision) {
     char *out = xmalloc(a + b + c + d + e + 1);
     memcpy(out, agent_glm_tools_prompt_intro, a);
     memcpy(out + a, schemas, schemas_len);
-    if (vision) snprintf(out + a + schemas_len, v + 1, "%s\n", agent_vision_tool_schema);
+    if (vision) {
+        snprintf(out + a + schemas_len, v + 1, "%s\n%s\n",
+                 agent_vision_tool_schema, agent_video_tool_schema);
+    }
     memcpy(out + a + b, agent_glm_tools_prompt_after_schemas, c);
     memcpy(out + a + b + c, edit, d);
     memcpy(out + a + b + c + d, agent_glm_tools_prompt_rules_tail, e + 1);
@@ -1471,7 +1562,7 @@ static const char agent_dsml41_syntax_reminder[] =
     "</｜DSML｜ invoke>\n"
     "</｜DSML｜ calls>\n";
 static const char agent_qwen_syntax_reminder[] =
-    "Tool-call syntax reminder:\n"
+    "Qwen tool-call syntax reminder:\n"
     "<tool_call>\n<function=$TOOL_NAME>\n<parameter=$PARAMETER_NAME>\n$PARAMETER_VALUE\n</parameter>\n"
     "</function>\n</tool_call>\n";
 
@@ -5014,12 +5105,20 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
         snprintf(err, err_len, "live KV state does not match session transcript");
         return false;
     }
+    /* The header records the routed-expert quantization so a checkpoint cannot be
+     * resumed by a model whose experts were quantized differently.  A model with
+     * no routed experts at all - Qwen3.8 has none - reports zero, which is just as
+     * meaningful: the load path compares this byte against the same function, so
+     * zero is self-consistent, and demanding 2 or 4 here only made every save fail
+     * with "unsupported routed quantization" while the engine's own payload
+     * staging had already written it correctly. */
     const int quant_bits = ds4_engine_routed_quant_bits(w->engine);
-    if (!ds4_kvstore_quant_bits_supported(quant_bits)) {
+    const int model_id = ds4_engine_model_id(w->engine);
+    if (!ds4_kvstore_quant_bits_supported(quant_bits) &&
+        !(model_id == DS4_MODEL_ID_QWEN38 && quant_bits == 0)) {
         snprintf(err, err_len, "unsupported routed quantization for KV save");
         return false;
     }
-    const int model_id = ds4_engine_model_id(w->engine);
 
     size_t text_len = 0;
     char *text = ds4_kvstore_render_tokens_text(w->engine, tokens, &text_len);
@@ -7636,6 +7735,8 @@ static void test_agent_qwen_tool_parser_two_calls_and_error(void) {
     AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[1], "path"), "/tmp/x"));
     agent_dsml_parser_free(&p);
 
+    /* </function> is missing its </tool_call>: a completed but malformed call
+     * must switch to ERROR so the model gets a retryable tool error. */
     const char *bad = "<tool_call>\n<function=list>\n<parameter=path>\n.\n</parameter>\n</tool_call>";
     agent_dsml_parser q = {
         .syntax = AGENT_TOOL_SYNTAX_QWEN,
@@ -7850,7 +7951,7 @@ static void test_agent_tool_argument_literal_markup(void) {
         AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
         AGENT_TEST_ASSERT(p.calls.len == 1);
         if (p.calls.len)
-            AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "content"), expected[is_glm]));
+            AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "content"), expected[kind]));
         free(out);
         agent_dsml_parser_free(&p);
     }
@@ -9448,6 +9549,78 @@ static void agent_tool_view_image(agent_worker *w,
     agent_tool_observation_puts(obs, meta);
 }
 
+/* view_video: one video as one observation.
+ *
+ * The DSML tool protocol carries flat string arguments, so a frame list arrives
+ * as newline- or comma-separated paths and a container arrives as `path`.
+ * Frames have to be attached together: the engine merges adjacent frames, so
+ * several view_image calls would each produce an independent still. */
+static void agent_tool_view_video(agent_worker *w,
+                                  const agent_tool_call *call,
+                                  agent_tool_observation *obs) {
+    if (!ds4_engine_has_vision(w->engine)) {
+        agent_tool_observation_puts(
+            obs, "Tool error: view_video requires ds4-agent --vision FILE\n");
+        return;
+    }
+    const char *path = agent_tool_arg_value(call, "path");
+    const char *frames_arg = agent_tool_arg_value(call, "frames");
+    ds4_vision_embedding embedding = {0};
+    char err[256] = {0};
+    char shown[PATH_MAX + 80] = {0};
+    bool ok = false;
+    if (frames_arg && frames_arg[0]) {
+        const char *paths[128];
+        size_t count = 0;
+        char *copy = xstrdup(frames_arg);
+        char *save = NULL;
+        for (char *tok = strtok_r(copy, ",\n", &save);
+             tok && count < 128u;
+             tok = strtok_r(NULL, ",\n", &save)) {
+            while (*tok == ' ' || *tok == '\t') tok++;
+            if (*tok) paths[count++] = tok;
+        }
+        if (count < 2u) {
+            agent_tool_observation_puts(
+                obs, "Tool error: view_video needs at least two frame paths\n");
+            free(copy);
+            return;
+        }
+        ok = ds4_engine_vision_encode_frame_files(w->engine, paths, count,
+                                                  &embedding, err, sizeof(err));
+        snprintf(shown, sizeof(shown), "\n[tool:view_video] %zu frames\n",
+                 count);
+        free(copy);
+    } else if (path && path[0]) {
+        uint32_t wanted = (uint32_t)agent_parse_int_default(
+            agent_tool_arg_value(call, "max_frames"), 32, 2, 128);
+        ok = ds4_engine_vision_encode_video_file(w->engine, path, wanted,
+                                                 &embedding, err, sizeof(err));
+        snprintf(shown, sizeof(shown), "\n[tool:view_video] %s\n", path);
+    } else {
+        agent_tool_observation_puts(
+            obs, "Tool error: view_video requires path or frames\n");
+        return;
+    }
+    if (!ok) {
+        agent_tool_observation_puts(obs, "Tool error: view_video failed: ");
+        agent_tool_observation_puts(obs, err[0] ? err : "unable to decode video");
+        agent_tool_observation_puts(obs, "\n");
+        return;
+    }
+    agent_publish(w, shown, strlen(shown));
+    agent_tool_observation_add_image(obs, &embedding);
+    char meta[224];
+    snprintf(meta, sizeof(meta),
+             "\nVideo observation attached (%ux%u, %u visual tokens, %u "
+             "temporal groups).\n",
+             obs->images[obs->image_count - 1].width,
+             obs->images[obs->image_count - 1].height,
+             obs->images[obs->image_count - 1].token_count,
+             obs->images[obs->image_count - 1].grid_time);
+    agent_tool_observation_puts(obs, meta);
+}
+
 /* Execute one parsed DSML tool call and return the text that will be appended as
  * the tool-role result.  UI visualization already happened while streaming; this
  * function is only about side effects and the model-visible observation. */
@@ -9523,6 +9696,10 @@ static agent_tool_observation agent_execute_tool_observation(
         agent_tool_observation_puts(&obs, hdr);
         if (calls->v[i].name && !strcmp(calls->v[i].name, "view_image")) {
             agent_tool_view_image(w, &calls->v[i], &obs);
+            continue;
+        }
+        if (calls->v[i].name && !strcmp(calls->v[i].name, "view_video")) {
+            agent_tool_view_video(w, &calls->v[i], &obs);
             continue;
         }
         char *res = agent_execute_tool_call(w, &calls->v[i]);

@@ -4,6 +4,8 @@
 #include "ds4_tp.h"
 #include "ds4_help.h"
 #include "ds4_prompt_prefix.h"
+#include "ds4_image.h"
+#include "ds4_video.h"
 #include "linenoise.h"
 
 /* ds4 CLI.
@@ -1293,6 +1295,7 @@ static void print_repl_help(void) {
     puts("  /power N       Set GPU duty cycle percentage, 1..100.");
     puts("  /steer F       Set FFN steering for subsequent tokens; no value shows it.");
     puts("  /read FILE     Submit a text file, PNG, or JPEG.");
+    puts("  /video SRC     Submit a video: one container (ffmpeg) or 2..128 ordered frames.");
     puts("  /quit, /exit   Leave the prompt.");
     puts("  Ctrl+C         Stop generation and return to the prompt.");
 }
@@ -1528,7 +1531,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
         ds4_vision_span *span = repl_chat_add_image(chat);
         const char *text_parts[] = {"", user_text ? user_text : ""};
         char image_error[160] = {0};
-        if (!span || !ds4_chat_append_multimodal_message(
+if (!span || !ds4_chat_append_multimodal_message(
                 engine, &chat->transcript, "user", text_parts,
                 image, 1, span, image_error, sizeof(image_error))) {
             repl_chat_trim_images(chat, rollback_images);
@@ -1706,6 +1709,17 @@ static bool cli_file_has_image_magic(const char *path) {
            (n >= 2 && magic[0] == 0xff && magic[1] == 0xd8);
 }
 
+/* A container is neither an image to decode nor text to prompt with, so
+ * /read has to name it instead of ingesting the bytes as a prompt. */
+static const char *cli_file_container_kind(const char *path) {
+    unsigned char magic[16] = {0};
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
+    size_t n = fread(magic, 1, sizeof(magic), fp);
+    fclose(fp);
+    return n ? ds4_image_container_kind(magic, n) : NULL;
+}
+
 static int run_repl(ds4_engine *engine, cli_config *cfg) {
     repl_chat chat;
     if (repl_chat_init(engine, &chat, cfg) != 0) return 1;
@@ -1825,10 +1839,69 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
         } else if (!strcmp(cmd, "/quit") || !strcmp(cmd, "/exit")) {
             linenoiseFree(line);
             break;
+        } else if (!strncmp(cmd, "/video", 6) &&
+                   (cmd[6] == '\0' || isspace((unsigned char)cmd[6]))) {
+            const char *paths[128];
+            size_t frame_count = 0u;
+            char *save = NULL;
+            for (char *path = strtok_r(trim_inplace(cmd + 6), " \t", &save);
+                 path && frame_count < 128u;
+                 path = strtok_r(NULL, " \t", &save)) {
+                paths[frame_count++] = path;
+            }
+            /* A single container is decoded with ffmpeg; two or more paths are
+             * already an ordered frame list. */
+            if (frame_count == 1u && cli_file_container_kind(paths[0])) {
+                char video_error[256] = {0};
+                ds4_vision_embedding video = {0};
+                uint32_t frames_wanted = DS4_VIDEO_DEFAULT_FRAMES;
+                const char *frames_env = getenv("DS4_VIDEO_FRAMES");
+                if (frames_env && frames_env[0]) {
+                    const long v = strtol(frames_env, NULL, 10);
+                    if (v >= 2 && v <= (long)DS4_VIDEO_MAX_FRAMES)
+                        frames_wanted = (uint32_t)v;
+                }
+                if (!ds4_engine_vision_encode_video_file(
+                        engine, paths[0], frames_wanted, &video, video_error,
+                        sizeof(video_error))) {
+                    fprintf(stderr, "ds4: /video failed: %s\n",
+                            video_error[0] ? video_error : "container decode failed");
+                } else {
+                    fprintf(stderr,
+                            "ds4: video %s, %u frames sampled, temporal grid %u, "
+                            "%u tokens\n",
+                            paths[0], frames_wanted, video.grid_time,
+                            video.token_count);
+                    rc = run_chat_turn(engine, cfg, &chat, "", &video);
+                    ds4_vision_embedding_free(&video);
+                }
+            } else if (frame_count < 2u) {
+                fprintf(stderr, "ds4: /video needs a container or at least two frame files\n");
+            } else {
+                char video_error[256] = {0};
+                ds4_vision_embedding video = {0};
+                if (!ds4_engine_vision_encode_frame_files(
+                        engine, paths, frame_count, &video,
+                        video_error, sizeof(video_error))) {
+                    fprintf(stderr, "ds4: /video failed: %s\n",
+                            video_error[0] ? video_error : "video encoding failed");
+                } else {
+                    fprintf(stderr,
+                            "ds4: video %zu frames, temporal grid %u, %u tokens\n",
+                            frame_count, video.grid_time, video.token_count);
+                    rc = run_chat_turn(engine, cfg, &chat, "", &video);
+                    ds4_vision_embedding_free(&video);
+                }
+            }
         } else if (!strncmp(cmd, "/read", 5) && (cmd[5] == '\0' || isspace((unsigned char)cmd[5]))) {
             char *path = trim_inplace(cmd + 5);
             if (!path[0]) {
                 fprintf(stderr, "ds4: /read needs a file path\n");
+            } else if (cli_file_container_kind(path)) {
+                fprintf(stderr,
+                        "ds4: %s is a %s video/animation container; export an "
+                        "ordered frame list of PNG/JPEG stills and use /video\n",
+                        path, cli_file_container_kind(path));
             } else if (cli_file_has_image_magic(path)) {
                 char image_error[256] = {0};
                 ds4_vision_embedding image = {0};
@@ -2018,6 +2091,18 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.vision_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.glm_mtp = true;
+        } else if (!strcmp(arg, "-ctk") || !strcmp(arg, "--cache-type-k")) {
+            if (!ds4_kv_type_from_name(need_arg(&i, argc, argv, arg),
+                                       &c.engine.ctk_q8)) {
+                fprintf(stderr, "ds4: %s accepts f16 or q8_0\n", arg);
+                exit(1);
+            }
+        } else if (!strcmp(arg, "-ctv") || !strcmp(arg, "--cache-type-v")) {
+            if (!ds4_kv_type_from_name(need_arg(&i, argc, argv, arg),
+                                       &c.engine.ctv_q8)) {
+                fprintf(stderr, "ds4: %s accepts f16 or q8_0\n", arg);
+                exit(1);
+            }
         } else if (!strcmp(arg, "--mtp-model")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {

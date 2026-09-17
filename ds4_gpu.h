@@ -345,6 +345,16 @@ int ds4_gpu_qwen4_batch_mm_q8_tensor(
         const void *model_map, uint64_t model_size, uint64_t weight_offset,
         uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows);
 uint64_t ds4_gpu_recommended_working_set_size(void);
+/* Free and total bytes of the device this engine runs on.  Returns 0 when the
+ * backend cannot report them, in which case callers must not size work from
+ * it (a driver-level answer is a hint, never a guarantee). */
+int ds4_gpu_memory_info(uint64_t *free_bytes, uint64_t *total_bytes);
+/* In-stream phase timing for diagnostics: mark a boundary, then collect the
+ * elapsed GPU time of each segment.  No synchronization is involved, so the
+ * measured pipeline is the real one. */
+void ds4_gpu_phase_reset(void);
+int ds4_gpu_phase_mark(int group);
+int ds4_gpu_phase_finish(float *totals, int groups);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
 typedef struct ds4_gpu_stream_expert_table {
@@ -566,6 +576,15 @@ int ds4_gpu_embed_tokens_quant_tensor(
         uint32_t                n_vocab,
         uint32_t                n_tokens,
         uint32_t                n_embd);
+
+/* KV cache format for the Qwen3.8 attention layers.  0 is f16, the release
+ * path; 1 is q8_0, which stores 32 values per block behind an fp16 scale and
+ * costs 1088 bytes per position per layer against 2048.  Set once when the
+ * engine opens, before any session allocates its caches. */
+void ds4_gpu_qwen38_set_kv_quant(int q8);
+void ds4_gpu_qwen38_set_kv_fmt(int fmt);
+int  ds4_gpu_qwen38_kv_fmt(void);
+int ds4_gpu_qwen38_kv_quant_is_q8(void);
 
 int ds4_gpu_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
@@ -3143,6 +3162,134 @@ int ds4_gpu_glm53_matmul_bf16_qkv(
         uint32_t              in_dim,
         uint32_t              out_dim,
         const ds4_gpu_tensor *x);
+
+/* Qwen3.8 decode primitives. GDN recurrence is FP32; GA K/V is FP16 so the
+ * 32k context fits beside the native mixed-IQ model on a 16GB GPU. */
+int ds4_gpu_qwen38_gdn_decode(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *qkv,
+        const ds4_gpu_tensor *z,
+        const ds4_gpu_tensor *alpha,
+        const ds4_gpu_tensor *beta,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              conv_weight_offset,
+        uint64_t              a_offset,
+        uint64_t              dt_offset,
+        uint64_t              norm_offset);
+int ds4_gpu_qwen38_gdn_chunk(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *qkv,
+        const ds4_gpu_tensor *z,
+        const ds4_gpu_tensor *alpha,
+        const ds4_gpu_tensor *beta,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              conv_weight_offset,
+        uint64_t              a_offset,
+        uint64_t              dt_offset,
+        uint64_t              norm_offset,
+        uint32_t              n_tokens);
+int ds4_gpu_qwen38_ga_prepare(
+        ds4_gpu_tensor       *q_full,
+        ds4_gpu_tensor       *k_cache,
+        ds4_gpu_tensor       *v_cache,
+        ds4_gpu_tensor       *k,
+        const ds4_gpu_tensor *v,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_norm_offset,
+        uint64_t              k_norm_offset,
+        uint32_t              pos,
+        uint32_t              ctx_size);
+int ds4_gpu_qwen38_ga_prepare_chunk(
+        ds4_gpu_tensor       *q_full,
+        ds4_gpu_tensor       *k_cache,
+        ds4_gpu_tensor       *v_cache,
+        ds4_gpu_tensor       *k,
+        const ds4_gpu_tensor *v,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_norm_offset,
+        uint64_t              k_norm_offset,
+        const ds4_gpu_tensor *rope_positions,
+        uint32_t              start_pos,
+        uint32_t              n_tokens,
+        uint32_t              ctx_size);
+int ds4_gpu_qwen38_ga_decode(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q_full,
+        const ds4_gpu_tensor *k_cache,
+        const ds4_gpu_tensor *v_cache,
+        uint32_t              pos,
+        uint32_t              ctx_size);
+int ds4_gpu_qwen38_ga_chunk(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q_full,
+        const ds4_gpu_tensor *k_cache,
+        const ds4_gpu_tensor *v_cache,
+        uint32_t              start_pos,
+        uint32_t              n_tokens,
+        uint32_t              ctx_size);
+
+#ifndef DS4_QWEN3VL_VISION_TYPES_DEFINED
+#define DS4_QWEN3VL_VISION_TYPES_DEFINED
+#define DS4_QWEN3VL_VISION_LAYERS 27u
+
+typedef struct {
+    uint64_t norm1_weight;
+    uint64_t norm1_bias;
+    uint64_t qkv_weight;
+    uint64_t qkv_bias;
+    uint64_t attn_out_weight;
+    uint64_t attn_out_bias;
+    uint64_t norm2_weight;
+    uint64_t norm2_bias;
+    uint64_t ffn_up_weight;
+    uint64_t ffn_up_bias;
+    uint64_t ffn_down_weight;
+    uint64_t ffn_down_bias;
+} ds4_qwen3vl_vision_layer_weights;
+
+typedef struct {
+    uint64_t patch_weight_0;
+    uint64_t patch_weight_1;
+    uint64_t patch_bias;
+    uint64_t position_embedding;
+    uint64_t post_norm_weight;
+    uint64_t post_norm_bias;
+    uint64_t merger_up_weight;
+    uint64_t merger_up_bias;
+    uint64_t merger_down_weight;
+    uint64_t merger_down_bias;
+    ds4_qwen3vl_vision_layer_weights layer[DS4_QWEN3VL_VISION_LAYERS];
+} ds4_qwen3vl_vision_weights;
+#endif
+
+/* Encode normalized RGB 16x16 patches in 2x2 merge-tile order. Still images
+ * feed the same patch rows to both temporal convolution slices; video feeds
+ * two adjacent frame rows to the pair entry point. */
+int ds4_gpu_qwen3vl_vision_encode_pair(
+        float                           *out,
+        const float                     *patches_0,
+        const float                     *patches_1,
+        uint32_t                         grid_h,
+        uint32_t                         grid_w,
+        const void                      *model_map,
+        uint64_t                         model_size,
+        const ds4_qwen3vl_vision_weights *weights);
+int ds4_gpu_qwen3vl_vision_encode(
+        float                           *out,
+        const float                     *patches,
+        uint32_t                         grid_h,
+        uint32_t                         grid_w,
+        const void                      *model_map,
+        uint64_t                         model_size,
+        const ds4_qwen3vl_vision_weights *weights);
 
 #ifndef DS4_GLM53_VISION_TYPES_DEFINED
 #define DS4_GLM53_VISION_TYPES_DEFINED

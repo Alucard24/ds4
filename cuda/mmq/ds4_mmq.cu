@@ -3123,8 +3123,8 @@ int ds4_mmq_dense_vec_impl(
 
     ggml_cuda_mm_fusion_args_device fusion = {};
 
-    (void)cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
-
+    /* Dense MMVQ writes every logical output element; unlike routed MoE it
+     * has no invalid-id lanes or sparse destinations to pre-zero. */
     mul_mat_vec_q_switch_type(
         /*vx=*/W, /*type_x=*/type,
         /*vy=*/(const void *)src1_q8_1.get(),
@@ -3150,7 +3150,6 @@ int ds4_mmq_dense_vec_impl(
                 tag, cudaGetErrorString(err));
         return -3;
     }
-    ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)N, stream);
     return 0;
 }
 
@@ -4926,6 +4925,99 @@ extern "C" int ds4_mmq_q4_K_moe_pair_raw_vec(
         M, K, n_tokens, n_experts, n_expert_used, stream);
 }
 
+__global__ static void ds4_mmq_iq2_s_get_row_kernel(
+        const block_iq2_s *weights, float *out,
+        uint32_t row, uint32_t row_width) {
+    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= row_width) return;
+    const block_iq2_s *b = weights + (uint64_t)row * (row_width / QK_K) + d / QK_K;
+    const uint32_t q = d & (QK_K - 1);
+    const uint32_t group = q >> 5;
+    const uint32_t lane8 = (q >> 3) & 3u;
+    const uint32_t j = q & 7u;
+    const uint32_t grid_index = b->qs[4u * group + lane8] |
+        (((uint32_t)b->qh[group] << (8u - 2u * lane8)) & 0x300u);
+    const uint64_t grid = iq2s_grid[grid_index];
+    const uint8_t signs = b->qs[QK_K / 8 + 4u * group + lane8];
+    const uint8_t packed_scale = b->scales[group];
+    const uint32_t scale4 = lane8 < 2u ? packed_scale & 15u : packed_scale >> 4;
+    const float scale = __half2float(b->d) * (0.5f + (float)scale4) * 0.25f;
+    const float value = (float)((grid >> (8u * j)) & 0xffu);
+    out[d] = (signs & (1u << j) ? -scale : scale) * value;
+}
+
+extern "C" int ds4_mmq_iq2_s_get_row(
+        const void *W, float *out, uint32_t row, uint32_t row_width,
+        cudaStream_t stream) {
+    if (!W || !out || row_width == 0u || row_width % QK_K != 0u) return -1;
+    ds4_mmq_iq2_s_get_row_kernel<<<(row_width + 255u) / 256u, 256u, 0, stream>>>(
+        (const block_iq2_s *)W, out, row, row_width);
+    const cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4_mmq_iq2_s_get_row: launch failed: %s\n",
+                cudaGetErrorString(err));
+        return -2;
+    }
+    return 0;
+}
+
+extern "C" int ds4_mmq_quant_dense(
+        const void *W, uint32_t weight_type, const float *X, float *out,
+        int M, int N, int K, cudaStream_t stream) {
+#define DS4_MMQ_CASE(type, name) \
+    case type: return ds4_mmq_dense_impl<type>(name, W, X, out, M, N, K, stream)
+    switch ((ggml_type)weight_type) {
+        DS4_MMQ_CASE(GGML_TYPE_Q2_K,    "ds4_mmq_q2_K_dense");
+        DS4_MMQ_CASE(GGML_TYPE_Q4_K,    "ds4_mmq_q4_K_dense");
+        DS4_MMQ_CASE(GGML_TYPE_IQ2_XXS, "ds4_mmq_iq2_xxs_dense");
+        DS4_MMQ_CASE(GGML_TYPE_IQ2_XS,  "ds4_mmq_iq2_xs_dense");
+        DS4_MMQ_CASE(GGML_TYPE_IQ2_S,   "ds4_mmq_iq2_s_dense");
+        DS4_MMQ_CASE(GGML_TYPE_IQ3_XXS, "ds4_mmq_iq3_xxs_dense");
+        DS4_MMQ_CASE(GGML_TYPE_IQ3_S,   "ds4_mmq_iq3_s_dense");
+        DS4_MMQ_CASE(GGML_TYPE_IQ4_XS,  "ds4_mmq_iq4_xs_dense");
+        DS4_MMQ_CASE(GGML_TYPE_Q6_K,    "ds4_mmq_q6_K_dense");
+        /* IQ1_M and IQ1_S are deliberately absent here.  The vendored MMVQ has
+         * kernels for both and the vendored MMQ even has IQ1_S tiles, but the
+         * ds4-side glue only has ds4_mmq_dense_impl specializations for the types
+         * the release trunks use: naming IQ1_S here links and fails on an
+         * undefined mul_mat_q_case<(ggml_type)19>, and IQ1_M has no tiles at all.
+         * Both therefore go through the vector kernels in slices of eight rows
+         * (qwen38_gpu_matvec_rows), which is the path that works; IQ1_S weighs
+         * 0.03 GiB in the mixed file it appears in, so the smaller matmul tiles
+         * cost nothing measurable. */
+        default:
+            fprintf(stderr, "ds4_mmq_quant_dense: unsupported type %u\n", weight_type);
+            return -1;
+    }
+#undef DS4_MMQ_CASE
+}
+
+extern "C" int ds4_mmq_quant_dense_vec(
+        const void *W, uint32_t weight_type, const float *X, float *out,
+        int M, int N, int K, cudaStream_t stream) {
+#define DS4_MMQ_VEC_CASE(type, name) \
+    case type: return ds4_mmq_dense_vec_impl<type>(name, W, X, out, M, N, K, stream)
+    switch ((ggml_type)weight_type) {
+        DS4_MMQ_VEC_CASE(GGML_TYPE_Q2_K,    "ds4_mmq_q2_K_dense_vec");
+        DS4_MMQ_VEC_CASE(GGML_TYPE_Q4_K,    "ds4_mmq_q4_K_dense_vec");
+        DS4_MMQ_VEC_CASE(GGML_TYPE_IQ2_XXS, "ds4_mmq_iq2_xxs_dense_vec");
+        DS4_MMQ_VEC_CASE(GGML_TYPE_IQ2_XS,  "ds4_mmq_iq2_xs_dense_vec");
+        DS4_MMQ_VEC_CASE(GGML_TYPE_IQ2_S,   "ds4_mmq_iq2_s_dense_vec");
+        DS4_MMQ_VEC_CASE(GGML_TYPE_IQ3_XXS, "ds4_mmq_iq3_xxs_dense_vec");
+        DS4_MMQ_VEC_CASE(GGML_TYPE_IQ3_S,   "ds4_mmq_iq3_s_dense_vec");
+        DS4_MMQ_VEC_CASE(GGML_TYPE_IQ4_XS,  "ds4_mmq_iq4_xs_dense_vec");
+        DS4_MMQ_VEC_CASE(GGML_TYPE_IQ1_M,   "ds4_mmq_iq1_m_dense_vec");
+        /* The vendored MMVQ has carried IQ1_S all along, like Q6_K and IQ1_M; the
+         * ds4-side dispatch list was the only thing that never named it. */
+        DS4_MMQ_VEC_CASE(GGML_TYPE_IQ1_S,   "ds4_mmq_iq1_s_dense_vec");
+        DS4_MMQ_VEC_CASE(GGML_TYPE_Q6_K,    "ds4_mmq_q6_K_dense_vec");
+        default:
+            fprintf(stderr, "ds4_mmq_quant_dense_vec: unsupported type %u\n", weight_type);
+            return -1;
+    }
+#undef DS4_MMQ_VEC_CASE
+}
+
 extern "C" int ds4_mmq_q8_0_dense_vec(
         const void * W, const float * X, float * out,
         int M, int N, int K, cudaStream_t stream) {
@@ -4950,7 +5042,22 @@ template void mul_mat_q_case<GGML_TYPE_Q2_K>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_IQ2_XXS>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_IQ2_XS>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_IQ2_S>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_IQ3_XXS>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_IQ3_S>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_IQ4_XS>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_Q4_K>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_MXFP4>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+/* Q6_K was in the vendored kernels all along; only the instantiations the ds4
+ * API exposes were missing.  Needed by the Qwen3.8 MTP draft head when a single
+ * GGUF carries it inside the trunk. */
+template void mul_mat_q_case<GGML_TYPE_Q6_K>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);

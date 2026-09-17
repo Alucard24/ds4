@@ -12,6 +12,11 @@ The default address is `http://127.0.0.1:8000`. Use `--host 0.0.0.0` to listen
 on other interfaces. Restrict access to trusted clients; for an Internet-facing
 deployment, put authentication and TLS in front of the server.
 
+Opening that address in a browser gives a small page with the loaded model, the
+context size, the endpoint list and a chat box, so `GET /` (and `/ui`) answer
+HTML instead of `unknown endpoint`. `GET /health`, `/props`, and `/api/tags`
+answer JSON for clients that probe before connecting.
+
 `--cors` enables browser cross-origin headers. It does not change the listening
 address or provide access control.
 

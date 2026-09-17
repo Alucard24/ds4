@@ -1,5 +1,21 @@
 # Agent Notes
 
+## CUDA Xid incident — standing rule
+
+`docs/CUDA_XID_INCIDENT.md` records two hard machine shutdowns caused by kernels of
+this project faulting out of range (Xid 13 `Out Of Range Address` from `name=ds4`,
+then Xid 43 channel resets, then Xid 79 "GPU has fallen off the bus" and Xid 154
+"OS Reboot"). The fault is **not fixed**.
+
+Therefore, on the owner's machine:
+
+- **No GPU or model run without the owner's explicit approval for that specific
+  run**, and never a sequence, a sweep or a retry loop. Ask first, every time.
+- **The first error, warning or unexpected device message stops the work.** Report
+  it; do not interpret it as noise and continue. Every continuation after the first
+  `CUDA init set device failed` on 2026-09-15 belongs to the second shutdown.
+- Propose a single, watched run at most, and say what it will cost before asking.
+
 `ds4.c` is a DeepSeek V4 Flash specific inference engine. It is not a generic
 GGUF runner. The goal is a small, readable, high-performance C codebase with
 Objective-C only where Metal requires it and Metal kernels under `metal/`.

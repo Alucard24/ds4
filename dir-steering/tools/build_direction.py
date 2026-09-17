@@ -26,6 +26,8 @@ MODEL_PROFILES = {
     "deepseek-v4-flash": (43, 4096),
     "glm-5.3-flash": (45, 4096),
     "qwen3.8-flash-next": (48, 2560),
+    # The separate MTP block is not part of the direction matrix.
+    "qwen3.8-27b": (64, 5120),
 }
 
 
@@ -65,6 +67,7 @@ def run_capture(
     n_layer: int,
     n_embd: int,
     work: Path,
+    qwen: bool = False,
 ) -> list[list[float]]:
     """Run ds4 once and return the last prompt-row dump for every layer."""
     prompt_path = work / "prompt.txt"
@@ -76,6 +79,15 @@ def run_capture(
     env["DS4_METAL_GRAPH_DUMP_NAME"] = component
     env["DS4_METAL_GRAPH_DUMP_POS"] = "0"
     env["DS4_QWEN4_PREFILL_CHUNK"] = str(max(ctx, 1024))
+    if qwen:
+        # Qwen emits one last-row dump per chunk. With -n 1 and no MTP the CLI
+        # samples but does not evaluate its output token. Pick the final prefill
+        # chunk, including prompts longer than the chunk cap.
+        for key in list(env):
+            if key.startswith("DS4_ROCM_GRAPH_DUMP_") or key in (
+                "DS4_METAL_GRAPH_DUMP_POS", "DS4_METAL_GRAPH_DUMP_LAYER"
+            ):
+                env.pop(key)
 
     cmd = [
         str(ds4),
@@ -97,12 +109,20 @@ def run_capture(
     rows: list[list[float]] = []
     for layer in range(n_layer):
         path = work / f"dump_{component}-{layer}_pos0.bin"
+        if qwen:
+            paths = list(work.glob(f"dump_{component}-{layer}_pos*.bin"))
+            if not paths:
+                raise RuntimeError(f"missing {component} capture for layer {layer}")
+            path = max(paths, key=lambda p: int(p.stem.rsplit("_pos", 1)[1]))
         data = array.array("f")
         with path.open("rb") as f:
             data.fromfile(f, path.stat().st_size // 4)
         if len(data) < n_embd or len(data) % n_embd != 0:
             raise RuntimeError(f"bad dump shape for {path}: {len(data)} floats")
-        rows.append(list(data[-n_embd:]))
+        row = list(data[-n_embd:])
+        if not all(math.isfinite(x) for x in row):
+            raise RuntimeError(f"non-finite capture in {path}")
+        rows.append(row)
     return rows
 
 
@@ -134,6 +154,7 @@ def main() -> None:
     ap.add_argument("--component", default="ffn_out",
                     choices=("ffn_out", "attn_out"),
                     help="runtime-editable activation stream at the profile's embedding width")
+                    help="runtime-editable hidden-width activation stream")
     ap.add_argument("--think", action="store_true",
                     help="capture after <think>; default captures direct answers")
     ap.add_argument("--pair-normalize", action="store_true",
@@ -165,9 +186,11 @@ def main() -> None:
             gw.mkdir()
             bw.mkdir()
             good_rows = run_capture(ds4, model, good, args.system, args.think,
-                                    args.ctx, args.component, n_layer, n_embd, gw)
+                                    args.ctx, args.component, n_layer, n_embd, gw,
+                                    qwen=args.profile == "qwen3.8-27b")
             bad_rows = run_capture(ds4, model, bad, args.system, args.think,
-                                   args.ctx, args.component, n_layer, n_embd, bw)
+                                   args.ctx, args.component, n_layer, n_embd, bw,
+                                   qwen=args.profile == "qwen3.8-27b")
             add_rows(good_sum, good_rows, n_layer)
             add_rows(bad_sum, bad_rows, n_layer)
             if args.pair_normalize:
@@ -206,6 +229,7 @@ def main() -> None:
         "shape": [n_layer, n_embd],
         "profile": args.profile,
         "component": args.component,
+        "capture": "last-prompt-row" if args.profile == "qwen3.8-27b" else "pos0-last-row",
         "thinking": bool(args.think),
         "pair_normalize": bool(args.pair_normalize),
         "orthogonalize_control_mean": not args.no_orthogonalize,
