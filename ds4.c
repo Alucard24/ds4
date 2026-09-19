@@ -5760,6 +5760,12 @@ static void qwen4_cpu_dot_iq2_s_q8k_vnni_batch(const void *row, const block_q8_K
     const __m512i bitpat = _mm512_set1_epi64((long long)0x8040201008040201ULL);
     const __m512i bcast = _mm512_broadcast_i32x4(_mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8, 8, 8, 8, 8));
     pthread_once(&g_qwen4_sc16_once, qwen4_cpu_sc16_init);
+    /* The row is streamed once per call and is the thing that evicts the
+     * activations from the shared L2 (measured wall: ~165 GMAC/s aggregate, L3
+     * bandwidth).  NTA prefetch marks its lines evict-first in L2/L3, so the
+     * activations - re-read for every one of the k_ff rows - keep residency. */
+    for (uint32_t off = 0; off < nb * (uint32_t)sizeof(block_iq2_s); off += 64u)
+        _mm_prefetch((const char *)row + off, _MM_HINT_NTA);
     __m512i acc[16];
     float sumf[16];
     for (uint32_t b = 0; b < n; b++) { acc[b] = _mm512_setzero_si512(); sumf[b] = 0.0f; }
