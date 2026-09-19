@@ -109,8 +109,71 @@ static int g_model_device_owned;
 static int g_model_range_mapping_supported = 1;
 static int g_model_hmm_direct;
 static int g_model_fd = -1;
+
+static int cuda_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset);
+
 static const void *g_model_fd_host_base;
 static int g_model_direct_fd = -1;
+
+/* Split-GGUF shard table for file-backed reads. Global reservation offsets
+ * translate to (fd, file-local offset) here; single-file models leave
+ * n_shards at 0 and keep the legacy g_model_fd path byte for byte. */
+#define DS4_CUDA_MAX_SHARDS 16
+static int g_model_shard_fds[DS4_CUDA_MAX_SHARDS];
+static uint64_t g_model_shard_sizes[DS4_CUDA_MAX_SHARDS];
+static uint64_t g_model_shard_bases[DS4_CUDA_MAX_SHARDS];
+static uint32_t g_model_n_shards = 0;
+
+static void cuda_model_shards_reset(void) {
+    for (uint32_t i = 0; i < DS4_CUDA_MAX_SHARDS; i++) g_model_shard_fds[i] = -1;
+    g_model_n_shards = 0;
+}
+
+extern "C" int ds4_gpu_set_model_shards(const int *fds, const uint64_t *sizes,
+                                          const uint64_t *bases, uint32_t n) {
+    cuda_model_shards_reset();
+    /* n == 0 clears the table (single-file models publish no shards). */
+    if (n == 0) return 1;
+    if (!fds || !sizes || !bases || n < 2 || n > DS4_CUDA_MAX_SHARDS) return 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (fds[i] < 0) { cuda_model_shards_reset(); return 0; }
+        g_model_shard_fds[i] = fds[i];
+        g_model_shard_sizes[i] = sizes[i];
+        g_model_shard_bases[i] = bases[i];
+    }
+    g_model_n_shards = n;
+    /* The O_DIRECT fd cached for shard 0 addresses the wrong file for the
+     * other shards; plain pread below stays correct across all of them. */
+    if (g_model_direct_fd >= 0) {
+        (void)close(g_model_direct_fd);
+        g_model_direct_fd = -1;
+    }
+    return 1;
+}
+
+/* pread across shard files: global reservation offsets become per-shard
+ * (fd, local offset) segments. Returns 1 on a full read, 0 with errno set. */
+static int cuda_pread_sharded(void *buf, uint64_t offset, uint64_t bytes) {
+    uint8_t *p = (uint8_t *)buf;
+    uint64_t off = offset, left = bytes;
+    while (left > 0) {
+        uint32_t s = 0;
+        while (s < g_model_n_shards &&
+               (off < g_model_shard_bases[s] ||
+                off >= g_model_shard_bases[s] + g_model_shard_sizes[s])) {
+            s++;
+        }
+        if (s >= g_model_n_shards) { errno = EIO; return 0; }
+        uint64_t seg = g_model_shard_bases[s] + g_model_shard_sizes[s] - off;
+        if (seg > left) seg = left;
+        if (!cuda_pread_full(g_model_shard_fds[s], p, seg, off - g_model_shard_bases[s]))
+            return 0;
+        p += seg;
+        off += seg;
+        left -= seg;
+    }
+    return 1;
+}
 static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
 static int g_model_cache_full;
@@ -2301,6 +2364,13 @@ static int cuda_model_stage_read_from(int fd, int *direct_fd, uint64_t align,
 static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
                                  uint64_t offset, uint64_t bytes,
                                  const char **payload) {
+    /* Split models address shards, not one file: translate global offsets.
+     * The stage pool always holds a full chunk, so a direct fill is safe. */
+    if (g_model_n_shards > 1) {
+        if (bytes > stage_bytes) { errno = EINVAL; return 0; }
+        *payload = (const char *)stage;
+        return cuda_pread_sharded(stage, offset, bytes);
+    }
     return cuda_model_stage_read_from(g_model_fd, &g_model_direct_fd,
         g_model_direct_align, g_model_file_size, stage, stage_bytes, offset, bytes, payload);
 }
@@ -2528,6 +2598,19 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     return (char *)dev;
 }
 
+/* Rewind bump-allocator watermarks after a failed range fill, freeing any
+ * arenas the failed fill created. Without this a failed range keeps its
+ * arena space and later ranges die with a bogus out-of-memory. */
+static void cuda_model_arena_rewind(const std::vector<uint64_t> &mark) {
+    while (g_model_arenas.size() > mark.size()) {
+        (void)cudaFree(g_model_arenas.back().device_ptr);
+        g_model_arenas.pop_back();
+    }
+    for (size_t i = 0; i < mark.size() && i < g_model_arenas.size(); i++) {
+        if (g_model_arenas[i].used > mark[i]) g_model_arenas[i].used = mark[i];
+    }
+}
+
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
@@ -2566,6 +2649,12 @@ static const char *cuda_model_range_ptr_from_fd(
         }
         return cuda_model_ptr(model_map, offset);
     }
+    /* Bump-allocator watermark: every post-alloc failure below must rewind
+     * it, or a failed range eats arena space and surfaces later as a bogus
+     * out-of-memory (seen when shard reads failed during boot). */
+    std::vector<uint64_t> arena_mark;
+    arena_mark.reserve(g_model_arenas.size());
+    for (const cuda_model_arena &a : g_model_arenas) arena_mark.push_back(a.used);
     cudaError_t err = cudaSuccess;
 
     const uint64_t chunk = cuda_model_copy_chunk_bytes();
@@ -2583,6 +2672,7 @@ static const char *cuda_model_range_ptr_from_fd(
                 fprintf(stderr, "ds4: CUDA model staging wait failed for %s: %s\n",
                         what ? what : "weights", cudaGetErrorString(err));
                 (void)cudaGetLastError();
+                cuda_model_arena_rewind(arena_mark);
                 return NULL;
             }
         }
@@ -2593,6 +2683,7 @@ static const char *cuda_model_range_ptr_from_fd(
                     what ? what : "weights",
                     (double)copied / 1048576.0,
                     strerror(errno));
+            cuda_model_arena_rewind(arena_mark);
             return NULL;
         }
         err = cudaMemcpyAsync(dev + copied, payload, (size_t)n,
@@ -2603,6 +2694,7 @@ static const char *cuda_model_range_ptr_from_fd(
                     (double)copied / 1048576.0,
                     cudaGetErrorString(err));
             (void)cudaGetLastError();
+            cuda_model_arena_rewind(arena_mark);
             return NULL;
         }
         err = cudaEventRecord(g_model_stage_event[bi], g_model_upload_stream);
@@ -2610,6 +2702,7 @@ static const char *cuda_model_range_ptr_from_fd(
             fprintf(stderr, "ds4: CUDA model staging record failed for %s: %s\n",
                     what ? what : "weights", cudaGetErrorString(err));
             (void)cudaGetLastError();
+            cuda_model_arena_rewind(arena_mark);
             return NULL;
         }
         cuda_model_drop_file_pages(offset + copied, n);
@@ -2623,6 +2716,7 @@ static const char *cuda_model_range_ptr_from_fd(
         fprintf(stderr, "ds4: CUDA model range upload sync failed for %s: %s\n",
                 what ? what : "weights", cudaGetErrorString(err));
         (void)cudaGetLastError();
+        cuda_model_arena_rewind(arena_mark);
         return NULL;
     }
 
@@ -3104,6 +3198,10 @@ extern "C" void ds4_gpu_cleanup(void) {
         (void)cudaStreamDestroy(g_model_prefetch_stream);
         g_model_prefetch_stream = NULL;
     }
+    /* Release the CUDA context before the caller unmaps the model: driver
+     * threads and UVA references must be gone, or unmapping faults teardown
+     * (teardown SIGSEGV). Re-init recreates it if the process continues. */
+    (void)cudaDeviceReset();
 }
 
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
@@ -3335,6 +3433,20 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, con
                      "tensor write");
     }
     return ok;
+}
+
+extern "C" void *ds4_gpu_host_alloc(uint64_t bytes) {
+    if (bytes == 0) return NULL;
+    void *p = NULL;
+    if (cudaMallocHost(&p, (size_t)bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    return p;
+}
+
+extern "C" void ds4_gpu_host_free(void *ptr) {
+    if (ptr) (void)cudaFreeHost(ptr);
 }
 
 extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
@@ -3885,6 +3997,65 @@ extern "C" int ds4_gpu_pack_slot_rows_f32_tensor(
             n_slots,
             slot_cap);
     return cuda_ok(cudaGetLastError(), "pack_slot_rows_f32 launch");
+}
+
+/* ------------------------------------------------------------------------
+ * Event-based GPU stage profiler (diagnostic, DS4_QWEN4_TIMING=4).
+ *
+ * The qwen4 graph records one event per stage boundary on stream 0; a report
+ * syncs once when the pool fills and prints the per-stage GPU ms/token
+ * measured between consecutive events (stage 6 marks the token start, so its
+ * delta from the previous stage 5 is the output head).  Recording events
+ * costs a few us/token and no sync, so the pipeline timing is unperturbed.
+ * ------------------------------------------------------------------------ */
+#define DS4_GPU_PROF_STAGES 32
+#define DS4_GPU_PROF_MAX 20000
+static cudaEvent_t g_prof_ev[DS4_GPU_PROF_MAX];
+static uint8_t g_prof_stage[DS4_GPU_PROF_MAX];
+static uint32_t g_prof_n;
+static int g_prof_on = -1;
+static double g_prof_sum[DS4_GPU_PROF_STAGES];
+static uint64_t g_prof_cnt[DS4_GPU_PROF_STAGES];
+static uint64_t g_prof_tokens;
+
+extern "C" int ds4_gpu_prof_mark(int stage) {
+    if (g_prof_on < 0) {
+        const char *tv = getenv("DS4_QWEN4_TIMING");
+        g_prof_on = tv && atoi(tv) >= 4 ? 1 : 0;
+    }
+    if (!g_prof_on) return 0;
+    if (stage == 6) g_prof_tokens++;
+    if (g_prof_n >= DS4_GPU_PROF_MAX - 8u) {
+        cudaDeviceSynchronize();
+        for (uint32_t i = 1; i < g_prof_n; i++) {
+            float ms = 0.0f;
+            if (cudaEventElapsedTime(&ms, g_prof_ev[i - 1], g_prof_ev[i]) == cudaSuccess &&
+                g_prof_stage[i] < DS4_GPU_PROF_STAGES) {
+                g_prof_sum[g_prof_stage[i]] += ms;
+                g_prof_cnt[g_prof_stage[i]]++;
+            }
+        }
+        const double n = g_prof_tokens ? (double)g_prof_tokens : 1.0;
+        fprintf(stderr,
+                "ds4: gpu stage ms/token over %llu tok: ple=%.2f hc_attn=%.2f gdn=%.2f attn=%.2f "
+                "hc_ffn=%.2f moe=%.2f head=%.2f | gdn pair=%.2f front=%.2f scan=%.2f out=%.2f "
+                "lin_out=%.2f\n",
+                (unsigned long long)g_prof_tokens,
+                g_prof_sum[0] / n, g_prof_sum[1] / n, g_prof_sum[2] / n, g_prof_sum[3] / n,
+                g_prof_sum[4] / n, g_prof_sum[5] / n, g_prof_sum[6] / n,
+                g_prof_sum[8] / n, g_prof_sum[9] / n, g_prof_sum[10] / n, g_prof_sum[11] / n,
+                g_prof_sum[12] / n);
+        for (uint32_t i = 0; i < g_prof_n; i++) cudaEventDestroy(g_prof_ev[i]);
+        g_prof_n = 0;
+        g_prof_tokens = 0;
+        memset(g_prof_sum, 0, sizeof(g_prof_sum));
+        memset(g_prof_cnt, 0, sizeof(g_prof_cnt));
+    }
+    if (cudaEventCreate(&g_prof_ev[g_prof_n]) != cudaSuccess) return 0;
+    g_prof_stage[g_prof_n] = (uint8_t)stage;
+    cudaEventRecord(g_prof_ev[g_prof_n], 0);
+    g_prof_n++;
+    return 1;
 }
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }

@@ -110,7 +110,7 @@ static int run_fixture(int bad_layout) {
 static void check_model_layout(const char *path) {
     ds4_model m;
     model_open(&m, path, false, false);
-    config_validate_model(&m);
+    config_validate_model(&m, false);
     assert(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41);
     ds4_weights w;
     weights_bind(&w, &m, false, 0, UINT32_MAX, true, false);

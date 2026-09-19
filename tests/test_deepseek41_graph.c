@@ -81,7 +81,7 @@ static int check_batch_head(const char *path) {
     ds4_gpu_tensor *input = NULL, *output = NULL, *scalar = NULL, *row = NULL;
     int rc = 1;
     model_open(&model, path, true, false);
-    config_validate_model(&model);
+    config_validate_model(&model, false);
     REQUIRE(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41);
     weights_bind(&weights, &model, false, 0, UINT32_MAX, true, false);
     const ds4_tensor *head = weights.output;
@@ -156,7 +156,7 @@ static int check_attention_layouts(const char *path) {
     ds4_model model = {.fd = -1};
     ds4_weights weights = {0};
     model_open(&model, path, true, false);
-    config_validate_model(&model);
+    config_validate_model(&model, false);
     assert(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41);
     weights_bind(&weights, &model, false, 0, UINT32_MAX, true, false);
     const uint32_t layers[] = {0, 39};
@@ -718,7 +718,7 @@ static int check_chat(const char *path, const char *level, const char *system, c
     else if (!strcmp(level, "max")) mode = DS4_THINK_MAX;
     else if (!ds4_think_mode_parse_level(level, &mode)) return 2;
     model_open(&model, path, true, false);
-    config_validate_model(&model);
+    config_validate_model(&model, false);
     vocab_load(&engine.vocab, &model);
     REQUIRE(ds4_engine_is_deepseek41(&engine));
     REQUIRE(ds4_think_mode_for_context(mode, 256) == mode);
@@ -1493,7 +1493,7 @@ static int check_partitions(const char *path) {
     float *expected = NULL, *actual = NULL, *first = NULL;
     int rc = 1;
     model_open(&model, path, true, false);
-    config_validate_model(&model);
+    config_validate_model(&model, false);
     REQUIRE(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41);
     weights_bind(&weights, &model, false, 0, UINT32_MAX, true, false);
     ds4_gpu_model_residency_skip(1);
@@ -1657,7 +1657,7 @@ static int check_memory_plan(const char *path) {
     const uint64_t saved_shard = g_tp_shard_model_bytes;
     int rc = 1;
     model_open(&e.model, path, true, false);
-    config_validate_model(&e.model);
+    config_validate_model(&e.model, false);
     REQUIRE(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41);
     REQUIRE(ds41_prefill_limit(8191) == 2048u);
     REQUIRE(ds41_prefill_limit(8192) == 4096u);
@@ -1995,7 +1995,7 @@ int main(int argc, char **argv) {
     ds4_model_map_span_vec spans = {0};
     uint64_t *offsets = NULL, *sizes = NULL;
     model_open(&model, argv[1], true, false);
-    config_validate_model(&model);
+    config_validate_model(&model, false);
     REQUIRE(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41);
     weights_bind(&weights, &model, false, 0, UINT32_MAX, true, false);
     vocab_load(&vocab, &model);

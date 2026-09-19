@@ -5000,6 +5000,7 @@ extern "C" int ds4_mmq_quant_dense_vec(
     switch ((ggml_type)weight_type) {
         DS4_MMQ_VEC_CASE(GGML_TYPE_Q2_K,    "ds4_mmq_q2_K_dense_vec");
         DS4_MMQ_VEC_CASE(GGML_TYPE_Q4_K,    "ds4_mmq_q4_K_dense_vec");
+        DS4_MMQ_VEC_CASE(GGML_TYPE_Q5_K,    "ds4_mmq_q5_K_dense_vec");
         DS4_MMQ_VEC_CASE(GGML_TYPE_IQ2_XXS, "ds4_mmq_iq2_xxs_dense_vec");
         DS4_MMQ_VEC_CASE(GGML_TYPE_IQ2_XS,  "ds4_mmq_iq2_xs_dense_vec");
         DS4_MMQ_VEC_CASE(GGML_TYPE_IQ2_S,   "ds4_mmq_iq2_s_dense_vec");

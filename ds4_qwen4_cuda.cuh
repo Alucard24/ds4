@@ -362,7 +362,16 @@ static uint64_t row_bytes(uint32_t type, uint64_t n) {
     case 39: return n % 32 ? 0 : n / 32 * 17;
     case 10: return n % 256 ? 0 : n / 256 * 84;
     case 12: return n % 256 ? 0 : n / 256 * 144;
+    case 13: return n % 256 ? 0 : n / 256 * 176;
+    case 14: return n % 256 ? 0 : n / 256 * 210;
     case 16: return n % 256 ? 0 : n / 256 * 66;
+    case 17: return n % 256 ? 0 : n / 256 * 74;
+    case 18: return n % 256 ? 0 : n / 256 * 98;
+    case 20: return n % 32 ? 0 : n / 32 * 18;
+    case 21: return n % 256 ? 0 : n / 256 * 110;
+    case 22: return n % 256 ? 0 : n / 256 * 82;
+    case 23: return n % 256 ? 0 : n / 256 * 136;
+    case 42: return n % 64 ? 0 : n / 64 * 18;
     default: return 0;
     }
 }
@@ -454,6 +463,135 @@ __device__ __forceinline__ float value(const char *row, unsigned i,
         if (signs & (1u << (j & 7))) v = -v;
         return dev_f16_to_f32(b->d) * (.5f + (signs_scale >> 28)) * .25f * v;
     }
+    /* Q6_K (Unsloth dense): low 4 bits in ql, high 2 bits in qh, one int8
+     * scale per 16 values. Same unpacking as the host ds4_vec_dot_q6_K_f32. */
+    if (TYPE == 14) {
+        const uint8_t *b = (const uint8_t *)row + (i / 256) * 210;
+        const unsigned j = i % 256, h = j / 128, l = j & 31, s = (j >> 5) & 3;
+        const uint8_t *ql = b + (uint64_t)h * 64u, *qh = b + 128u + (uint64_t)h * 32u;
+        const int8_t *sc = (const int8_t *)(b + 192u + (uint64_t)h * 8u);
+        unsigned low, high;
+        if (s == 0) { low = ql[l] & 15u; high = (qh[l] >> 0) & 3u; }
+        else if (s == 1) { low = ql[l + 32] & 15u; high = (qh[l] >> 2) & 3u; }
+        else if (s == 2) { low = ql[l] >> 4; high = (qh[l] >> 4) & 3u; }
+        else { low = ql[l + 32] >> 4; high = (qh[l] >> 6) & 3u; }
+        uint16_t dh;
+        memcpy(&dh, b + 208, 2);
+        return dev_f16_to_f32(dh) * (float)sc[l / 16 + 2 * s] *
+            (float)((int)(low | (high << 4)) - 32);
+    }
+    /* IQ2_S (Unsloth gate/up experts): mirrors ds4_dequant_row_iq2_s.
+     * Superblock: f16 d, 64 qs bytes, 8 qh bytes, 8 scale bytes. */
+    if (TYPE == 22) {
+        const uint8_t *b = (const uint8_t *)row + (i / 256) * 82;
+        const unsigned j = i % 256, ib = j / 32, l = (j % 32) / 8, sub = j % 8;
+        uint16_t dh;
+        memcpy(&dh, b, 2);
+        const float d = dev_f16_to_f32(dh);
+        const uint8_t sc = b[74 + ib];
+        const float dl = d * (0.5f + (float)(l < 2 ? (sc & 15u) : (sc >> 4))) * 0.25f;
+        const unsigned gi = (unsigned)b[2 + ib * 4 + l] | (((unsigned)b[66 + ib] >> (2 * l)) & 3u) << 8;
+        const float v = (float)((cuda_iq2s_grid[gi] >> (8 * sub)) & 0xFFu);
+        const unsigned sgn = (b[34 + ib * 4 + l] >> sub) & 1u;
+        return dl * (sgn ? -v : v);
+    }
+    /* IQ4_NL (Unsloth down experts): f16 scale + 16 nibble bytes over the
+     * fixed grid, low nibble first. Mirrors ds4_dequant_row_iq4_nl. */
+    if (TYPE == 20) {
+        const uint8_t *b = (const uint8_t *)row + (i / 32) * 18;
+        const unsigned j = i % 32;
+        uint16_t dh;
+        memcpy(&dh, b, 2);
+        const unsigned q = j < 16 ? (b[2 + j] & 15u) : (b[2 + j - 16] >> 4);
+        return dev_f16_to_f32(dh) * (float)cuda_iq4nl_values[q];
+    }
+    /* IQ3_S (Unsloth layer-2 gate/up): mirrors ds4_dequant_row_iq3_s.
+     * One scale byte per 64 values, low nibble for the first 32. */
+    if (TYPE == 21) {
+        const uint8_t *b = (const uint8_t *)row + (i / 256) * 110;
+        const unsigned j = i % 256, ib = j / 64, r = j % 64, g = r / 32;
+        const unsigned l = (r % 32) / 8, q = (r % 8) / 4, sub = r % 4;
+        uint16_t dh;
+        memcpy(&dh, b, 2);
+        const float d = dev_f16_to_f32(dh);
+        const uint8_t sc = b[106 + ib];
+        const float db = d * (1.0f + 2.0f * (float)(g == 0 ? (sc & 15u) : (sc >> 4)));
+        const unsigned qs = b[2 + ib * 16 + g * 8 + 2 * l + q];
+        const unsigned qh = b[66 + ib * 2 + g];
+        const unsigned shift = q == 0 ? (8 - 2 * l) : (7 - 2 * l);
+        const uint32_t grid = cuda_iq3s_grid[qs | ((qh << shift) & 256u)];
+        const float v = (float)((grid >> (8 * sub)) & 0xFFu);
+        const unsigned sgn = (b[74 + ib * 8 + g * 4 + l] >> (q * 4 + sub)) & 1u;
+        return db * v * (sgn ? -1.0f : 1.0f);
+    }
+    /* Q5_K (Unsloth ISTA dense/head): mirrors ds4_vec_dot_q5_K_f32. */
+    if (TYPE == 13) {
+        const uint8_t *b = (const uint8_t *)row + (i / 256) * 176;
+        const unsigned j = i % 256, g = j / 32, l = j % 32;
+        uint16_t dh, dmh;
+        memcpy(&dh, b, 2);
+        memcpy(&dmh, b + 2, 2);
+        unsigned sc, mn;
+        if (g < 4) { sc = b[4 + g] & 63u; mn = b[4 + g + 4] & 63u; }
+        else {
+            sc = (b[4 + g + 4] & 15u) | ((b[4 + g - 4] >> 6) << 4);
+            mn = (b[4 + g + 4] >> 4) | ((b[4 + g] >> 6) << 4);
+        }
+        const unsigned base = (g >> 1) * 32u, shift = (g & 1u) * 4u;
+        const unsigned q = ((b[48 + base + l] >> shift) & 15u) | (((b[16 + l] >> g) & 1u) << 4);
+        return dev_f16_to_f32(dh) * (float)sc * (float)q -
+               dev_f16_to_f32(dmh) * (float)mn;
+    }
+    /* IQ2_XS (Unsloth ISTA experts): mirrors ds4_dequant_row_iq2_xs. */
+    if (TYPE == 17) {
+        const uint8_t *b = (const uint8_t *)row + (i / 256) * 74;
+        const unsigned j = i % 256, ib = j / 32, l = (j % 32) / 8, sub = j % 8;
+        uint16_t dh, q;
+        memcpy(&dh, b, 2);
+        memcpy(&q, b + 2 + (uint64_t)(ib * 4 + l) * 2u, 2);
+        const float d = dev_f16_to_f32(dh);
+        const uint8_t sc = b[66 + ib];
+        const float dl = d * (0.5f + (float)(l < 2 ? (sc & 15u) : (sc >> 4))) * 0.25f;
+        const float v = (float)((cuda_iq2xs_grid[q & 511u] >> (8 * sub)) & 0xFFu);
+        const unsigned sgn = (cuda_ksigns_iq2xs[q >> 9] >> sub) & 1u;
+        return dl * (sgn ? -v : v);
+    }
+    /* IQ3_XXS (Unsloth ISTA experts): mirrors ds4_dequant_row_iq3_xxs. */
+    if (TYPE == 18) {
+        const uint8_t *b = (const uint8_t *)row + (i / 256) * 98;
+        const unsigned j = i % 256, ib = j / 32, l = (j % 32) / 8, q = (j % 8) / 4, sub = j % 4;
+        uint16_t dh;
+        memcpy(&dh, b, 2);
+        const float d = dev_f16_to_f32(dh);
+        uint32_t aux;
+        memcpy(&aux, b + 66 + ib * 4, 4);
+        const float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+        const unsigned gi = b[2 + ib * 8 + 2 * l + q];
+        const float v = (float)((cuda_iq3xxs_grid[gi] >> (8 * sub)) & 0xFFu);
+        const unsigned sgn = (cuda_ksigns_iq2xs[(aux >> (7 * l)) & 127u] >> (q * 4 + sub)) & 1u;
+        return db * v * (sgn ? -1.0f : 1.0f);
+    }
+    /* IQ4_XS (Unsloth UD-IQ4_XS/ISTA experts): mirrors ds4_dequant_row_iq4_xs. */
+    if (TYPE == 23) {
+        const uint8_t *b = (const uint8_t *)row + (i / 256) * 136;
+        const unsigned j = i % 256, ib = j / 32, r = j % 32;
+        uint16_t dh, sh;
+        memcpy(&dh, b, 2);
+        memcpy(&sh, b + 2, 2);
+        const unsigned ls = ((b[4 + ib / 2] >> (4 * (ib % 2))) & 15u) | (((sh >> (2 * ib)) & 3u) << 4);
+        const float dl = dev_f16_to_f32(dh) * ((float)ls - 32.0f);
+        const unsigned q = r < 16 ? (b[8 + ib * 16 + r] & 15u) : (b[8 + ib * 16 + r - 16] >> 4);
+        return dl * (float)cuda_iq4nl_values[q];
+    }
+    /* Q2_0 (Unsloth ISTA down experts): ggml layout, 00=-1..11=+2. */
+    if (TYPE == 42) {
+        const uint8_t *b = (const uint8_t *)row + (i / 64) * 18;
+        const unsigned j = i % 64;
+        uint16_t dh;
+        memcpy(&dh, b, 2);
+        const unsigned q = (b[2 + j / 4] >> ((j % 4) * 2)) & 3u;
+        return dev_f16_to_f32(dh) * (float)((int)q - 1);
+    }
     return 0;
 }
 
@@ -463,7 +601,14 @@ __device__ __forceinline__ float scalar(const char *row, unsigned i, unsigned ty
     case 1: return value<1>(row, i);
     case 2: return value<2>(row, i);
     case 8: return value<8>(row, i);
+    case 12: return value<12>(row, i);
+    case 13: return value<13>(row, i);
+    case 14: return value<14>(row, i);
+    case 20: return value<20>(row, i);
+    case 21: return value<21>(row, i);
+    case 23: return value<23>(row, i);
     case 30: return value<30>(row, i);
+    case 42: return value<42>(row, i);
     case 39: return value<39>(row, i);
     default: return 0;
     }
@@ -514,6 +659,31 @@ __device__ __forceinline__ float4 value4(const char *row, unsigned i,
         #pragma unroll
         for (unsigned k = 0; k < 4; k++) {
             v[k] = scale*(float)(int8_t)(packed>>(8*k));
+        }
+    } else if (TYPE == 14) {
+        /* Q6_K prefill tiles: four scalar reads. Correct for any i, which
+         * the 4-wide callers do not guarantee at row tails. */
+        #pragma unroll
+        for (unsigned k = 0; k < 4; k++) v[k] = value<14>(row, i + k, grid_table, sign_table);
+    } else if (TYPE == 13 || TYPE == 21 || TYPE == 23) {
+        /* ISTA dense tiles (Q5_K/IQ3_S/IQ4_XS): same scalar delegation. */
+        #pragma unroll
+        for (unsigned k = 0; k < 4; k++) {
+            if (TYPE == 13) v[k] = value<13>(row, i + k, grid_table, sign_table);
+            else if (TYPE == 21) v[k] = value<21>(row, i + k, grid_table, sign_table);
+            else v[k] = value<23>(row, i + k, grid_table, sign_table);
+        }
+    } else if (TYPE == 20 || TYPE == 22 || TYPE == 17 || TYPE == 18 || TYPE == 42) {
+        /* Unsloth MoE tiles (IQ4_NL down, IQ2_S/IQ2_XS/IQ3_S gate/up,
+         * IQ3_XXS, Q2_0): scalar delegation keeps the tiled prefill
+         * bit-close to the decode path (full FP32, no half rounding). */
+        #pragma unroll
+        for (unsigned k = 0; k < 4; k++) {
+            if (TYPE == 20) v[k] = value<20>(row, i + k, grid_table, sign_table);
+            else if (TYPE == 22) v[k] = value<22>(row, i + k, grid_table, sign_table);
+            else if (TYPE == 17) v[k] = value<17>(row, i + k, grid_table, sign_table);
+            else if (TYPE == 18) v[k] = value<18>(row, i + k, grid_table, sign_table);
+            else v[k] = value<42>(row, i + k, grid_table, sign_table);
         }
     } else if (TYPE == 10 || TYPE == 12) {
         const unsigned j = i%256;
@@ -608,6 +778,61 @@ __global__ void router(int *selected, float *weights, const float *logits,
     if (tid < NS) weights[(uint64_t)t * NS + tid] /= red[tid];
 }
 
+template<unsigned TYPE>
+__global__ void moe_mv_v2_mid(float *out, const float *x, const int *selected,
+        const char *w0, const char *w1,
+        unsigned NE, unsigned NS, unsigned K, unsigned M,
+        uint64_t rb) {
+    /* Staged decode MoE mid (Unsloth gate/up types, T=1): one block per
+     * (4-row group, slot). Phase 1 cooperatively dequantizes gate+up
+     * superblocks to smem with all 128 threads (scalar value<> helpers:
+     * exact by construction); phase 2 vec-dots the 4 rows from smem with
+     * no dependent LUT chains in the hot loop, then silu(a)*b per row.
+     * Targets the latency-bound profile (low power + low mem util +
+     * high SM util) instead of redundant-fetch micro-tweaks. */
+    const unsigned row4 = blockIdx.x * 4, slot = blockIdx.y, t = blockIdx.z;
+    if (slot >= NS) return; /* routed slots only; shared stays on moe_mv */
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 31, warp = tid / 32;
+    const uint64_t pair = (uint64_t)t * NS + slot;
+    const float *xt = x + t * K;
+    const int e = selected[(uint64_t)t * NS + slot];
+    __shared__ float tg[4][256], tu[4][256];
+    const bool valid = e >= 0 && (unsigned)e < NE;
+    float sumA = 0, sumB = 0;
+    for (unsigned s = 0; s < (unsigned)K; s += 256) {
+        /* Phase 1: all 128 threads dequantize gate+up superblocks. */
+        for (unsigned q = tid; q < 1024; q += 128) {
+            const unsigned r = q / 256, k = q % 256, gi = s + k;
+            const unsigned row = row4 + r;
+            float gv = 0, uv = 0;
+            if (valid && row < M && gi < (unsigned)K) {
+                gv = value<TYPE>(w0 + ((uint64_t)e * M + row) * rb, gi, NULL, NULL);
+                uv = value<TYPE>(w1 + ((uint64_t)e * M + row) * rb, gi, NULL, NULL);
+            }
+            tg[r][k] = gv;
+            tu[r][k] = uv;
+        }
+        __syncthreads();
+        /* Phase 2: each warp dots its row from smem (8 vals/lane). */
+        #pragma unroll
+        for (unsigned k = lane * 4; k < 256; k += 128) {
+            float x0 = xt[s + k], x1 = xt[s + k + 1];
+            float x2 = xt[s + k + 2], x3 = xt[s + k + 3];
+            sumA += tg[warp][k] * x0 + tg[warp][k + 1] * x1 +
+                    tg[warp][k + 2] * x2 + tg[warp][k + 3] * x3;
+            sumB += tu[warp][k] * x0 + tu[warp][k + 1] * x1 +
+                    tu[warp][k + 2] * x2 + tu[warp][k + 3] * x3;
+        }
+        __syncthreads();
+    }
+    float a = sum(sumA), b = sum(sumB);
+    if (!(tid & 31)) {
+        const unsigned row = row4 + tid / 32;
+        if (valid && row < M) out[pair * M + row] = silu(a) * b;
+    }
+}
+
 template<unsigned TYPE, bool DOWN>
 __global__ void moe_mv(float *out, const float *x, const int *selected,
         const char *w0, const char *w1, const char *sh0, const char *sh1,
@@ -662,12 +887,20 @@ static int moe_mv_dispatch(float *out, const float *x, const int *sel,
         unsigned type, unsigned st, unsigned NE, unsigned T, unsigned NS, unsigned K, unsigned M, bool down) {
     const uint64_t rb = expert_row_bytes(type, K), srb = row_bytes(st, K);
     const dim3 grid((M + 3) / 4, NS + (st != UINT_MAX), T);
+    /* Routed-only (st==UINT_MAX): packs with a shared expert in the slot
+     * (UD3) keep v1, which blends the shared rows; v2 skips slot NS and
+     * would feed stale shared-mid to the reduce (correct outputs observed
+     * only because those tokens gated the shared expert ~0). */
+    if (!down && type == 18 && st == UINT_MAX && getenv("DS4_QWEN4_MOE_V2")) {
+        moe_mv_v2_mid<18><<<grid,128,0,cuda_decode_stream()>>>(out,x,sel,w0,w1,NE,NS,K,M,rb);
+        return launched();
+    }
 #define QWEN_MOE(TYPE) case TYPE: \
     if (down) moe_mv<TYPE, true><<<grid,128,0,cuda_decode_stream()>>>(out,x,sel,w0,w1,s0,s1,st,NE,NS,K,M,rb,srb); \
     else moe_mv<TYPE, false><<<grid,128,0,cuda_decode_stream()>>>(out,x,sel,w0,w1,s0,s1,st,NE,NS,K,M,rb,srb); break
     switch (type) {
     QWEN_MOE(0); QWEN_MOE(1); QWEN_MOE(2); QWEN_MOE(8); QWEN_MOE(10);
-    QWEN_MOE(12); QWEN_MOE(16); QWEN_MOE(30); QWEN_MOE(39);
+    QWEN_MOE(12); QWEN_MOE(16); QWEN_MOE(17); QWEN_MOE(18); QWEN_MOE(20); QWEN_MOE(21); QWEN_MOE(22); QWEN_MOE(23); QWEN_MOE(30); QWEN_MOE(39); QWEN_MOE(42);
     default: return 0;
     }
 #undef QWEN_MOE
@@ -1067,7 +1300,8 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
         else matrix_reg<TYPE,false,2><<<tcgrid,128,0,cuda_decode_stream()>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); break
         switch (type) {
         QWEN_TC(0); QWEN_TC(1); QWEN_TC(2); QWEN_TC(8); QWEN_TC(10);
-        QWEN_TC(12); QWEN_TC(16); QWEN_TC(30); QWEN_TC(39);
+        QWEN_TC(12); QWEN_TC(13); QWEN_TC(14); QWEN_TC(16); QWEN_TC(17); QWEN_TC(18);
+        QWEN_TC(20); QWEN_TC(21); QWEN_TC(22); QWEN_TC(23); QWEN_TC(30); QWEN_TC(39); QWEN_TC(42);
         default: return 0;
         }
 #undef QWEN_TC
@@ -1094,6 +1328,18 @@ __device__ __forceinline__ float dot(const char *row, const float *x, unsigned n
         for (unsigned i = (threadIdx.x&31)*4; i < n; i += 128) {
             const float4 w = value4<TYPE>(row,i,grid,signs), v = *(const float4 *)(x+i);
             acc += w.x*v.x; acc += w.y*v.y; acc += w.z*v.z; acc += w.w*v.w;
+        }
+    } else if (TYPE == 30 && !(n%4) && !((uintptr_t)x&15) && !((uintptr_t)row&7)) {
+        /* Hyper-connections are BF16: two bf16 pairs per 8 bytes, expanded
+         * by a shift into the fp32 high half (bf16 is the upper 16 bits). */
+        for (unsigned i = (threadIdx.x&31)*4; i < n; i += 128) {
+            const uint32_t b0 = *(const uint32_t *)(row + (uint64_t)i*2u);
+            const uint32_t b1 = *(const uint32_t *)(row + (uint64_t)i*2u + 4u);
+            const float4 v = *(const float4 *)(x+i);
+            acc += __uint_as_float((b0 & 0xffffu) << 16) * v.x;
+            acc += __uint_as_float(b0 & 0xffff0000u) * v.y;
+            acc += __uint_as_float((b1 & 0xffffu) << 16) * v.z;
+            acc += __uint_as_float(b1 & 0xffff0000u) * v.w;
         }
     } else {
         for (unsigned i = threadIdx.x & 31; i < n; i += 32) acc += value<TYPE>(row, i, grid, signs) * x[i];
@@ -1190,7 +1436,7 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
     else matvec<TYPE><<<grid,128,0,cuda_decode_stream()>>>(out,w,x,K,M,stride); break
     switch (type) {
     QWEN_MV(0); QWEN_MV(1); QWEN_MV(2); QWEN_MV(8); QWEN_MV(10);
-    QWEN_MV(12); QWEN_MV(16); QWEN_MV(30); QWEN_MV(39);
+    QWEN_MV(12); QWEN_MV(13); QWEN_MV(14); QWEN_MV(16); QWEN_MV(20); QWEN_MV(21); QWEN_MV(23); QWEN_MV(30); QWEN_MV(39); QWEN_MV(42);
     default: return 0;
     }
 #undef QWEN_MV
@@ -1369,7 +1615,8 @@ static int dense_blas(float *out, const float *x, const char *w,
 #define QWEN_UNPACK(TYPE) case TYPE: unpack<TYPE><<<((uint64_t)n*K+255)/256,256,0,cuda_decode_stream()>>>(scratch,w+(uint64_t)r*rb,K,n,rb); break
             switch (type) {
             QWEN_UNPACK(1); QWEN_UNPACK(2); QWEN_UNPACK(8); QWEN_UNPACK(10);
-            QWEN_UNPACK(12); QWEN_UNPACK(16); QWEN_UNPACK(30); QWEN_UNPACK(39);
+            QWEN_UNPACK(12); QWEN_UNPACK(13); QWEN_UNPACK(14); QWEN_UNPACK(16); QWEN_UNPACK(20); QWEN_UNPACK(21);
+            QWEN_UNPACK(23); QWEN_UNPACK(30); QWEN_UNPACK(39); QWEN_UNPACK(42);
             default: return 0;
             }
 #undef QWEN_UNPACK
@@ -1870,12 +2117,13 @@ extern "C" int ds4_gpu_qwen4_hc_norm_tensor(ds4_gpu_tensor *xn, ds4_gpu_tensor *
         (ni && !tensor(inj, (uint64_t)T * hc * 8 * ni * 4))) return 0;
     const char *gamma = weight(map, size, go, (uint64_t)E * hc * 4);
     const char *wi = ni ? weight(map, size, io, row_bytes(type, (uint64_t)E * hc) * ni) : gamma;
-    if (!gamma || !wi || (type != 0 && type != 1 && type != 8)) return 0;
+    if (!gamma || !wi || (type != 0 && type != 1 && type != 8 && type != 30)) return 0;
     if (T > 8) {
 #define QWEN_HC_NORM(TYPE) hc_norm_prefill<TYPE><<<dim3(hc,T),256,0,cuda_decode_stream()>>>((float *)xn->ptr, \
         ni ? (float *)inj->ptr : NULL,(const float *)R->ptr,(const float *)gamma,wi,E,hc,ni,eps)
         if (type == 0) { QWEN_HC_NORM(0); }
         else if (type == 1) { QWEN_HC_NORM(1); }
+        else if (type == 30) { QWEN_HC_NORM(30); }
         else { QWEN_HC_NORM(8); }
 #undef QWEN_HC_NORM
         return launched();
@@ -1892,11 +2140,12 @@ extern "C" int ds4_gpu_qwen4_hc_gate_mix_tensor(ds4_gpu_tensor *out,
     if (!T || !E || !hc || hc > 4 || !rank || !tensor(out, (uint64_t)T * E * 4) ||
         !tensor(xn, (uint64_t)T * E * hc * 4) || !tensor(lo, (uint64_t)T * rank * 4)) return 0;
     const char *w = weight(map, size, offset, row_bytes(type, rank) * E * hc);
-    if (!w || (type != 0 && type != 1 && type != 8)) return 0;
+    if (!w || (type != 0 && type != 1 && type != 8 && type != 30)) return 0;
 #define QWEN_HC(TYPE) hc_mix<TYPE><<<dim3((E + 3) / 4, T),128,0,cuda_decode_stream()>>>((float *)out->ptr, \
         (const float *)xn->ptr,(const float *)lo->ptr,w,E,hc,rank,row_bytes(TYPE,rank))
     if (type == 0) { QWEN_HC(0); }
     else if (type == 1) { QWEN_HC(1); }
+    else if (type == 30) { QWEN_HC(30); }
     else { QWEN_HC(8); }
 #undef QWEN_HC
     return launched();
@@ -2018,6 +2267,18 @@ extern "C" uint64_t ds4_gpu_qwen4_attn_part_floats(uint32_t T, uint32_t H, uint3
     return (uint64_t)T * H * 64 * (D + 2);
 }
 
+/* Types the vendored MMVQ dense entry supports (Step 6 of cuda/mmq): the
+ * scalar value<> fallbacks for IQ3_S/IQ4_XS and friends are the slow lane at
+ * T <= 8, while MMVQ is the upstream decode kernel for exactly this shape. */
+static int qwen4_mmvq_dense_type(uint32_t type) {
+    switch (type) {
+    case 12: case 13: case 14: case 16: case 17: case 18: case 19: case 21: case 22: case 23: case 29:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *map, uint64_t size, uint64_t off, uint32_t type, uint32_t T, uint32_t K, uint32_t M) {
     using namespace qwen4_cuda;
@@ -2026,6 +2287,14 @@ extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_
     if (!rb) return 0;
     const char *w = weight(map, size, off, rb*M);
     if (!w) return 0;
+    /* Decode rows: route the ISTA dense types through MMVQ (upstream's
+     * matrix-vector kernels); types it does not cover or K not multiple of
+     * 256 (IQ4_NL/Q2_0 MoE-down rows, K=640) keep the local kernels. */
+    if (T <= 8u && (K % 256u) == 0u && qwen4_mmvq_dense_type(type) && !getenv("DS4_QWEN4_NO_MMVQ") &&
+        ds4_mmq_quant_dense_vec(w, type, (const float *)x->ptr, (float *)out->ptr,
+                                (int)M, (int)T, (int)K, cuda_decode_stream()) == 0) {
+        return 1;
+    }
     if (T <= 8) return matvec_dispatch((float *)out->ptr, w, (const float *)x->ptr, type, T, K, M);
     if (type == 1 && T >= 32 && T <= INT_MAX && K <= INT_MAX && M <= INT_MAX &&
         g_cublas_ready && !g_quality_mode && !getenv("DS4_CUDA_NO_TF32"))
@@ -2033,8 +2302,12 @@ extern "C" int ds4_gpu_qwen4_dense_mm_tensor(ds4_gpu_tensor *out, const ds4_gpu_
     if (type == 8 && T >= 32 && T <= INT_MAX && K <= INT_MAX && M <= INT_MAX &&
         g_cublas_ready && !g_quality_mode && !getenv("DS4_CUDA_NO_TF32"))
         return dense_q8_blas((float *)out->ptr,(const float *)x->ptr,w,T,K,M);
-    if (g_cublas_ready && T >= 32 && K <= INT_MAX && M <= INT_MAX && T <= INT_MAX)
-        return dense_blas((float *)out->ptr,(const float *)x->ptr,w,type,T,K,M);
+    if (g_cublas_ready && T >= 32 && K <= INT_MAX && M <= INT_MAX && T <= INT_MAX &&
+        dense_blas((float *)out->ptr,(const float *)x->ptr,w,type,T,K,M)) {
+        return 1;
+    }
+    /* Types cublas cannot unpack (IQ4_NL/Q2_0 shared experts) and non-blas
+     * paths take the per-type tiled kernel. */
     return matrix_dispatch((float *)out->ptr, (const float *)x->ptr, w, NULL, NULL, NULL,
                            type, 1, T, 1, 1, K, M, 0, false);
 }
@@ -2051,6 +2324,17 @@ extern "C" int ds4_gpu_qwen4_matmul_q8_0_weights_tensor(ds4_gpu_tensor *out, con
     const uint64_t rb = row_bytes(8, K);
     if (!K || !M || !rb || !tensor(w, rb*M) || !tensor(x, (uint64_t)K*4) || !tensor(out, (uint64_t)M*4)) return 0;
     return matvec_dispatch((float *)out->ptr, (const char *)w->ptr, (const float *)x->ptr, 8, 1, K, M);
+}
+
+/* Type-parameterized twin of the Q8_0 entry: scores rows that live in a GPU
+ * tensor (the gathered MTP draft head) with the same kernel and geometry
+ * the model-range path would use for that type. */
+extern "C" int ds4_gpu_qwen4_matmul_weights_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *w,
+        uint32_t type, uint32_t K, uint32_t M, const ds4_gpu_tensor *x) {
+    using namespace qwen4_cuda;
+    const uint64_t rb = row_bytes(type, K);
+    if (!type || !K || !M || !rb || !tensor(w, rb*M) || !tensor(x, (uint64_t)K*4) || !tensor(out, (uint64_t)M*4)) return 0;
+    return matvec_dispatch((float *)out->ptr, (const char *)w->ptr, (const float *)x->ptr, type, 1, K, M);
 }
 
 extern "C" int ds4_gpu_qwen4_multi_gemv_tensor(const ds4_gpu_tensor *x, uint32_t T,
@@ -2210,6 +2494,22 @@ extern "C" int ds4_gpu_qwen4_mtp_stage_tensor(ds4_gpu_tensor *cat, const ds4_gpu
         !tensor(e,(uint64_t)E*4) || !tensor(R,(uint64_t)hc*E*4)) return 0;
     const char *ge = weight(map,size,eo,(uint64_t)E*4), *gh = weight(map,size,ho,(uint64_t)hc*E*4);
     if (!ge || !gh) return 0;
+#if 1 /* TEMP-DEBUG MTP fault: classify every pointer. Remove after fix. */
+    {
+        const void *ptrs[5] = {cat->ptr, e->ptr, R->ptr, ge, gh};
+        const char *names[5] = {"cat", "e", "R", "ge", "gh"};
+        for (int pi = 0; pi < 5; pi++) {
+            struct cudaPointerAttributes attr;
+            memset(&attr, 0, sizeof(attr));
+            cudaError_t pe = cudaPointerGetAttributes(&attr, ptrs[pi]);
+            fprintf(stderr, "ds4: [tmp-mtp] %s=%p attr=%d dev=%d err=%d\n",
+                    names[pi], ptrs[pi],
+                    pe == cudaSuccess ? attr.type : -1,
+                    pe == cudaSuccess ? attr.device : -1, (int)pe);
+            (void)cudaGetLastError();
+        }
+    }
+#endif
     mtp_stage<<<hc+1,256,0,cuda_decode_stream()>>>((float *)cat->ptr,(const float *)e->ptr,
         (const float *)R->ptr,(const float *)ge,(const float *)gh,E,hc,eps);
     return launched();

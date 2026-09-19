@@ -39,7 +39,10 @@ static void fixture(const char *path, bool bad_alignment, uint32_t type) {
     u64(f, 65536 - start + (bad_alignment ? 1 : 0));
     assert(!fseek(f, (long)start, SEEK_SET));
     u32(f, 0x3f800000);
-    assert(!fseek(f, 65536, SEEK_SET));
+    /* With bad_alignment the directory points one byte past the aligned
+     * guess; write the payload where the directory says it is so reads
+     * stay consistent and only the page alignment is off. */
+    assert(!fseek(f, 65536 + (bad_alignment ? 1 : 0), SEEK_SET));
     for (size_t r = 0; r < 1000; r++) {
         for (size_t c = 0; c < 160; c++) {
             uint16_t v = value(r, c);
@@ -115,8 +118,41 @@ int main(void) {
     close(fd);
     model_close(&m);
     assert(m.ngram_fd == -1 && !m.ngram_tensor);
-    for (int bad = 0; bad < 4; bad++) {
-        fixture(path, bad == 0, bad == 1 ? 1 : bad == 2 ? 3 : 30);
+    /* A one-byte-misaligned trailing table no longer dies: only whole pages
+     * are released, the edges stay mapped, size is not truncated, and reads
+     * still go through pread. */
+    fixture(path, true, 30);
+    model_open(&m, path, false, false);
+    assert(m.ngram_fd >= 0 && m.ngram_tensor);
+    struct stat pst;
+    assert(fstat(m.fd, &pst) == 0 && m.size == (uint64_t)pst.st_size);
+    assert(m.size == (uint64_t)65537 + 320000 + 1);
+    assert(qwen4_ngram_read(&m, rows, 16, out));
+    for (size_t i = 0; i < 16; i++) {
+        for (size_t c = 0; c < 160; c++) {
+            uint32_t bits;
+            memcpy(&bits, out + i * 160 + c, 4);
+            assert(bits == (uint32_t)value(rows[i], c) << 16);
+        }
+    }
+    {
+        /* A page strictly inside the table must be unmapped now. */
+        unsigned char resident = 0;
+        /* 196608 = 48 * 4096: page-aligned and strictly inside the punched
+         * [69632, 385024) hole of the [65537, 385537) table. */
+        const void *hole = (const void *)(m.map + 196608);
+        errno = 0;
+#ifdef __APPLE__
+        (void)hole;
+        assert(0 && "hole check needs a macOS vm_region port");
+#else
+        assert(mincore((void *)hole, 4096, &resident) == -1 && errno == ENOMEM);
+#endif
+    }
+    model_warm_weights(&m);
+    model_close(&m);
+    for (int bad = 1; bad < 4; bad++) {
+        fixture(path, false, bad == 1 ? 1 : bad == 2 ? 3 : 30);
         if (bad == 3) assert(!truncate(path, 65536 + 320000 - 1));
         pid_t pid = fork();
         assert(pid >= 0);

@@ -2519,5 +2519,12 @@ int main(int argc, char **argv) {
     ds4_dist_options_free(cfg.dist);
     ds4_prompt_prefix_free(&cfg.gen.prefix);
     free(cfg.prompt_owned);
+    /* Fast exit for batch runs (see server main): teardown is complete;
+     * exit handlers race leftover driver threads. The interactive REPL
+     * keeps the normal return so terminal restore (atexit) still runs. */
+    if (cfg.gen.prompt) {
+        fflush(NULL);
+        _exit(rc);
+    }
     return rc;
 }

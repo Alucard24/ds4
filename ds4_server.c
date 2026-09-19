@@ -1253,6 +1253,30 @@ static bool parse_output_config_effort(const char **p, ds4_think_mode *effort) {
     return true;
 }
 
+/* DS4_THINK_DEFAULT: applied only when the client sent no thinking field, so
+ * the llama.cpp web UI (which sends none) follows the launch command.
+ * Accepts 0/off/none, 1/on, or a level: minimal|low|medium|high|xhigh|max.
+ * "max" still degrades to high when the context is smaller than 393216. */
+static void think_default_apply(bool *enabled, ds4_think_mode *effort) {
+    const char *def = getenv("DS4_THINK_DEFAULT");
+    if (!def || !def[0]) return;
+    if (!strcmp(def, "0") || !strcmp(def, "off") || !strcmp(def, "none")) {
+        *enabled = false;
+        *effort = DS4_THINK_NONE;
+        return;
+    }
+    if (!strcmp(def, "1") || !strcmp(def, "on")) {
+        *enabled = true;
+        *effort = DS4_THINK_HIGH;
+        return;
+    }
+    ds4_think_mode m;
+    if (parse_reasoning_effort_name(def, &m)) {
+        *enabled = m != DS4_THINK_NONE;
+        *effort = m;
+    }
+}
+
 static bool model_alias_disables_thinking(const char *model) {
     return model &&
            (!strcmp(model, "deepseek-chat") ||
@@ -4451,6 +4475,8 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    if (!got_thinking && !model_alias_enables_thinking(r->model))
+        think_default_apply(&thinking_enabled, &reasoning_effort);
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
@@ -4668,6 +4694,8 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    if (!got_thinking && !model_alias_enables_thinking(r->model))
+        think_default_apply(&thinking_enabled, &reasoning_effort);
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     if (!anthropic_validate_tool_results(s, &msgs,
@@ -5698,6 +5726,8 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     r->has_tools = active_tool_schemas && active_tool_schemas[0];
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    if (!got_thinking && !model_alias_enables_thinking(r->model))
+        think_default_apply(&thinking_enabled, &reasoning_effort);
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     if (!responses_validate_tool_outputs(s, &msgs, r->think_mode,
@@ -5905,6 +5935,8 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     }
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
+    if (!got_thinking && !model_alias_enables_thinking(r->model))
+        think_default_apply(&thinking_enabled, &reasoning_effort);
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     chat_msgs msgs = {0};
@@ -7143,6 +7175,46 @@ static bool http_error(int fd, bool enable_cors, int code, const char *msg) {
     buf_puts(&b, ",\"type\":\"invalid_request_error\"}}\n");
     bool ok = http_response(fd, enable_cors, code, "application/json", b.ptr);
     buf_free(&b);
+    return ok;
+}
+
+/* --webui-dir: serve a prebuilt web UI from disk (for example llama.cpp's
+ * tools/server/public) so the browser page and the API share one origin.
+ * Only text assets are served: http_response() sends a NUL-terminated body. */
+static const char *webui_content_type(const char *path) {
+    const char *dot = strrchr(path, '.');
+    if (!dot) return "application/octet-stream";
+    if (!strcmp(dot, ".html")) return "text/html; charset=utf-8";
+    if (!strcmp(dot, ".js") || !strcmp(dot, ".mjs")) return "text/javascript; charset=utf-8";
+    if (!strcmp(dot, ".css")) return "text/css; charset=utf-8";
+    if (!strcmp(dot, ".json") || !strcmp(dot, ".map")) return "application/json";
+    if (!strcmp(dot, ".svg")) return "image/svg+xml";
+    if (!strcmp(dot, ".txt")) return "text/plain; charset=utf-8";
+    return "application/octet-stream";
+}
+
+static bool webui_serve(int fd, bool cors, const char *dir, const char *path) {
+    if (!dir || !dir[0] || !path || strstr(path, "..")) return false;
+    const char *rel = path;
+    while (*rel == '/') rel++;
+    if (!*rel) rel = "index.html";
+    char full[4096];
+    const int n = snprintf(full, sizeof(full), "%s/%s", dir, rel);
+    if (n <= 0 || (size_t)n >= sizeof(full)) return false;
+    FILE *f = fopen(full, "rb");
+    if (!f) return false;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    const long sz = ftell(f);
+    if (sz < 0 || sz > 256L * 1024L * 1024L) { fclose(f); return false; }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return false; }
+    char *body = (char *)malloc((size_t)sz + 1u);
+    if (!body) { fclose(f); return false; }
+    const size_t rd = fread(body, 1, (size_t)sz, f);
+    fclose(f);
+    if (rd != (size_t)sz) { free(body); return false; }
+    body[sz] = '\0';
+    const bool ok = http_response(fd, cors, 200, webui_content_type(rel), body);
+    free(body);
     return ok;
 }
 
@@ -10528,6 +10600,7 @@ struct server {
     server_image_cache image_cache; /* Protected by inference_mu. */
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
+    const char *webui_dir; /* --webui-dir */
     pthread_mutex_t tool_mu;
     pthread_mutex_t kv_mu;
     pthread_mutex_t inference_mu;
@@ -15338,6 +15411,10 @@ static bool send_models(server *s, int fd) {
         append_model_json(&b, s, "qwen3.8-flash-next-chat");
         buf_putc(&b, ',');
         append_model_json(&b, s, "qwen3.8-flash-next-reasoner");
+        /* Same model, requests with thinking disabled: pick it in the web UI
+         * to get answers without the reasoning pass. */
+        buf_putc(&b, ',');
+        append_model_json(&b, s, "qwen3.8-flash-next-nothink");
     } else if (ds4_engine_is_glm_dsa(s->engine)) {
         append_model_json(&b, s, "glm-5.2");
         buf_putc(&b, ',');
@@ -15599,8 +15676,10 @@ static const char ds4_server_index_html[] =
     if (!strcmp(hr.method, "GET") &&
         (!strcmp(hr.path, "/") || !strcmp(hr.path, "/ui") ||
          !strcmp(hr.path, "/index.html"))) {
-        (void)http_response(fd, s->enable_cors, 200,
-                            "text/html; charset=utf-8", ds4_server_index_html);
+        if (!webui_serve(fd, s->enable_cors, s->webui_dir, "index.html")) {
+            (void)http_response(fd, s->enable_cors, 200,
+                                "text/html; charset=utf-8", ds4_server_index_html);
+        }
         http_request_free(&hr);
         goto done;
     }
@@ -15653,6 +15732,14 @@ static const char ds4_server_index_html[] =
         goto done;
     }
 
+    /* --webui-dir: static assets of the prebuilt UI (after the API GET routes,
+     * before the POST chain so an unknown GET still 404s when nothing matches). */
+    if (!strcmp(hr.method, "GET") && s->webui_dir && s->webui_dir[0]) {
+        if (webui_serve(fd, s->enable_cors, s->webui_dir, hr.path)) {
+            http_request_free(&hr);
+            goto done;
+        }
+    }
     request req;
     char err[160];
     bool ok = false;
@@ -15769,6 +15856,7 @@ typedef struct {
     int default_tokens;
     const char *chdir_path;
     const char *trace_path;
+    const char *webui_dir;
     const char *kv_disk_dir;
     uint64_t kv_disk_space_mb;
     kv_cache_options kv_cache;
@@ -16038,6 +16126,8 @@ static server_config parse_options(int argc, char **argv) {
               }
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--webui-dir")) {
+            c.webui_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batched-session")) {
             c.batched_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
@@ -16315,6 +16405,7 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    s.webui_dir = cfg.webui_dir;
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
     if (s.batched_mode) {
@@ -16495,7 +16586,12 @@ int main(int argc, char **argv) {
         kv_cache_store_current(&s, slot, "shutdown");
     }
     server_close_resources(&s);
-    return 0;
+    /* Fast exit: everything owned is already released above; returning
+     * through static destructors and libc/driver teardown races leftover
+     * driver threads against heap teardown (teardown SIGSEGV). Flush
+     * stdio, then terminate without running exit handlers. */
+    fflush(NULL);
+    _exit(0);
 }
 #else
 

@@ -409,6 +409,26 @@ tests/test_cuda_q8_rows: tests/test_cuda_q8_rows.o ds4_cuda.o ds4_image.o $(MMQ_
 test-cuda-q8-rows: tests/test_cuda_q8_rows
 	./tests/test_cuda_q8_rows
 
+tests/test_cuda_tc23.o: tests/test_cuda_tc23.c ds4_gpu.h
+	$(CC) $(QUALITY_CFLAGS) -I. -c -o $@ $<
+
+tests/test_cuda_tc23: tests/test_cuda_tc23.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+.PHONY: test-cuda-tc23
+test-cuda-tc23: tests/test_cuda_tc23
+	./tests/test_cuda_tc23
+
+tests/test_moe_bench.o: tests/test_moe_bench.c ds4_gpu.h
+	$(CC) $(QUALITY_CFLAGS) -I. -c -o $@ $<
+
+tests/test_moe_bench: tests/test_moe_bench.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+.PHONY: test-moe-bench
+test-moe-bench: tests/test_moe_bench
+	./tests/test_moe_bench
+
 tests/test_cuda_reductions.o: tests/test_cuda_reductions.cu ds4_gpu.h
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -c -o $@ $<
 
@@ -837,6 +857,46 @@ tests/test_qwen4_ngrams: tests/test_qwen4_ngrams.o $(filter-out ds4_cpu.o,$(CPU_
 test-qwen4-ngrams: tests/test_qwen4_ngrams
 	./tests/test_qwen4_ngrams
 
+tests/test_qwen4_split.o: tests/test_qwen4_split.c ds4.c ds4.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<
+
+tests/test_qwen4_split: tests/test_qwen4_split.o $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ $^ $(LDLIBS)
+
+.PHONY: test-qwen4-split
+test-qwen4-split: tests/test_qwen4_split
+	./tests/test_qwen4_split
+
+tests/test_qwen4_config.o: tests/test_qwen4_config.c ds4.c ds4.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<
+
+tests/test_qwen4_config: tests/test_qwen4_config.o $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ $^ $(LDLIBS)
+
+.PHONY: test-qwen4-config
+test-qwen4-config: tests/test_qwen4_config
+	./tests/test_qwen4_config
+
+tests/test_qwen4_drafthead.o: tests/test_qwen4_drafthead.c ds4.c ds4.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<
+
+tests/test_qwen4_drafthead: tests/test_qwen4_drafthead.o $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ $^ $(LDLIBS)
+
+.PHONY: test-qwen4-drafthead
+test-qwen4-drafthead: tests/test_qwen4_drafthead
+	./tests/test_qwen4_drafthead
+
+tests/test_qwen4_dequant.o: tests/test_qwen4_dequant.c ds4.c ds4.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<
+
+tests/test_qwen4_dequant: tests/test_qwen4_dequant.o $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ $^ $(LDLIBS)
+
+.PHONY: test-qwen4-dequant
+test-qwen4-dequant: tests/test_qwen4_dequant
+	./tests/test_qwen4_dequant
+
 tests/test_qwen4_ngram_state.o: tests/test_qwen4_ngram_state.c ds4.c ds4.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
@@ -957,6 +1017,16 @@ tests/test_sampling.o: tests/test_sampling.c ds4.h
 
 tests/test_sampling: tests/test_sampling.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+tests/test_qwen4_cpu_dot.o: tests/test_qwen4_cpu_dot.c
+	$(CC) $(CFLAGS) -fno-finite-math-only -I. -c -o $@ $<
+
+tests/test_qwen4_cpu_dot: tests/test_qwen4_cpu_dot.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o ds4_video.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+.PHONY: test-qwen4-cpu-dot
+test-qwen4-cpu-dot: tests/test_qwen4_cpu_dot
+	./tests/test_qwen4_cpu_dot
 
 tests/test_session_state.o: tests/test_session_state.c ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<
@@ -1177,6 +1247,7 @@ clean:
 	rm -f tests/test_cuda_tp_repack
 	rm -f tests/test_cuda_ssd_repack
 	rm -f tests/test_deepseek41_gguf
+	rm -f tests/test_qwen4_split tests/test_qwen4_config tests/test_qwen4_dequant
 	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli
 	rm -f tests/test_deepseek41_prefill
 	rm -f tests/test_metal_tp_bulk

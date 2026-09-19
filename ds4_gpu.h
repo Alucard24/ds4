@@ -54,6 +54,11 @@ void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
+/* Pinned (page-locked) host memory, for small per-layer device->host
+ * readbacks where the driver's pageable staging dominates the copy time.
+ * Process lifetime: the caller frees with ds4_gpu_host_free. */
+void *ds4_gpu_host_alloc(uint64_t bytes);
+void ds4_gpu_host_free(void *ptr);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
@@ -176,11 +181,19 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              const char *label);
 #endif
 int ds4_gpu_end_commands(void);
+
+/* Diagnostic: DS4_QWEN4_TIMING=4 records one event per qwen4 stage boundary on
+ * stream 0 (stage 6 = token start) and reports per-stage GPU ms/token. */
+int ds4_gpu_prof_mark(int stage);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
+/* Split-shard file table for CUDA file-backed reads (global reservation
+ * offset -> per-shard fd + local offset). n == 0 clears the table. */
+int ds4_gpu_set_model_shards(const int *fds, const uint64_t *sizes,
+                             const uint64_t *bases, uint32_t n);
 int ds4_gpu_build_derived_artifacts(const void *model_map, uint64_t model_size,
                                   const char *model_path);
 /* Two-rank expert-only artifacts; never build or cache the unowned half.
@@ -3490,6 +3503,10 @@ void ds4_gpu_decode_graphs_invalidate(void);
  * gathered MTP draft head); same kernel and geometry as the model-range path. */
 int ds4_gpu_qwen4_matmul_q8_0_weights_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *w,
                                              uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x);
+/* Type-parameterized twin (CUDA; other backends keep the Q8_0-only entry):
+ * scores rows living in a GPU tensor with the model-range kernel geometry. */
+int ds4_gpu_qwen4_matmul_weights_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *w, uint32_t type,
+                                         uint32_t in_dim, uint32_t out_dim, const ds4_gpu_tensor *x);
 int ds4_gpu_qwen4_argmax_tensor(ds4_gpu_tensor *out_idx, ds4_gpu_tensor *scratch,
                                const ds4_gpu_tensor *logits, uint32_t n_vocab);
 /* M3 Ultra decode defaults; DS4_QWEN4_DECODE_FUSIONS=0 restores old paths. */

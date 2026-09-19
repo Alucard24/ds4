@@ -1151,6 +1151,23 @@ typedef struct {
     uint8_t  qs[QK_K / 2];
 } block_iq4_xs;
 
+/* IQ4_NL: plain 32-value blocks (f16 scale + 16 bytes of nibbles over the
+ * fixed kvalues_iq4nl grid, low nibble first). Unsloth packs the Flash-Next
+ * down experts and the PLE table with it. */
+#define QK4_NL 32
+typedef struct {
+    uint16_t d;
+    uint8_t  qs[QK4_NL / 2];
+} block_iq4_nl;
+
+/* Q2_0: ggml layout (f16 scale + 16 bytes of 2-bit values, 00=-1..11=+2).
+ * Unsloth ISTA uses it for some down experts and shared down projections. */
+#define QK2_0 64
+typedef struct {
+    uint16_t d;
+    uint8_t  qs[QK2_0 / 4];
+} block_q2_0;
+
 /* IQ1_S: 256 weights in 50 bytes - an fp16 delta, 32 bytes of grid indices and
  * 16 bytes carrying each group's high index bit, its sign and its scale.  The
  * grid is the same iq1s_grid the IQ1_M path below already uses; the two formats
@@ -1185,6 +1202,8 @@ DS4_STATIC_ASSERT(ds4_block_iq2_s_size, sizeof(block_iq2_s) == 82);
 DS4_STATIC_ASSERT(ds4_block_iq3_xxs_size, sizeof(block_iq3_xxs) == 98);
 DS4_STATIC_ASSERT(ds4_block_iq3_s_size, sizeof(block_iq3_s) == 110);
 DS4_STATIC_ASSERT(ds4_block_iq4_xs_size, sizeof(block_iq4_xs) == 136);
+DS4_STATIC_ASSERT(ds4_block_iq4_nl_size, sizeof(block_iq4_nl) == 18);
+DS4_STATIC_ASSERT(ds4_block_q2_0_size, sizeof(block_q2_0) == 18);
 DS4_STATIC_ASSERT(ds4_block_iq1_s_size, sizeof(block_iq1_s) == 50);
 DS4_STATIC_ASSERT(ds4_block_iq1_m_size, sizeof(block_iq1_m) == 56);
 DS4_STATIC_ASSERT(ds4_block_mxfp4_size, sizeof(block_mxfp4) == 17);
@@ -2424,7 +2443,12 @@ static const gguf_type_info gguf_types[] = {
     [17] = {"iq2_xs", 256,  74},
     [18] = {"iq3_xxs",256,  98},
     [19] = {"iq1_s",  256,  50},
-    [20] = {"iq4_nl", 256,  50},
+    /* IQ4_NL uses plain 32-value blocks (f16 scale + 16 bytes of nibbles
+     * over a fixed grid), not 256-wide superblocks: the PLE row width
+     * (160) is not a multiple of 256, so a superblock entry would size
+     * its rows wrong. */
+    [20] = {"iq4_nl",  32,  18},
+    [42] = {"q2_0",    64,  18},
     [21] = {"iq3_s",  256, 110},
     [22] = {"iq2_s",  256,  82},
     [23] = {"iq4_xs", 256, 136},
@@ -2453,6 +2477,9 @@ enum {
     DS4_TENSOR_IQ2_XS   = 17,
     DS4_TENSOR_IQ3_XXS  = 18,
     DS4_TENSOR_IQ1_S    = 19,
+    /* IQ4_NL parses (block 32 x 18 B) but has no execution kernels yet:
+     * dequant lands with the Unsloth Flash-Next port (option B). */
+    DS4_TENSOR_IQ4_NL   = 20,
     DS4_TENSOR_IQ3_S    = 21,
     DS4_TENSOR_IQ2_S    = 22,
     DS4_TENSOR_IQ4_XS   = 23,
@@ -2460,6 +2487,8 @@ enum {
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_IQ1_M    = 29,
     DS4_TENSOR_BF16     = 30,
+    /* Q2_0 (Unsloth ISTA down experts): ggml layout, 64 values in 18 bytes. */
+    DS4_TENSOR_Q2_0     = 42,
     DS4_TENSOR_MXFP4    = 39,
 };
 
@@ -2478,7 +2507,25 @@ typedef struct {
     uint64_t abs_offset;
     uint64_t elements;
     uint64_t bytes;
+    /* Split GGUF shard holding this tensor's bytes, and the byte offset
+     * of the tensor data within that shard's file (for pread-style disk
+     * reads). Single-file models use shard 0 with file_offset == abs_offset. */
+    uint32_t shard;
+    uint64_t file_offset;
 } ds4_tensor;
+
+/* One file of a split GGUF. slot_base is the global address offset of the
+ * shard's file byte 0 inside the model's contiguous virtual reservation;
+ * shard 0 always sits at slot_base 0, so legacy abs_offset math is also
+ * valid global math. data_pos is the shard-local tensor-data start. */
+#define DS4_MAX_SHARDS 16
+typedef struct {
+    int fd;
+    const uint8_t *map;
+    uint64_t size;
+    uint64_t slot_base;
+    uint64_t data_pos;
+} ds4_shard;
 
 typedef struct ds4_model {
     int fd;
@@ -2495,6 +2542,13 @@ typedef struct ds4_model {
 
     ds4_kv *kv;
     ds4_tensor *tensors;
+
+    /* Split-GGUF state. Single-file models keep n_shards == 1 with
+     * shards[0] mirroring fd/map/size and no virtual reservation. */
+    uint32_t n_shards;
+    ds4_shard shards[DS4_MAX_SHARDS];
+    void *reserve_base;
+    uint64_t reserve_size;
 
     int ngram_fd;
     const ds4_tensor *ngram_tensor;
@@ -2599,6 +2653,17 @@ static ds4_cursor cursor_at(const ds4_model *m, uint64_t pos) {
     return c;
 }
 
+/* Cursor over one split shard: same layout, independent base/size. */
+static ds4_cursor cursor_at_ptr(const uint8_t *base, uint64_t size, uint64_t pos) {
+    ds4_cursor c = {
+        .base = base,
+        .size = size,
+        .pos = pos,
+        .error = {0},
+    };
+    return c;
+}
+
 static ds4_kv *model_find_kv(const ds4_model *m, const char *key) {
     for (uint64_t i = 0; i < m->n_kv; i++) {
         if (ds4_streq(m->kv[i].key, key)) return &m->kv[i];
@@ -2618,6 +2683,46 @@ static bool model_get_u32(const ds4_model *m, const char *key, uint32_t *out) {
     if (!kv || kv->type != GGUF_VALUE_UINT32) return false;
     ds4_cursor c = cursor_at(m, kv->value_pos);
     return cursor_u32(&c, out);
+}
+
+/* llama.cpp writes split metadata as small ints (split.no/split.count are
+ * UINT16, split.tensors.count is INT32); accept the 32-bit forms too. */
+static bool model_get_u16(const ds4_model *m, const char *key, uint32_t *out) {
+    ds4_kv *kv = model_find_kv(m, key);
+    if (!kv) return false;
+    ds4_cursor c = cursor_at(m, kv->value_pos);
+    if (kv->type == GGUF_VALUE_UINT16) {
+        uint16_t v = 0;
+        if (!cursor_read(&c, &v, sizeof(v))) return false;
+        *out = v;
+        return true;
+    }
+    if (kv->type == GGUF_VALUE_UINT32) {
+        uint32_t v = 0;
+        if (!cursor_u32(&c, &v)) return false;
+        *out = v;
+        return true;
+    }
+    return false;
+}
+
+static bool model_get_i32(const ds4_model *m, const char *key, int32_t *out) {
+    ds4_kv *kv = model_find_kv(m, key);
+    if (!kv) return false;
+    ds4_cursor c = cursor_at(m, kv->value_pos);
+    if (kv->type == GGUF_VALUE_INT32) {
+        int32_t v = 0;
+        if (!cursor_read(&c, &v, sizeof(v))) return false;
+        *out = v;
+        return true;
+    }
+    if (kv->type == GGUF_VALUE_UINT32) {
+        uint32_t v = 0;
+        if (!cursor_u32(&c, &v) || v > (uint32_t)INT32_MAX) return false;
+        *out = (int32_t)v;
+        return true;
+    }
+    return false;
 }
 
 static bool model_get_token_id(const ds4_model *m, const char *key, int *out) {
@@ -2731,15 +2836,49 @@ static void model_close(ds4_model *m) {
     if (m->ngram_tensor && m->ngram_fd >= 0) close(m->ngram_fd);
     free(m->kv);
     free(m->tensors);
-    if (m->map) munmap((void *)m->map, (size_t)m->size);
-    if (m->fd >= 0) close(m->fd);
+    /* m->fd mirrors shards[0].fd; close shards only to avoid a double close. */
+    for (uint32_t i = 0; i < m->n_shards && i < DS4_MAX_SHARDS; i++) {
+        if (m->shards[i].fd >= 0) close(m->shards[i].fd);
+    }
+    if (m->reserve_base) {
+        munmap(m->reserve_base, (size_t)m->reserve_size);
+    } else if (m->map) {
+        munmap((void *)m->map, (size_t)m->size);
+    }
     memset(m, 0, sizeof(*m));
     m->fd = -1;
     m->ngram_fd = -1;
+    for (uint32_t i = 0; i < DS4_MAX_SHARDS; i++) m->shards[i].fd = -1;
+}
+
+/* Advise one address range, tolerating kernels without the hint. The start
+ * rounds down to a page: madvise rejects unaligned addresses while an
+ * unaligned length is fine, and over-advising a few bytes is harmless. */
+static void model_prefetch_range(const void *addr, uint64_t len) {
+    if (len == 0) return;
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page > 0) {
+        uintptr_t a = (uintptr_t)addr;
+        uintptr_t aligned = a & ~((uintptr_t)page - 1u);
+        len += a - aligned;
+        addr = (const void *)aligned;
+    }
+#if defined(POSIX_MADV_WILLNEED)
+    const int rc = posix_madvise((void *)addr, (size_t)len, POSIX_MADV_WILLNEED);
+    if (rc != 0) {
+        ds4_log(stderr,
+                DS4_LOG_WARNING,
+                "ds4: warning: POSIX_MADV_WILLNEED failed for CPU model mapping: %s\n",
+                strerror(rc));
+    }
+#else
+    (void)addr;
+    (void)len;
+#endif
 }
 
 static void model_prefetch_cpu_mapping(const ds4_model *m) {
-    if (!m || !m->map || m->size == 0) return;
+    if (!m || m->n_shards == 0) return;
 
     /*
      * CPU generation touches expert weights according to router decisions, so a
@@ -2748,18 +2887,31 @@ static void model_prefetch_cpu_mapping(const ds4_model *m) {
      * an OS-level VM panic in map-count accounting. This hint does not copy or
      * pin the GGUF; it just asks the kernel to start bringing the read-only
      * mapping into the page cache before token generation reaches it.
+     *
+     * The disk-only n-gram table is never read through the mapping (it uses
+     * pread), so prefetching it would fault gigabytes for nothing: skip the
+     * table range wherever it sits. Single-file models truncate m->size at the
+     * table, which the per-shard clamp below already expresses.
      */
-#if defined(POSIX_MADV_WILLNEED)
-    const int rc = posix_madvise((void *)m->map, (size_t)m->size, POSIX_MADV_WILLNEED);
-    if (rc != 0) {
-        ds4_log(stderr,
-                DS4_LOG_WARNING,
-                "ds4: warning: POSIX_MADV_WILLNEED failed for CPU model mapping: %s\n",
-                strerror(rc));
+    for (uint32_t i = 0; i < m->n_shards && i < DS4_MAX_SHARDS; i++) {
+        const ds4_shard *s = &m->shards[i];
+        if (!s->map || s->size == 0) continue;
+        uint64_t end = s->slot_base + s->size;
+        if (end > m->size) end = m->size;
+        if (end <= s->slot_base) continue;
+        if (m->ngram_tensor && m->ngram_tensor->shard == (uint32_t)i) {
+            const uint64_t t0 = m->ngram_tensor->abs_offset;
+            const uint64_t t1 = t0 + m->ngram_tensor->bytes;
+            if (t0 > s->slot_base) {
+                model_prefetch_range(s->map, t0 - s->slot_base);
+            }
+            if (t1 < end) {
+                model_prefetch_range(m->map + t1, end - t1);
+            }
+            continue;
+        }
+        model_prefetch_range(s->map, end - s->slot_base);
     }
-#else
-    (void)m;
-#endif
 }
 
 /* Read the GGUF metadata table.  Values stay in the mmap; we store offsets so
@@ -2845,6 +2997,10 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
             ds4_die("tensor offset overflow");
         }
         t->abs_offset = m->tensor_data_pos + t->rel_offset;
+        /* Single-shard parse: shard 0 owns every tensor and file offsets
+         * match global offsets. The split path rewrites both after merging. */
+        t->shard = 0;
+        t->file_offset = t->abs_offset;
         if (t->bytes != 0 &&
             (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset))
         {
@@ -2898,6 +3054,332 @@ static void model_unmap_engram(ds4_model *m) {
 
 /* Like V4.1 Engram, the n-gram table must trail the resident weights. This
  * prevents warming or a future whole-model GPU view from faulting it in. */
+/* Split GGUF names follow the llama.cpp convention:
+ * <prefix>-00001-of-00003.gguf (1-based in the name, 0-based split.no key). */
+static bool model_split_path_parse(const char *path, uint64_t *prefix_len,
+                                   uint32_t *no, uint32_t *count) {
+    size_t len = strlen(path);
+    /* "-NNNNN-of-MMMMM.gguf" tail is 1+5+4+5+5 = 20 bytes. */
+    if (len < 21) return false;
+    const char *tail = path + len - 20;
+    if (tail[0] != '-' || tail[6] != '-' || tail[7] != 'o' || tail[8] != 'f' ||
+        tail[9] != '-' || strcmp(tail + 15, ".gguf") != 0) return false;
+    uint32_t n = 0, c = 0;
+    for (int i = 1; i <= 5; i++) {
+        if (tail[i] < '0' || tail[i] > '9') return false;
+        n = n * 10u + (uint32_t)(tail[i] - '0');
+    }
+    for (int i = 10; i <= 14; i++) {
+        if (tail[i] < '0' || tail[i] > '9') return false;
+        c = c * 10u + (uint32_t)(tail[i] - '0');
+    }
+    *prefix_len = (uint64_t)(tail - path);
+    *no = n;
+    *count = c;
+    return true;
+}
+
+static void model_split_sibling(char *out, size_t cap, const char *path,
+                                uint64_t prefix_len, uint32_t no, uint32_t count) {
+    int n = snprintf(out, cap, "%.*s-%05u-of-%05u.gguf",
+                     (int)prefix_len, path, no, count);
+    if (n < 0 || (size_t)n >= cap) ds4_die("split shard path is too long");
+}
+
+static bool ds4_str_equal(ds4_str a, ds4_str b) {
+    return a.len == b.len && (a.len == 0 || memcmp(a.ptr, b.ptr, (size_t)a.len) == 0);
+}
+
+static void model_read_header(const uint8_t *map, uint64_t size,
+                              uint32_t *version, uint64_t *n_tensors, uint64_t *n_kv) {
+    ds4_cursor c = cursor_at_ptr(map, size, 0);
+    uint32_t magic;
+    if (!cursor_u32(&c, &magic)) ds4_die(c.error);
+    if (magic != DS4_GGUF_MAGIC) ds4_die("model is not a GGUF file");
+    if (!cursor_u32(&c, version)) ds4_die(c.error);
+    if (!cursor_u64(&c, n_tensors)) ds4_die(c.error);
+    if (!cursor_u64(&c, n_kv)) ds4_die(c.error);
+    if (*version != 3) ds4_die("only GGUF v3 is supported");
+}
+
+/* Parse one non-first split shard and merge its tensors into the model.
+ * Shard-local offsets shift by slot_base into the global reservation; every
+ * name must be new, since splits partition tensors without overlap.
+ * Non-first shards carry only split.* keys, so consistency is checked on
+ * those (no architecture key to compare); foreign shards still fail on
+ * tensor names, types and shapes at bind time. */
+static void model_merge_split_shard(ds4_model *m, uint32_t index,
+                                    uint32_t split_count, int32_t expect_total,
+                                    uint64_t *total) {
+    if (index >= m->n_shards) ds4_die("split shard index is out of range");
+    ds4_shard *s = &m->shards[index];
+    ds4_model tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.fd = -1;
+    tmp.map = s->map;
+    tmp.size = s->size;
+    model_read_header(s->map, s->size, &tmp.version, &tmp.n_tensors, &tmp.n_kv);
+    ds4_cursor c = cursor_at_ptr(s->map, s->size, 24);
+    parse_metadata(&tmp, &c);
+    parse_tensors(&tmp, &c);
+    s->data_pos = tmp.tensor_data_pos;
+    if (tmp.alignment != m->alignment) ds4_die("split shards disagree on alignment");
+    uint32_t shard_count = 0;
+    if (!model_get_u16(&tmp, "split.count", &shard_count) || shard_count != split_count)
+        ds4_die("split shard has an unexpected split.count key");
+    int32_t shard_total = -1;
+    if (expect_total >= 0) {
+        if (!model_get_i32(&tmp, "split.tensors.count", &shard_total) ||
+            shard_total != expect_total)
+            ds4_die("split shard disagrees on split.tensors.count");
+    }
+    uint32_t split_no = 0;
+    if (!model_get_u16(&tmp, "split.no", &split_no) || split_no != index)
+        ds4_die("split shard has an unexpected split.no key");
+    if (tmp.n_tensors > UINT64_MAX - *total) ds4_die("split tensor count overflow");
+    ds4_tensor *grown = realloc(m->tensors,
+        (size_t)(*total + tmp.n_tensors) * sizeof(*grown));
+    if (!grown) ds4_die("out of memory while merging split tensors");
+    m->tensors = grown;
+    for (uint64_t i = 0; i < tmp.n_tensors; i++) {
+        ds4_tensor *t = &tmp.tensors[i];
+        for (uint64_t j = 0; j < *total; j++) {
+            if (ds4_str_equal(m->tensors[j].name, t->name))
+                ds4_die("split shards share a tensor name");
+        }
+        if (t->abs_offset > UINT64_MAX - s->slot_base)
+            ds4_die("tensor offset overflow");
+        t->abs_offset += s->slot_base;
+        t->shard = index;
+        t->file_offset = t->abs_offset - s->slot_base;
+        m->tensors[(*total)++] = *t;
+        if (t->bytes > m->max_tensor_bytes) m->max_tensor_bytes = t->bytes;
+    }
+    free(tmp.kv);
+    free(tmp.tensors);
+}
+
+static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name);
+
+/* Absorb an MTP sidecar file as extra shards of an already-open model.
+ * Only blk.48.* tensors join the trunk directory (token/output embeddings
+ * stay the trunk's); they get global offsets in a tail reservation so the
+ * single-map (m->map + abs_offset) invariant holds for every consumer -
+ * CPU, Metal no-copy buffers, CUDA staging - with no mixed-model plumbing.
+ * The sidecar struct is emptied (fds/maps move to the trunk) so closing it
+ * is a harmless no-op. Needs a trunk reservation (split GGUFs always have
+ * one); single-file trunks are refused with a clear message. */
+static void model_absorb_sidecar(ds4_model *m, ds4_model *sidecar,
+                                 bool metal_mapping, uint64_t *draft_dense_out) {
+    if (!m || !sidecar) ds4_die("internal error: missing model in sidecar absorb");
+    if (!m->reserve_base || m->reserve_size == 0)
+        ds4_die("MTP sidecar needs a reserved trunk mapping (split GGUF)");
+    if (sidecar->n_shards != 1)
+        ds4_die("MTP sidecar must be a single-file GGUF");
+    if (sidecar->alignment != m->alignment) ds4_die("MTP sidecar disagrees on alignment");
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) ds4_die("cannot query page size for sidecar mapping");
+    const uint64_t upage = (uint64_t)page;
+    const int mmap_flags = metal_mapping ? MAP_SHARED : MAP_PRIVATE;
+
+    /* Tail slots continue the trunk reservation (which carries slack for
+     * exactly this). Refuse rather than clobber if they would overrun it. */
+    uint64_t tail = m->size;
+    for (uint32_t i = 0; i < sidecar->n_shards; i++) {
+        tail = align_up(tail, upage);
+        if (tail > UINT64_MAX - sidecar->shards[i].size ||
+            align_up(tail, upage) + sidecar->shards[i].size > m->reserve_size)
+            ds4_die("MTP sidecar exceeds the trunk reservation tail slack");
+        sidecar->shards[i].slot_base = tail;
+        tail += sidecar->shards[i].size;
+    }
+    const uint64_t new_span = align_up(tail, upage);
+    if (new_span > m->reserve_size) ds4_die("MTP sidecar exceeds the trunk reservation tail slack");
+
+    /* Move the mappings: release the sidecar reservation, re-map its files
+     * at the trunk tail. fds stay open; ownership moves to the trunk. */
+    for (uint32_t i = 0; i < sidecar->n_shards; i++) {
+        ds4_shard *s = &sidecar->shards[i];
+        int tail_flags = mmap_flags | MAP_FIXED;
+        /* NOTE: no MAP_FIXED_NOREPLACE here: btrfs rejects it with
+         * spurious EEXIST even on free reservations (verified). The tail
+         * lives inside our own PROT_NONE reservation, so plain FIXED is
+         * safe by construction. */
+        void *at = mmap((uint8_t *)m->reserve_base + s->slot_base, (size_t)s->size,
+                        PROT_READ, tail_flags, s->fd, 0);
+        if (at == MAP_FAILED) ds4_die_errno("cannot map sidecar shard", "MTP sidecar");
+        s->map = at;
+    }
+    if (sidecar->reserve_base)
+        munmap(sidecar->reserve_base, (size_t)sidecar->reserve_size);
+
+    /* Merge blk.48.* tensors with global offsets. */
+    uint64_t total = m->n_tensors;
+    uint64_t draft_dense = 0;
+    for (uint64_t i = 0; i < sidecar->n_tensors; i++) {
+        ds4_tensor *t = &sidecar->tensors[i];
+        if (t->name.len <= 7 || memcmp(t->name.ptr, "blk.48.", 7) != 0) continue;
+        for (uint64_t j = 0; j < total; j++) {
+            if (ds4_str_equal(m->tensors[j].name, t->name))
+                ds4_die("sidecar tensor duplicates a trunk tensor");
+        }
+        ds4_tensor *grown = realloc(m->tensors, (size_t)(total + 1) * sizeof(*grown));
+        if (!grown) ds4_die("out of memory while merging sidecar tensors");
+        m->tensors = grown;
+        if (t->abs_offset > UINT64_MAX - sidecar->shards[t->shard].slot_base)
+            ds4_die("tensor offset overflow");
+        t->abs_offset += sidecar->shards[t->shard].slot_base;
+        const uint32_t shard = m->n_shards + t->shard;
+        if (shard >= DS4_MAX_SHARDS) ds4_die("too many shards after sidecar absorb");
+        t->file_offset = t->abs_offset - sidecar->shards[t->shard].slot_base;
+        t->shard = shard;
+        m->tensors[total++] = *t;
+        if (t->bytes > m->max_tensor_bytes) m->max_tensor_bytes = t->bytes;
+        if (t->ndim != 3) draft_dense += t->bytes;
+    }
+    if (total == m->n_tensors) ds4_die("MTP sidecar contributed no blk.48 tensors");
+    for (uint32_t i = 0; i < sidecar->n_shards; i++) {
+        if (m->n_shards >= DS4_MAX_SHARDS) ds4_die("too many shards after sidecar absorb");
+        m->shards[m->n_shards++] = sidecar->shards[i];
+    }
+    m->n_tensors = total;
+    m->size = tail;
+    m->reserve_size = new_span;
+    m->file_size += sidecar->file_size;
+    if (draft_dense_out) *draft_dense_out = draft_dense;
+    /* The merge above may have moved the tensor array: re-resolve the
+     * n-gram pointer set at trunk open, or PLE reads use a dangling
+     * pointer (observed as EINVAL on the first prefill). */
+    if (m->ngram_tensor) {
+        m->ngram_tensor = model_find_tensor(m, "per_layer_token_embd.weight");
+        if (!m->ngram_tensor) ds4_die("MTP sidecar absorb lost the n-gram table");
+    }
+    free(sidecar->kv);
+    free(sidecar->tensors);
+    memset(sidecar, 0, sizeof(*sidecar));
+    sidecar->fd = -1;
+    sidecar->ngram_fd = -1;
+    for (uint32_t i = 0; i < DS4_MAX_SHARDS; i++) sidecar->shards[i].fd = -1;
+}
+
+/* Second phase for split GGUFs: the caller already parsed shard 0 in place.
+ * Every shard is re-mapped into one contiguous virtual reservation (page
+ * padded slots, no bytes copied), so all existing map+offset math — CPU,
+ * Metal no-copy buffers, CUDA staging — keeps working unchanged. */
+static void model_open_split(ds4_model *m, const char *path, bool metal_mapping,
+                             uint32_t split_count) {
+    uint64_t prefix_len = 0;
+    uint32_t path_no = 0, path_count = 0;
+    if (!model_split_path_parse(path, &prefix_len, &path_no, &path_count) || path_no != 1)
+        ds4_die("split GGUF must be opened by its -00001-of-... shard");
+    if (path_count != split_count)
+        ds4_die("split filename disagrees with the split.count key");
+    if (split_count > DS4_MAX_SHARDS)
+        ds4_die("split GGUF has too many shards");
+    uint32_t split_no = 0;
+    if (!model_get_u16(m, "split.no", &split_no) || split_no != 0)
+        ds4_die("first split shard must carry split.no 0");
+
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) ds4_die("cannot query page size for split mapping");
+    const uint64_t upage = (uint64_t)page;
+
+    /* Open the siblings before touching the shard-0 mapping. */
+    uint64_t sizes[DS4_MAX_SHARDS];
+    int fds[DS4_MAX_SHARDS];
+    uint64_t slot_base[DS4_MAX_SHARDS];
+    sizes[0] = m->shards[0].size;
+    fds[0] = m->shards[0].fd;
+    slot_base[0] = 0;
+    char sib[4096];
+    for (uint32_t i = 1; i < split_count; i++) {
+        model_split_sibling(sib, sizeof(sib), path, prefix_len, i + 1, split_count);
+        int sfd = open(sib, O_RDONLY);
+        if (sfd == -1) ds4_die_errno("cannot open split shard", sib);
+        struct stat sst;
+        if (fstat(sfd, &sst) == -1) ds4_die_errno("cannot stat split shard", sib);
+        if (sst.st_size < 32) ds4_die("split shard is too small to be GGUF");
+        fds[i] = sfd;
+        sizes[i] = (uint64_t)sst.st_size;
+        slot_base[i] = align_up(slot_base[i - 1] + sizes[i - 1], upage);
+    }
+    const uint64_t end = slot_base[split_count - 1] + sizes[split_count - 1];
+    const uint64_t span = align_up(end, upage);
+    /* Tail slack: PROT_NONE VA reserved past the span so a later MTP
+     * sidecar can be absorbed contiguously. Do not trust unreserved space
+     * after the span: blind MAP_FIXED there clobbered live mappings and
+     * killed the process with trashed stacks. Costs address space only. */
+    const uint64_t tail_slack = 4ull * 1073741824ull;
+    const uint64_t reserve_span = span + tail_slack;
+
+    int reserve_flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_NORESERVE
+    reserve_flags |= MAP_NORESERVE;
+#endif
+    void *reserve = mmap(NULL, (size_t)reserve_span, PROT_NONE, reserve_flags, -1, 0);
+    if (reserve == MAP_FAILED) ds4_die_errno("cannot reserve address space for split model", path);
+
+    /* Shard 0 was parsed from a throwaway mapping; its names die with it. */
+    if (munmap((void *)m->map, (size_t)m->size) != 0)
+        ds4_die_errno("cannot release temporary shard mapping", path);
+    free(m->kv);
+    m->kv = NULL;
+    free(m->tensors);
+    m->tensors = NULL;
+
+    /* MAP_FIXED replaces the PROT_NONE reservation slots above; the range
+     * is ours, so plain FIXED is correct (NOREPLACE would refuse our own
+     * reservation). */
+    const int mmap_flags = metal_mapping ? MAP_SHARED : MAP_PRIVATE;
+    const int map_flags = mmap_flags | MAP_FIXED;
+    const uint8_t *fixed[DS4_MAX_SHARDS];
+    for (uint32_t i = 0; i < split_count; i++) {
+        void *at = mmap((uint8_t *)reserve + slot_base[i], (size_t)sizes[i],
+                        PROT_READ, map_flags, fds[i], 0);
+        if (at == MAP_FAILED) ds4_die_errno("cannot map split shard", path);
+        fixed[i] = at;
+    }
+
+    uint64_t file_total = 0;
+    for (uint32_t i = 0; i < split_count; i++) {
+        if (sizes[i] > UINT64_MAX - file_total) ds4_die("split size overflow");
+        file_total += sizes[i];
+        m->shards[i].fd = fds[i];
+        m->shards[i].map = fixed[i];
+        m->shards[i].size = sizes[i];
+        m->shards[i].slot_base = slot_base[i];
+        m->shards[i].data_pos = 0;
+    }
+    m->fd = fds[0];
+    m->map = reserve;
+    m->size = end;
+    m->file_size = file_total;
+    m->reserve_base = reserve;
+    m->reserve_size = reserve_span;
+    m->n_shards = split_count;
+    m->max_tensor_bytes = 0;
+
+    /* Re-parse shard 0 at its reserved slot, then merge the rest. */
+    model_read_header(fixed[0], sizes[0], &m->version, &m->n_tensors, &m->n_kv);
+    ds4_cursor c0 = cursor_at_ptr(fixed[0], sizes[0], 24);
+    parse_metadata(m, &c0);
+    parse_tensors(m, &c0);
+    m->shards[0].data_pos = m->tensor_data_pos;
+
+    int32_t expect_total = -1;
+    (void)model_get_i32(m, "split.tensors.count", &expect_total);
+    uint64_t total = m->n_tensors;
+    for (uint32_t i = 1; i < split_count; i++)
+        model_merge_split_shard(m, i, split_count, expect_total, &total);
+    m->n_tensors = total;
+    if (expect_total >= 0 && (uint64_t)expect_total != total)
+        ds4_die("split tensor total disagrees with split.tensors.count");
+}
+/* Like V4.1 Engram, the n-gram table is excluded from the resident mapping.
+ * The legacy trailing table keeps its exact old behavior; a mid-file table
+ * (split GGUFs) only loses its whole pages, keeping neighbors valid. Either
+ * way the table is read via pread, never through the mapping, which keeps
+ * warming and future whole-model GPU views from faulting it in. */
 static void model_unmap_qwen_ngrams(ds4_model *m, const char *path) {
     ds4_str arch = {0};
     if (!model_get_string(m, "general.architecture", &arch) ||
@@ -2908,9 +3390,10 @@ static void model_unmap_qwen_ngrams(ds4_model *m, const char *path) {
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const ds4_tensor *t = &m->tensors[i];
         if (ds4_streq(t->name, "per_layer_token_embd.weight")) {
-            if (table || t->type != DS4_TENSOR_BF16 || t->ndim != 2 ||
-                !t->dim[0] || t->dim[0] > 160 || !t->dim[1] || t->dim[1] > UINT32_MAX)
-                ds4_die("Qwen requires original BF16 n-grams; repack with gguf-tools/qwen4_native_ngrams.py");
+            if (table || (t->type != DS4_TENSOR_BF16 && t->type != DS4_TENSOR_IQ4_NL) ||
+                t->ndim != 2 || !t->dim[0] || t->dim[0] > 160 ||
+                !t->dim[1] || t->dim[1] > UINT32_MAX)
+                ds4_die("Qwen requires BF16 or IQ4_NL n-grams; repack with gguf-tools/qwen4_native_ngrams.py");
             table = t;
         } else {
             if (!t->bytes) ds4_die("unsupported Qwen resident tensor type");
@@ -2922,29 +3405,56 @@ static void model_unmap_qwen_ngrams(ds4_model *m, const char *path) {
      * rejects them when binding its required n-gram tensor. */
     if (!table) return;
     const long page = sysconf(_SC_PAGESIZE);
-    if (page <= 0 || table->abs_offset % (uint64_t)page || resident_end > table->abs_offset)
-        ds4_die("Qwen n-grams must follow page-aligned weights; repack with gguf-tools/qwen4_native_ngrams.py");
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    struct stat main_st, table_st;
-    if (fd < 0) ds4_die_errno("cannot open n-gram table", path);
-    if (fstat(fd, &table_st) || fstat(m->fd, &main_st) ||
-        table_st.st_dev != main_st.st_dev || table_st.st_ino != main_st.st_ino ||
-        table_st.st_size < 0 || (uint64_t)table_st.st_size != m->file_size) {
+    if (page <= 0) ds4_die("cannot query page size for n-gram mapping");
+    const uint64_t upage = (uint64_t)page;
+    if (table->shard >= m->n_shards) ds4_die("n-gram table shard is out of range");
+    /* Disk reads address the table's own shard file, not the shard-0 path. */
+    const char *table_path = path;
+    char sib[4096];
+    if (m->n_shards > 1) {
+        uint64_t prefix_len = 0;
+        uint32_t path_no = 0, path_count = 0;
+        if (!model_split_path_parse(path, &prefix_len, &path_no, &path_count))
+            ds4_die("split model path lost its shard suffix");
+        model_split_sibling(sib, sizeof(sib), path, prefix_len,
+                            table->shard + 1, m->n_shards);
+        table_path = sib;
+    }
+    int fd = open(table_path, O_RDONLY | O_CLOEXEC);
+    struct stat shard_st, table_st;
+    if (fd < 0) ds4_die_errno("cannot open n-gram table", table_path);
+    if (fstat(fd, &table_st) || fstat(m->shards[table->shard].fd, &shard_st) ||
+        table_st.st_dev != shard_st.st_dev || table_st.st_ino != shard_st.st_ino ||
+        table_st.st_size < 0 || (uint64_t)table_st.st_size != m->shards[table->shard].size) {
         close(fd);
         ds4_die("Qwen GGUF changed while opening its n-grams");
     }
 #ifdef __APPLE__
     if (fcntl(fd, F_NOCACHE, 1) || fcntl(fd, F_RDAHEAD, 0))
-        ds4_die_errno("cannot configure n-gram disk reads", path);
+        ds4_die_errno("cannot configure n-gram disk reads", table_path);
 #elif defined(POSIX_FADV_RANDOM)
-    (void)posix_fadvise(fd, (off_t)table->abs_offset, (off_t)table->bytes, POSIX_FADV_RANDOM);
+    (void)posix_fadvise(fd, (off_t)table->file_offset, (off_t)table->bytes, POSIX_FADV_RANDOM);
 #ifdef POSIX_FADV_NOREUSE
-    (void)posix_fadvise(fd, (off_t)table->abs_offset, (off_t)table->bytes, POSIX_FADV_NOREUSE);
+    (void)posix_fadvise(fd, (off_t)table->file_offset, (off_t)table->bytes, POSIX_FADV_NOREUSE);
 #endif
 #endif
-    if (munmap((void *)(m->map + table->abs_offset), (size_t)(m->size - table->abs_offset)))
-        ds4_die_errno("cannot unmap disk-only n-grams", path);
-    m->size = table->abs_offset;
+    if (resident_end <= table->abs_offset && table->abs_offset % upage == 0) {
+        /* Trailing page-aligned table: legacy behavior, unmap to the end. */
+        if (table->abs_offset > m->size ||
+            munmap((void *)(m->map + table->abs_offset),
+                   (size_t)(m->size - table->abs_offset)))
+            ds4_die_errno("cannot unmap disk-only n-grams", table_path);
+        m->size = table->abs_offset;
+    } else {
+        /* Mid-file table: drop whole pages only, neighbors stay mapped. */
+        const uint64_t hole0 = align_up(table->abs_offset, upage);
+        const uint64_t hole1 = (table->abs_offset + table->bytes) & ~(upage - 1);
+        if (hole1 > hole0 &&
+            munmap((void *)(m->map + hole0), (size_t)(hole1 - hole0)))
+            ds4_die_errno("cannot unmap disk-only n-grams", table_path);
+        /* m->size keeps spanning the later shards; prefetch and warming
+         * skip the table range explicitly. */
+    }
     m->ngram_fd = fd;
     m->ngram_tensor = table;
 }
@@ -2958,6 +3468,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     memset(m, 0, sizeof(*m));
     m->fd = -1;
     m->ngram_fd = -1;
+    for (uint32_t i = 0; i < DS4_MAX_SHARDS; i++) m->shards[i].fd = -1;
 
     int fd = open(path, O_RDONLY);
     if (fd == -1) ds4_die_errno("cannot open model", path);
@@ -2986,19 +3497,25 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     m->map = map;
     m->size = (uint64_t)st.st_size;
     m->file_size = m->size;
+    m->n_shards = 1;
+    m->shards[0].fd = fd;
+    m->shards[0].map = map;
+    m->shards[0].size = m->size;
+    m->shards[0].slot_base = 0;
 
-    ds4_cursor c = cursor_at(m, 0);
-    uint32_t magic;
-    if (!cursor_u32(&c, &magic)) ds4_die(c.error);
-    if (magic != DS4_GGUF_MAGIC) ds4_die("model is not a GGUF file");
-    if (!cursor_u32(&c, &m->version)) ds4_die(c.error);
-    if (!cursor_u64(&c, &m->n_tensors)) ds4_die(c.error);
-    if (!cursor_u64(&c, &m->n_kv)) ds4_die(c.error);
-
-    if (m->version != 3) ds4_die("only GGUF v3 is supported");
-
+    model_read_header(map, m->size, &m->version, &m->n_tensors, &m->n_kv);
+    ds4_cursor c = cursor_at(m, 24);
     parse_metadata(m, &c);
     parse_tensors(m, &c);
+    m->shards[0].data_pos = m->tensor_data_pos;
+
+    /* Split GGUFs carry their tensor directory across shards; shard 0 holds
+     * only metadata. Re-map every shard into one reservation (below) so all
+     * downstream offset math keeps working on the merged directory. */
+    uint32_t split_count = 0;
+    if (model_get_u16(m, "split.count", &split_count) && split_count > 1)
+        model_open_split(m, path, metal_mapping, split_count);
+
     model_unmap_engram(m);
     model_unmap_qwen_ngrams(m, path);
 
@@ -3348,6 +3865,37 @@ static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
         }
     }
     return NULL;
+}
+
+/* Pure row gather behind the MTP draft head: raw row bytes, so scoring the
+ * subset matches scoring those rows of the full head exactly. CPU-side so
+ * the NO_GPU unit tests cover it; the GPU graph only uploads the result. */
+static uint64_t qwen4_mtp_draft_row_bytes(uint32_t type, uint64_t dim0) {
+    if (type == DS4_TENSOR_Q8_0) {
+        if ((dim0 % 32u) != 0) return 0;
+        return (dim0 / 32u) * 34u;
+    }
+    if (type == DS4_TENSOR_Q6_K) {
+        if ((dim0 % 256u) != 0) return 0;
+        return (dim0 / 256u) * 210u;
+    }
+    return 0;
+}
+
+static bool qwen4_mtp_draft_gather_rows(const ds4_model *m, const ds4_tensor *w,
+                                        const int32_t *ids, uint32_t n, uint8_t *rows_out) {
+    if (!m || !m->map || !w || !ids || !rows_out || !n) return false;
+    if (w->ndim < 2 || w->dim[0] == 0) return false;
+    const uint64_t rb = qwen4_mtp_draft_row_bytes(w->type, w->dim[0]);
+    const uint64_t V = w->dim[1];
+    if (!rb || !V || V > m->size || rb > m->size / V) return false;
+    if (w->abs_offset > m->size || V * rb > m->size - w->abs_offset) return false;
+    const uint8_t *src = (const uint8_t *)m->map + w->abs_offset;
+    for (uint32_t i = 0; i < n; i++) {
+        if (ids[i] < 0 || (uint64_t)ids[i] >= V) return false;
+        memcpy(rows_out + (uint64_t)i * rb, src + (uint64_t)ids[i] * rb, (size_t)rb);
+    }
+    return true;
 }
 
 static ds4_tensor *model_find_tensorf(const ds4_model *m, const char *fmt, ...) {
@@ -3705,27 +4253,66 @@ static const void *tensor_data(const ds4_model *m, const ds4_tensor *t) {
     return m->map + t->abs_offset;
 }
 /* Optional startup pass that touches tensor pages before timing generation. */
+/* Walkable weight ranges: one per shard from its tensor-data start, minus
+ * the disk-only n-gram table wherever it sits. Gaps between split slots
+ * are unmapped reservation padding and must never be touched. */
+typedef struct { uint64_t off, len; } ds4_weight_seg;
+
+static uint32_t model_weight_segs(const ds4_model *m, ds4_weight_seg *segs, uint32_t cap) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < m->n_shards && i < DS4_MAX_SHARDS; i++) {
+        const ds4_shard *s = &m->shards[i];
+        if (!s->map || s->size == 0) continue;
+        uint64_t start = s->slot_base + s->data_pos;
+        uint64_t end = s->slot_base + s->size;
+        if (end > m->size) end = m->size;
+        if (end <= start) continue;
+        if (m->ngram_tensor && m->ngram_tensor->shard == i) {
+            const uint64_t t0 = m->ngram_tensor->abs_offset;
+            const uint64_t t1 = t0 + m->ngram_tensor->bytes;
+            if (t0 > start && n < cap) {
+                segs[n].off = start;
+                segs[n].len = t0 - start;
+                n++;
+            }
+            if (t1 >= end) continue;
+            start = t1;
+        }
+        if (n < cap) {
+            segs[n].off = start;
+            segs[n].len = end - start;
+            n++;
+        }
+    }
+    return n;
+}
+
 static void model_warm_weights(const ds4_model *m) {
-    const uint64_t start = m->tensor_data_pos;
-    const uint64_t end = m->size;
-    if (start >= end) return;
+    ds4_weight_seg segs[2 * DS4_MAX_SHARDS];
+    const uint32_t nseg = model_weight_segs(m, segs, 2 * DS4_MAX_SHARDS);
+    if (nseg == 0) return;
 
     const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
     const uint8_t *p = m->map;
     volatile uint64_t checksum = 0;
     const double t0 = now_sec();
 
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < nseg; i++) total += segs[i].len;
     fprintf(stderr, "ds4: warming mapped tensor pages: %.2f GiB\n",
-            (double)(end - start) / (1024.0 * 1024.0 * 1024.0));
+            (double)total / (1024.0 * 1024.0 * 1024.0));
 
-#if defined(POSIX_MADV_WILLNEED)
-    (void)posix_madvise((void *)(p + start), (size_t)(end - start), POSIX_MADV_WILLNEED);
-#endif
-
-    for (uint64_t off = start; off < end; off += page) {
-        checksum += p[off];
+    for (uint32_t i = 0; i < nseg; i++) {
+        model_prefetch_range(p + segs[i].off, segs[i].len);
     }
-    checksum += p[end - 1];
+
+    for (uint32_t i = 0; i < nseg; i++) {
+        const uint64_t end = segs[i].off + segs[i].len;
+        for (uint64_t off = segs[i].off; off < end; off += page) {
+            checksum += p[off];
+        }
+        checksum += p[end - 1];
+    }
 
     const double t1 = now_sec();
     fprintf(stderr, "ds4: warmed tensor pages in %.3fs (checksum=%llu)\n",
@@ -4784,6 +5371,1589 @@ DS4_IQ_VEC_DOT(ds4_vec_dot_iq1_s_f32, block_iq1_s, ds4_dequant_row_iq1_s)
 DS4_IQ_VEC_DOT(ds4_vec_dot_iq1_m_f32, block_iq1_m, ds4_dequant_row_iq1_m)
 DS4_IQ_VEC_DOT(ds4_vec_dot_iq4_xs_f32, block_iq4_xs, ds4_dequant_row_iq4_xs)
 
+/* Byte-exact mirror of llama.cpp dequantize_row_iq4_nl (low nibble first). */
+static DS4_MAYBE_UNUSED void ds4_dequant_row_iq4_nl(const block_iq4_nl *x, float *y, int64_t k) {
+    const int64_t nb = k / QK4_NL;
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d);
+        const uint8_t *qs = x[i].qs;
+        for (int j = 0; j < QK4_NL / 2; j++) {
+            y[j] = d * (float)kvalues_iq4nl[qs[j] & 0x0f];
+            y[j + QK4_NL / 2] = d * (float)kvalues_iq4nl[qs[j] >> 4];
+        }
+        y += QK4_NL;
+    }
+}
+DS4_IQ_VEC_DOT(ds4_vec_dot_iq4_nl_f32, block_iq4_nl, ds4_dequant_row_iq4_nl)
+
+/* ------------------------------------------------------------------------
+ * Qwen3.8 CPU MoE expert kernels.
+ *
+ * Decode touches ~1 GB/token of packed routed-expert weights; on this class
+ * of machine the DDR bandwidth is several times the PCIe link, so computing
+ * the experts on the CPU from the mmapped file (page cache) beats streaming
+ * them to the GPU.  llama.cpp's auto-fit takes the same route (MoE tensors
+ * to system memory).  These kernels mirror the scalar reference dequantizers
+ * above value for value in fp32; only the summation order differs, which the
+ * A/B battery (short probes, FT_LIST) bounds.
+ * ------------------------------------------------------------------------ */
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+#define DS4_CPU_AVX512 1
+/* 16 packed int8 -> 16 fp32. */
+static inline __m512 qwen4_cpu_cvt_i8_16(const void *p) {
+    return _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)p)));
+}
+/* 8 sign bits -> 8 negation bytes (0xFF where the bit is set). */
+static inline __m128i qwen4_cpu_sign_mask8(uint8_t s) {
+    const __m128i bits = _mm_setr_epi8(1, 2, 4, 8, 16, 32, 64, (char)0x80, 0, 0, 0, 0, 0, 0, 0, 0);
+    const __m128i sv = _mm_set1_epi8((char)s);
+    return _mm_cmpeq_epi8(_mm_and_si128(sv, bits), bits);
+}
+
+/* IQ4_NL: 32 values per 18-byte block (f16 scale + 16 nibbles). */
+static float qwen4_cpu_dot_iq4_nl_simd(const void *row, const float *x, uint32_t k) {
+    const block_iq4_nl *blk = (const block_iq4_nl *)row;
+    const __m128i lut = _mm_loadu_si128((const __m128i *)kvalues_iq4nl);
+    const __m128i nib = _mm_set1_epi8(0x0f);
+    __m512 acc = _mm512_setzero_ps();
+    for (uint32_t i = 0; i < k / 32u; i++) {
+        const __m128i q = _mm_loadu_si128((const __m128i *)blk[i].qs);
+        const __m128i vlo = _mm_shuffle_epi8(lut, _mm_and_si128(q, nib));
+        const __m128i vhi = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(q, 4), nib));
+        const __m512 d = _mm512_set1_ps(f16_to_f32(blk[i].d));
+        const __m512 f0 = _mm512_mul_ps(qwen4_cpu_cvt_i8_16(&vlo), d);
+        const __m512 f1 = _mm512_mul_ps(qwen4_cpu_cvt_i8_16(&vhi), d);
+        const float *y = x + (uint64_t)i * 32u;
+        acc = _mm512_fmadd_ps(f0, _mm512_loadu_ps(y), acc);
+        acc = _mm512_fmadd_ps(f1, _mm512_loadu_ps(y + 16), acc);
+    }
+    return _mm512_reduce_add_ps(acc);
+}
+
+/* Q2_0: 64 values per 18-byte block (f16 scale + 16 packed 2-bit bytes,
+ * LSB-first, 00 = -1 .. 11 = +2).  ISTA down experts.  Four 2-bit fields per
+ * byte are unpacked with shift/mask and re-interleaved back into value order
+ * (v0..v15, v16..v31, ...) before the fp32 FMA. */
+static float qwen4_cpu_dot_q2_0_simd(const void *row, const float *x, uint32_t k) {
+    const block_q2_0 *blk = (const block_q2_0 *)row;
+    const __m128i m3 = _mm_set1_epi8(3);
+    __m512 acc = _mm512_setzero_ps();
+    for (uint32_t i = 0; i < k / 64u; i++) {
+        const __m128i q = _mm_loadu_si128((const __m128i *)blk[i].qs);
+        const __m512 d = _mm512_set1_ps(f16_to_f32(blk[i].d));
+        const __m128i f0 = _mm_and_si128(q, m3);
+        const __m128i f1 = _mm_and_si128(_mm_srli_epi16(q, 2), m3);
+        const __m128i f2 = _mm_and_si128(_mm_srli_epi16(q, 4), m3);
+        const __m128i f3 = _mm_and_si128(_mm_srli_epi16(q, 6), m3);
+        const __m128i p01l = _mm_unpacklo_epi8(f0, f1);
+        const __m128i p01h = _mm_unpackhi_epi8(f0, f1);
+        const __m128i p23l = _mm_unpacklo_epi8(f2, f3);
+        const __m128i p23h = _mm_unpackhi_epi8(f2, f3);
+        const __m128i v0 = _mm_unpacklo_epi16(p01l, p23l);
+        const __m128i v1 = _mm_unpackhi_epi16(p01l, p23l);
+        const __m128i v2 = _mm_unpacklo_epi16(p01h, p23h);
+        const __m128i v3 = _mm_unpackhi_epi16(p01h, p23h);
+        const float *y = x + (uint64_t)i * 64u;
+        acc = _mm512_fmadd_ps(_mm512_fmsub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v0)), d, d), _mm512_loadu_ps(y), acc);
+        acc = _mm512_fmadd_ps(_mm512_fmsub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v1)), d, d), _mm512_loadu_ps(y + 16), acc);
+        acc = _mm512_fmadd_ps(_mm512_fmsub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v2)), d, d), _mm512_loadu_ps(y + 32), acc);
+        acc = _mm512_fmadd_ps(_mm512_fmsub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v3)), d, d), _mm512_loadu_ps(y + 48), acc);
+    }
+    return _mm512_reduce_add_ps(acc);
+}
+
+/* Batched twins for the prefill down phase: one fp32 row against up to 8
+ * activations.  The IQ4_NL nibble dequant (and the Q2_0 field unpack) depends
+ * only on the row, so it is built once per block and reused for every token;
+ * per token only the x loads and FMAs remain.  Per-token accumulation order
+ * is that of the single-token kernel, so results are bit-identical. */
+static void qwen4_cpu_dot_iq4_nl_batch(const void *row, const float *const *xs, float *const *outs,
+                                       uint32_t n, uint32_t k) {
+    const block_iq4_nl *blk = (const block_iq4_nl *)row;
+    const __m128i lut = _mm_loadu_si128((const __m128i *)kvalues_iq4nl);
+    const __m128i nib = _mm_set1_epi8(0x0f);
+    if (n == 0u) return;
+    if (n > 8u) n = 8u;
+    __m512 acc[8];
+    for (uint32_t b = 0; b < n; b++) acc[b] = _mm512_setzero_ps();
+    for (uint32_t i = 0; i < k / 32u; i++) {
+        const __m128i q = _mm_loadu_si128((const __m128i *)blk[i].qs);
+        const __m128i vlo = _mm_shuffle_epi8(lut, _mm_and_si128(q, nib));
+        const __m128i vhi = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(q, 4), nib));
+        const __m512 d = _mm512_set1_ps(f16_to_f32(blk[i].d));
+        const __m512 f0 = _mm512_mul_ps(qwen4_cpu_cvt_i8_16(&vlo), d);
+        const __m512 f1 = _mm512_mul_ps(qwen4_cpu_cvt_i8_16(&vhi), d);
+        for (uint32_t b = 0; b < n; b++) {
+            const float *y = xs[b] + (uint64_t)i * 32u;
+            acc[b] = _mm512_fmadd_ps(f0, _mm512_loadu_ps(y), acc[b]);
+            acc[b] = _mm512_fmadd_ps(f1, _mm512_loadu_ps(y + 16), acc[b]);
+        }
+    }
+    for (uint32_t b = 0; b < n; b++) *outs[b] = _mm512_reduce_add_ps(acc[b]);
+}
+
+static void qwen4_cpu_dot_q2_0_batch(const void *row, const float *const *xs, float *const *outs,
+                                     uint32_t n, uint32_t k) {
+    const block_q2_0 *blk = (const block_q2_0 *)row;
+    const __m128i m3 = _mm_set1_epi8(3);
+    if (n == 0u) return;
+    if (n > 8u) n = 8u;
+    __m512 acc[8];
+    for (uint32_t b = 0; b < n; b++) acc[b] = _mm512_setzero_ps();
+    for (uint32_t i = 0; i < k / 64u; i++) {
+        const __m128i q = _mm_loadu_si128((const __m128i *)blk[i].qs);
+        const __m512 d = _mm512_set1_ps(f16_to_f32(blk[i].d));
+        const __m128i f0 = _mm_and_si128(q, m3);
+        const __m128i f1 = _mm_and_si128(_mm_srli_epi16(q, 2), m3);
+        const __m128i f2 = _mm_and_si128(_mm_srli_epi16(q, 4), m3);
+        const __m128i f3 = _mm_and_si128(_mm_srli_epi16(q, 6), m3);
+        const __m128i p01l = _mm_unpacklo_epi8(f0, f1);
+        const __m128i p01h = _mm_unpackhi_epi8(f0, f1);
+        const __m128i p23l = _mm_unpacklo_epi8(f2, f3);
+        const __m128i p23h = _mm_unpackhi_epi8(f2, f3);
+        const __m128i v0 = _mm_unpacklo_epi16(p01l, p23l);
+        const __m128i v1 = _mm_unpackhi_epi16(p01l, p23l);
+        const __m128i v2 = _mm_unpacklo_epi16(p01h, p23h);
+        const __m128i v3 = _mm_unpackhi_epi16(p01h, p23h);
+        const __m512 g0 = _mm512_fmsub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v0)), d, d);
+        const __m512 g1 = _mm512_fmsub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v1)), d, d);
+        const __m512 g2 = _mm512_fmsub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v2)), d, d);
+        const __m512 g3 = _mm512_fmsub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v3)), d, d);
+        for (uint32_t b = 0; b < n; b++) {
+            const float *y = xs[b] + (uint64_t)i * 64u;
+            acc[b] = _mm512_fmadd_ps(g0, _mm512_loadu_ps(y + 0), acc[b]);
+            acc[b] = _mm512_fmadd_ps(g1, _mm512_loadu_ps(y + 16), acc[b]);
+            acc[b] = _mm512_fmadd_ps(g2, _mm512_loadu_ps(y + 32), acc[b]);
+            acc[b] = _mm512_fmadd_ps(g3, _mm512_loadu_ps(y + 48), acc[b]);
+        }
+    }
+    for (uint32_t b = 0; b < n; b++) *outs[b] = _mm512_reduce_add_ps(acc[b]);
+}
+
+/* Grid rows and sign patterns as fp32: unpacking a grid row to floats costs
+ * more than the dot it feeds, so the 8-value magnitudes and the 8-bit sign
+ * patterns are expanded once at startup (32 KiB + 8 KiB, L1/L2 resident). */
+static float g_iq2s_f32[1024][8];
+static __m256i g_iq2s_sign[256];
+static float g_iq3s_f32[512][4];
+static bool g_qwen4_cpu_tables_ready;
+static pthread_once_t g_qwen4_cpu_tables_once = PTHREAD_ONCE_INIT;
+
+static void qwen4_cpu_tables_init(void) {
+    for (int g = 0; g < 1024; g++) {
+        const uint8_t *b = (const uint8_t *)&iq2s_grid[g];
+        for (int j = 0; j < 8; j++) g_iq2s_f32[g][j] = (float)b[j];
+    }
+    for (int sg = 0; sg < 256; sg++) {
+        int32_t m[8];
+        for (int j = 0; j < 8; j++) m[j] = (sg & kmask_iq2xs[j]) ? (int32_t)0x80000000u : 0;
+        g_iq2s_sign[sg] = _mm256_loadu_si256((const __m256i *)m);
+    }
+    for (int g = 0; g < 512; g++) {
+        const uint8_t *b = (const uint8_t *)&iq3s_grid[g];
+        for (int j = 0; j < 4; j++) g_iq3s_f32[g][j] = (float)b[j];
+    }
+    g_qwen4_cpu_tables_ready = true;
+}
+
+/* IQ2_S: 256 values per 82-byte block (f16 d, 64 qs, 8 qh, 8 scales).
+ * Each 32-value group is four 8-value grid rows (quantized magnitudes with
+ * per-row sign bits) scaled by two 4-bit sub-scales. */
+static float qwen4_cpu_dot_iq2_s_simd(const void *row, const float *x, uint32_t k) {
+    const block_iq2_s *blk = (const block_iq2_s *)row;
+    pthread_once(&g_qwen4_cpu_tables_once, qwen4_cpu_tables_init);
+    __m512 acc = _mm512_setzero_ps();
+    for (uint32_t i = 0; i < k / 256u; i++) {
+        const float d = f16_to_f32(blk[i].d);
+        const uint8_t *qs = blk[i].qs;
+        const uint8_t *qh = blk[i].qh;
+        const uint8_t *sgn = blk[i].qs + QK_K / 8;
+        for (uint32_t ib = 0; ib < 8u; ib++) {
+            const uint8_t sc = blk[i].scales[ib];
+            const __m256 db0 = _mm256_set1_ps(d * (0.5f + (float)(sc & 0x0f)) * 0.25f);
+            const __m256 db1 = _mm256_set1_ps(d * (0.5f + (float)(sc >> 4)) * 0.25f);
+            __m256 lo = _mm256_setzero_ps(), hi = _mm256_setzero_ps();
+            for (uint32_t l = 0; l < 4u; l++) {
+                const uint32_t idx = ((uint32_t)qs[4u * ib + l] |
+                                      (((uint32_t)qh[ib] << (8 - 2 * l)) & 0x300u)) & 1023u;
+                const __m256 mag = _mm256_loadu_ps(g_iq2s_f32[idx]);
+                const __m256 sv = _mm256_xor_ps(mag, _mm256_castsi256_ps(g_iq2s_sign[sgn[4u * ib + l]]));
+                const float *y = x + (uint64_t)i * 256u + 32u * ib + 8u * l;
+                if (l < 2u) lo = _mm256_fmadd_ps(sv, _mm256_loadu_ps(y), lo);
+                else hi = _mm256_fmadd_ps(sv, _mm256_loadu_ps(y), hi);
+            }
+            acc = _mm512_add_ps(acc, _mm512_insertf32x8(
+                _mm512_castps256_ps512(_mm256_mul_ps(lo, db0)), _mm256_mul_ps(hi, db1), 1));
+        }
+    }
+    return _mm512_reduce_add_ps(acc);
+}
+
+/* IQ3_S: 256 values per 110-byte block.  Values come in 4-wide grid rows,
+ * so a 32-value group needs eight row loads; two sub-scales per 64 values. */
+static float qwen4_cpu_dot_iq3_s_simd(const void *row, const float *x, uint32_t k) {
+    const block_iq3_s *blk = (const block_iq3_s *)row;
+    __m512 acc = _mm512_setzero_ps();
+    for (uint32_t i = 0; i < k / 256u; i++) {
+        const float d = f16_to_f32(blk[i].d);
+        /* Four 64-value steps: qs +16, signs +8, qh +2 and scales +1 each. */
+        for (uint32_t t = 0; t < 4u; t++) {
+            const float db1 = d * (1.0f + 2.0f * (float)(blk[i].scales[t] & 0x0f));
+            const float db2 = d * (1.0f + 2.0f * (float)(blk[i].scales[t] >> 4));
+            for (uint32_t half = 0; half < 2u; half++) {
+                const uint8_t *q = blk[i].qs + t * 16u + half * 8u;
+                const uint8_t *sc = blk[i].signs + t * 8u + half * 4u;
+                const uint8_t qhb = blk[i].qh[2u * t + half];
+                __m128i mag[4], neg[4];
+                for (uint32_t l = 0; l < 4; l++) {
+                    const uint32_t g1 = (uint32_t)q[2 * l + 0] | (((uint32_t)qhb << (8 - 2 * l)) & 256u);
+                    const uint32_t g2 = (uint32_t)q[2 * l + 1] | (((uint32_t)qhb << (7 - 2 * l)) & 256u);
+                    mag[l] = _mm_unpacklo_epi32(_mm_cvtsi32_si128((int)iq3s_grid[g1 & 511u]),
+                                                _mm_cvtsi32_si128((int)iq3s_grid[g2 & 511u]));
+                    neg[l] = qwen4_cpu_sign_mask8(sc[l]);
+                }
+                const __m256i m32 = _mm256_set_m128i(_mm_unpacklo_epi64(mag[2], mag[3]),
+                                                     _mm_unpacklo_epi64(mag[0], mag[1]));
+                const __m256i s32 = _mm256_set_m128i(_mm_unpacklo_epi64(neg[2], neg[3]),
+                                                     _mm_unpacklo_epi64(neg[0], neg[1]));
+                const __m256i v = _mm256_sub_epi8(_mm256_xor_si256(m32, s32), s32);
+                const float db = half ? db2 : db1;
+                const __m512 dvec = _mm512_set1_ps(db);
+                const __m512 f0 = _mm512_mul_ps(qwen4_cpu_cvt_i8_16(&v), dvec);
+                const __m512 f1 = _mm512_mul_ps(qwen4_cpu_cvt_i8_16((const char *)&v + 16), dvec);
+                const float *y = x + (uint64_t)i * 256u + 64u * t + 32u * half;
+                acc = _mm512_fmadd_ps(f0, _mm512_loadu_ps(y), acc);
+                acc = _mm512_fmadd_ps(f1, _mm512_loadu_ps(y + 16), acc);
+            }
+        }
+    }
+    return _mm512_reduce_add_ps(acc);
+}
+#endif /* DS4_CPU_AVX512 */
+
+/* ------------------------------------------------------------------------
+ * IQ2_S x Q8_K CPU kernels: the int8 route ggml takes (maddubs / VNNI).
+ *
+ * The float kernel above expands every grid row to fp32 and is issue-bound on
+ * the convert+FMA pair.  Here the activation is quantized once per MoE input
+ * into Q8_K (one fp32 scale per 256 values) and the packed grids stay int8:
+ * 64 values at a time become two maddubs (or one maddubs plus one VNNI dot)
+ * with the 4-bit sub-scales applied to the int16 products.  Grid magnitudes
+ * are <= 43 and q8 <= 127, so the maddubs pair sums stay inside int16 and the
+ * integer phase is exact; only the final fp32 scaling differs from the
+ * scalar reference.  The Q8_K activation quantizer is ds4_quantize_row_q8_K.
+ * ------------------------------------------------------------------------ */
+#if defined(__AVX2__)
+#define DS4_CPU_IQ2S_Q8K 1
+#endif
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+#define DS4_CPU_IQ2S_Q8K_VNNI 1
+#endif
+
+/* Scalar mirror of ggml's generic ggml_vec_dot_iq2_s_q8_K: the test's
+ * independent reference for the packed kernels. */
+static DS4_MAYBE_UNUSED float qwen4_cpu_dot_iq2_s_q8k_generic(const void *row, const block_q8_K *y, uint32_t k) {
+    const block_iq2_s *x = (const block_iq2_s *)row;
+    const uint32_t nb = k / QK_K;
+    float sumf = 0.0f;
+    for (uint32_t i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d) * y[i].d;
+        const int8_t *q8 = y[i].qs;
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        const uint8_t *signs = qs + QK_K / 8;
+        int32_t bsum = 0;
+        for (uint32_t ib32 = 0; ib32 < QK_K / 32; ib32++) {
+            const int32_t ls1 = 1 + 2 * (x[i].scales[ib32] & 0xf);
+            const int32_t ls2 = 1 + 2 * (x[i].scales[ib32] >> 4);
+            int32_t sumi1 = 0, sumi2 = 0;
+            for (uint32_t l = 0; l < 4; l++) {
+                const uint8_t *grid = (const uint8_t *)(iq2s_grid + (qs[l] | ((qh[ib32] << (8 - 2 * l)) & 0x300)));
+                for (int j = 0; j < 8; j++) {
+                    const int32_t v = (int32_t)q8[j] * (int32_t)grid[j] * (signs[l] & kmask_iq2xs[j] ? -1 : 1);
+                    if (l < 2) sumi1 += v; else sumi2 += v;
+                }
+                q8 += 8;
+            }
+            bsum += ls1 * sumi1 + ls2 * sumi2;
+            qs += 4;
+            signs += 4;
+        }
+        sumf += d * (float)bsum;
+    }
+    return 0.125f * sumf;
+}
+
+#if defined(DS4_CPU_IQ2S_Q8K)
+/* One sub-scale byte -> int16 [ls0 x8, ls1 x8], ls = 1 + 2*nibble.  Shared by
+ * the maddubs and VNNI kernels. */
+static int16_t g_iq2s_sc16[256][16];
+static pthread_once_t g_qwen4_sc16_once = PTHREAD_ONCE_INIT;
+static void qwen4_cpu_sc16_init(void) {
+    for (int s = 0; s < 256; s++) {
+        for (int j = 0; j < 8; j++) g_iq2s_sc16[s][j] = (int16_t)(1 + 2 * (s & 0xf));
+        for (int j = 0; j < 8; j++) g_iq2s_sc16[s][8 + j] = (int16_t)(1 + 2 * (s >> 4));
+    }
+}
+
+#if defined(DS4_CPU_IQ2S_Q8K_VNNI)
+/* AVX-512 VNNI: 64 values per step.  The 8 sign bytes are broadcast by
+ * vpshufb and tested against the bit weights; vpdpwssd folds the sub-scale
+ * multiply into the int32 accumulation. */
+static float qwen4_cpu_dot_iq2_s_q8k_vnni(const void *row, const block_q8_K *y, uint32_t k) {
+    const block_iq2_s *x = (const block_iq2_s *)row;
+    const uint32_t nb = k / QK_K;
+    const __m512i bitpat = _mm512_set1_epi64((long long)0x8040201008040201ULL);
+    const __m512i bcast = _mm512_broadcast_i32x4(_mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8, 8, 8, 8, 8));
+    pthread_once(&g_qwen4_sc16_once, qwen4_cpu_sc16_init);
+    float sumf = 0.0f;
+    for (uint32_t i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d) * y[i].d;
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        const uint8_t *sgn = x[i].qs + QK_K / 8;
+        const int8_t *q8 = y[i].qs;
+        __m512i acc = _mm512_setzero_si512();
+        for (uint32_t ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            const __m512i g = _mm512_set_epi64(
+                (long long)iq2s_grid[qs[7] | ((qh[ib32 + 1] << 2) & 0x300)],
+                (long long)iq2s_grid[qs[6] | ((qh[ib32 + 1] << 4) & 0x300)],
+                (long long)iq2s_grid[qs[5] | ((qh[ib32 + 1] << 6) & 0x300)],
+                (long long)iq2s_grid[qs[4] | ((qh[ib32 + 1] << 8) & 0x300)],
+                (long long)iq2s_grid[qs[3] | ((qh[ib32 + 0] << 2) & 0x300)],
+                (long long)iq2s_grid[qs[2] | ((qh[ib32 + 0] << 4) & 0x300)],
+                (long long)iq2s_grid[qs[1] | ((qh[ib32 + 0] << 6) & 0x300)],
+                (long long)iq2s_grid[qs[0] | ((qh[ib32 + 0] << 8) & 0x300)]);
+            const __m512i rep = _mm512_shuffle_epi8(
+                _mm512_cvtepu8_epi64(_mm_loadl_epi64((const __m128i *)(sgn + 4 * ib32))), bcast);
+            const __m512i q8v = _mm512_loadu_si512((const void *)(q8 + 32 * ib32));
+            const __m512i q8s = _mm512_mask_sub_epi8(q8v, _mm512_test_epi8_mask(rep, bitpat),
+                                                     _mm512_setzero_si512(), q8v);
+            const __m512i scv = _mm512_inserti64x4(
+                _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *)g_iq2s_sc16[x[i].scales[ib32 + 0]])),
+                _mm256_loadu_si256((const __m256i *)g_iq2s_sc16[x[i].scales[ib32 + 1]]), 1);
+            acc = _mm512_dpwssd_epi32(acc, _mm512_maddubs_epi16(g, q8s), scv);
+            qs += 8;
+        }
+        sumf += d * (float)_mm512_reduce_add_epi32(acc);
+    }
+    return 0.125f * sumf;
+}
+
+/* Batched twin for the prefill mid phase: one weight row against up to 8
+ * activations.  Grid, sign mask and sub-scales depend only on the row, so
+ * they are built once per block and reused for every token; per token only
+ * the q8 load, sign flip, maddubs and dpwssd remain.  Each token accumulates
+ * in the same order as the single-token kernel, so results are bit-identical. */
+static void qwen4_cpu_dot_iq2_s_q8k_vnni_batch(const void *row, const block_q8_K *const *ys,
+                                               float *out, uint32_t n, uint32_t k) {
+    const block_iq2_s *x = (const block_iq2_s *)row;
+    const uint32_t nb = k / QK_K;
+    if (n == 0u) return;
+    /* 16 tokens: the q8 load is already inside the token loop (one live
+     * temporary), so 16 accumulators + temps still fit the 32 zmm.  More
+     * independent chains = more outstanding L2 misses (see the mid profile). */
+    if (n > 16u) n = 16u;
+    const __m512i bitpat = _mm512_set1_epi64((long long)0x8040201008040201ULL);
+    const __m512i bcast = _mm512_broadcast_i32x4(_mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8, 8, 8, 8, 8));
+    pthread_once(&g_qwen4_sc16_once, qwen4_cpu_sc16_init);
+    __m512i acc[16];
+    float sumf[16];
+    for (uint32_t b = 0; b < n; b++) { acc[b] = _mm512_setzero_si512(); sumf[b] = 0.0f; }
+    for (uint32_t i = 0; i < nb; i++) {
+        const float dr = f16_to_f32(x[i].d);
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        const uint8_t *sgn = x[i].qs + QK_K / 8;
+        for (uint32_t ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            const __m512i g = _mm512_set_epi64(
+                (long long)iq2s_grid[qs[7] | ((qh[ib32 + 1] << 2) & 0x300)],
+                (long long)iq2s_grid[qs[6] | ((qh[ib32 + 1] << 4) & 0x300)],
+                (long long)iq2s_grid[qs[5] | ((qh[ib32 + 1] << 6) & 0x300)],
+                (long long)iq2s_grid[qs[4] | ((qh[ib32 + 1] << 8) & 0x300)],
+                (long long)iq2s_grid[qs[3] | ((qh[ib32 + 0] << 2) & 0x300)],
+                (long long)iq2s_grid[qs[2] | ((qh[ib32 + 0] << 4) & 0x300)],
+                (long long)iq2s_grid[qs[1] | ((qh[ib32 + 0] << 6) & 0x300)],
+                (long long)iq2s_grid[qs[0] | ((qh[ib32 + 0] << 8) & 0x300)]);
+            const __m512i rep = _mm512_shuffle_epi8(
+                _mm512_cvtepu8_epi64(_mm_loadl_epi64((const __m128i *)(sgn + 4 * ib32))), bcast);
+            const __mmask64 neg = _mm512_test_epi8_mask(rep, bitpat);
+            const __m512i scv = _mm512_inserti64x4(
+                _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *)g_iq2s_sc16[x[i].scales[ib32 + 0]])),
+                _mm256_loadu_si256((const __m256i *)g_iq2s_sc16[x[i].scales[ib32 + 1]]), 1);
+            for (uint32_t b = 0; b < n; b++) {
+                const __m512i q8v = _mm512_loadu_si512((const void *)(ys[b][i].qs + 32 * ib32));
+                const __m512i q8s = _mm512_mask_sub_epi8(q8v, neg, _mm512_setzero_si512(), q8v);
+                acc[b] = _mm512_dpwssd_epi32(acc[b], _mm512_maddubs_epi16(g, q8s), scv);
+            }
+            qs += 8;
+        }
+        for (uint32_t b = 0; b < n; b++) {
+            sumf[b] += dr * ys[b][i].d * (float)_mm512_reduce_add_epi32(acc[b]);
+            acc[b] = _mm512_setzero_si512();
+        }
+    }
+    for (uint32_t b = 0; b < n; b++) out[b] = 0.125f * sumf[b];
+}
+
+#endif /* DS4_CPU_IQ2S_Q8K_VNNI */
+
+/* AVX2: ggml's ggml_vec_dot_iq2_s_q8_K shape, sub-scales from the same int16
+ * table instead of a byte shuffle. */
+static DS4_MAYBE_UNUSED float qwen4_cpu_dot_iq2_s_q8k_maddubs(const void *row, const block_q8_K *y, uint32_t k) {
+    const block_iq2_s *x = (const block_iq2_s *)row;
+    const uint32_t nb = k / QK_K;
+    static const uint8_t k_mask1[32] = {
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+        2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+    };
+    static const uint8_t k_mask2[32] = {
+        1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128,
+        1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128,
+    };
+    const __m256i mask1 = _mm256_loadu_si256((const __m256i *)k_mask1);
+    const __m256i mask2 = _mm256_loadu_si256((const __m256i *)k_mask2);
+    pthread_once(&g_qwen4_sc16_once, qwen4_cpu_sc16_init);
+    __m256 accumf = _mm256_setzero_ps();
+    for (uint32_t i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d) * y[i].d;
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        const uint16_t *signs = (const uint16_t *)(x[i].qs + QK_K / 8);
+        const int8_t *q8 = y[i].qs;
+        __m256i sumi1 = _mm256_setzero_si256();
+        __m256i sumi2 = _mm256_setzero_si256();
+        for (uint32_t ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q2_1 = _mm256_set_epi64x(
+                (long long)iq2s_grid[qs[3] | ((qh[ib32 + 0] << 2) & 0x300)],
+                (long long)iq2s_grid[qs[2] | ((qh[ib32 + 0] << 4) & 0x300)],
+                (long long)iq2s_grid[qs[1] | ((qh[ib32 + 0] << 6) & 0x300)],
+                (long long)iq2s_grid[qs[0] | ((qh[ib32 + 0] << 8) & 0x300)]);
+            const __m256i q2_2 = _mm256_set_epi64x(
+                (long long)iq2s_grid[qs[7] | ((qh[ib32 + 1] << 2) & 0x300)],
+                (long long)iq2s_grid[qs[6] | ((qh[ib32 + 1] << 4) & 0x300)],
+                (long long)iq2s_grid[qs[5] | ((qh[ib32 + 1] << 6) & 0x300)],
+                (long long)iq2s_grid[qs[4] | ((qh[ib32 + 1] << 8) & 0x300)]);
+            qs += 8;
+            __m256i aux256 = _mm256_set1_epi32(signs[0] | ((uint32_t)signs[1] << 16));
+            aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256, mask1), mask2);
+            const __m256i s2_1 = _mm256_cmpeq_epi8(aux256, mask2);
+            const __m256i q8s_1 = _mm256_sub_epi8(_mm256_xor_si256(s2_1, q8_1), s2_1);
+            aux256 = _mm256_set1_epi32(signs[2] | ((uint32_t)signs[3] << 16));
+            aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256, mask1), mask2);
+            const __m256i s2_2 = _mm256_cmpeq_epi8(aux256, mask2);
+            const __m256i q8s_2 = _mm256_sub_epi8(_mm256_xor_si256(s2_2, q8_2), s2_2);
+            signs += 4;
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(_mm256_maddubs_epi16(q2_1, q8s_1),
+                _mm256_loadu_si256((const __m256i *)g_iq2s_sc16[x[i].scales[ib32 + 0]])));
+            sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(_mm256_maddubs_epi16(q2_2, q8s_2),
+                _mm256_loadu_si256((const __m256i *)g_iq2s_sc16[x[i].scales[ib32 + 1]])));
+        }
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf);
+    }
+    __m128 lo = _mm256_castps256_ps128(accumf);
+    __m128 hi = _mm256_extractf128_ps(accumf, 1);
+    lo = _mm_add_ps(lo, hi);
+    hi = _mm_movehl_ps(lo, lo);
+    lo = _mm_add_ps(lo, hi);
+    hi = _mm_shuffle_ps(lo, lo, 1);
+    lo = _mm_add_ss(lo, hi);
+    return 0.125f * _mm_cvtss_f32(lo);
+}
+#endif /* DS4_CPU_IQ2S_Q8K */
+
+/* One packed IQ2_S expert row dotted with a pre-quantized Q8_K activation. */
+static float qwen4_cpu_dot_iq2_s_q8k(const void *row, const block_q8_K *y, uint32_t k) {
+#if defined(DS4_CPU_IQ2S_Q8K_VNNI)
+    return qwen4_cpu_dot_iq2_s_q8k_vnni(row, y, k);
+#elif defined(DS4_CPU_IQ2S_Q8K)
+    return qwen4_cpu_dot_iq2_s_q8k_maddubs(row, y, k);
+#else
+    return qwen4_cpu_dot_iq2_s_q8k_generic(row, y, k);
+#endif
+}
+
+/* ------------------------------------------------------------------------
+ * IQ2_XXS / IQ2_XS / IQ3_XXS x Q8_K: the ISTA gate/up experts.
+ *
+ * Same integer route as IQ2_S above.  The 7-bit sign indices all share the
+ * ksigns_iq2xs -> +/-1 expansion in iq2xxs_signs (built once with the signed
+ * grids), applied to the Q8_K bytes with vpsignb; maddubs then multiplies the
+ * unsigned grid rows.  IQ2_XXS/IQ3_XXS carry one 4-bit scale per 32 values,
+ * IQ2_XS two (low nibble first), so the latter reuses g_iq2s_sc16.
+ * ------------------------------------------------------------------------ */
+
+/* Scalar mirrors of the ggml generics: the tests' independent references. */
+static DS4_MAYBE_UNUSED float qwen4_cpu_dot_iq2_xxs_q8k_generic(const void *row, const block_q8_K *y, uint32_t k) {
+    const block_iq2_xxs *x = (const block_iq2_xxs *)row;
+    const uint32_t nb = k / QK_K;
+    float sumf = 0.0f;
+    for (uint32_t i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d) * y[i].d;
+        const int8_t *q8 = y[i].qs;
+        const uint16_t *q2 = x[i].qs;
+        int32_t bsum = 0;
+        for (uint32_t ib32 = 0; ib32 < QK_K / 32; ib32++) {
+            uint32_t aux32[2];
+            memcpy(aux32, q2, 2 * sizeof(uint32_t));
+            q2 += 4;
+            const uint8_t *aux8 = (const uint8_t *)aux32;
+            const int32_t ls = 2 * (int32_t)(aux32[1] >> 28) + 1;
+            int32_t sumi = 0;
+            for (uint32_t l = 0; l < 4; l++) {
+                const uint8_t *grid = (const uint8_t *)(iq2xxs_grid + aux8[l]);
+                const uint8_t signs = ksigns_iq2xs[(aux32[1] >> (7 * l)) & 127];
+                for (int j = 0; j < 8; j++) {
+                    sumi += (int32_t)q8[j] * (int32_t)grid[j] * (signs & kmask_iq2xs[j] ? -1 : 1);
+                }
+                q8 += 8;
+            }
+            bsum += sumi * ls;
+        }
+        sumf += d * (float)bsum;
+    }
+    return 0.125f * sumf;
+}
+
+static DS4_MAYBE_UNUSED float qwen4_cpu_dot_iq2_xs_q8k_generic(const void *row, const block_q8_K *y, uint32_t k) {
+    const block_iq2_xs *x = (const block_iq2_xs *)row;
+    const uint32_t nb = k / QK_K;
+    float sumf = 0.0f;
+    for (uint32_t i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d) * y[i].d;
+        const int8_t *q8 = y[i].qs;
+        int32_t bsum = 0;
+        for (uint32_t ib32 = 0; ib32 < QK_K / 32; ib32++) {
+            const int32_t ls1 = 1 + 2 * (x[i].scales[ib32] & 0xf);
+            const int32_t ls2 = 1 + 2 * (x[i].scales[ib32] >> 4);
+            int32_t sumi1 = 0, sumi2 = 0;
+            for (uint32_t l = 0; l < 4; l++) {
+                const uint16_t q = x[i].qs[4 * ib32 + l];
+                const uint8_t *grid = (const uint8_t *)(iq2xs_grid + (q & 511));
+                const uint8_t signs = ksigns_iq2xs[q >> 9];
+                for (int j = 0; j < 8; j++) {
+                    const int32_t t = (int32_t)q8[j] * (int32_t)grid[j] * (signs & kmask_iq2xs[j] ? -1 : 1);
+                    if (l < 2) sumi1 += t; else sumi2 += t;
+                }
+                q8 += 8;
+            }
+            bsum += ls1 * sumi1 + ls2 * sumi2;
+        }
+        sumf += d * (float)bsum;
+    }
+    return 0.125f * sumf;
+}
+
+static DS4_MAYBE_UNUSED float qwen4_cpu_dot_iq3_xxs_q8k_generic(const void *row, const block_q8_K *y, uint32_t k) {
+    const block_iq3_xxs *x = (const block_iq3_xxs *)row;
+    const uint32_t nb = k / QK_K;
+    float sumf = 0.0f;
+    for (uint32_t i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d) * y[i].d;
+        const int8_t *q8 = y[i].qs;
+        const uint8_t *q3 = x[i].qs;
+        const uint8_t *gas = x[i].qs + QK_K / 4;
+        int32_t bsum = 0;
+        for (uint32_t ib32 = 0; ib32 < QK_K / 32; ib32++) {
+            uint32_t aux32;
+            memcpy(&aux32, gas + 4 * ib32, sizeof(aux32));
+            const int32_t ls = 2 * (int32_t)(aux32 >> 28) + 1;
+            int32_t sumi = 0;
+            for (uint32_t l = 0; l < 4; l++) {
+                const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+                const uint8_t *g1 = (const uint8_t *)(iq3xxs_grid + q3[8 * ib32 + 2 * l + 0]);
+                const uint8_t *g2 = (const uint8_t *)(iq3xxs_grid + q3[8 * ib32 + 2 * l + 1]);
+                for (int j = 0; j < 4; j++) {
+                    sumi += (int32_t)q8[j + 0] * (int32_t)g1[j] * (signs & kmask_iq2xs[j + 0] ? -1 : 1);
+                    sumi += (int32_t)q8[j + 4] * (int32_t)g2[j] * (signs & kmask_iq2xs[j + 4] ? -1 : 1);
+                }
+                q8 += 8;
+            }
+            bsum += sumi * ls;
+        }
+        sumf += d * (float)bsum;
+    }
+    return 0.25f * sumf;
+}
+
+#if defined(DS4_CPU_IQ2S_Q8K)
+/* 8 sign bytes for a 7-bit iq2xs sign index, as one 64-bit lane. */
+static inline uint64_t qwen4_cpu_sign64(uint32_t idx) {
+    uint64_t v;
+    memcpy(&v, iq2xxs_signs[idx], 8);
+    return v;
+}
+
+static float qwen4_cpu_hsum256_ps(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    lo = _mm_add_ps(lo, hi);
+    hi = _mm_movehl_ps(lo, lo);
+    lo = _mm_add_ps(lo, hi);
+    hi = _mm_shuffle_ps(lo, lo, 1);
+    lo = _mm_add_ss(lo, hi);
+    return _mm_cvtss_f32(lo);
+}
+
+/* IQ2_XXS: 256 values per 66-byte block.  Each 8-byte group of 32 values is
+ * four grid bytes + four 7-bit sign indices, with the scale in bits 28-31 of
+ * the sign word; two groups per step keeps the 256-bit lanes busy. */
+static DS4_MAYBE_UNUSED float qwen4_cpu_dot_iq2_xxs_q8k_maddubs(const void *row, const block_q8_K *y, uint32_t k) {
+    const block_iq2_xxs *x = (const block_iq2_xxs *)row;
+    const uint32_t nb = k / QK_K;
+    pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
+    uint32_t aux32[4];
+    const uint8_t *aux8 = (const uint8_t *)aux32;
+    __m256 accumf = _mm256_setzero_ps();
+    for (uint32_t i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d) * y[i].d;
+        const uint16_t *q2 = x[i].qs;
+        const int8_t *q8 = y[i].qs;
+        __m256i sumi1 = _mm256_setzero_si256();
+        __m256i sumi2 = _mm256_setzero_si256();
+        for (uint32_t ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            memcpy(aux32, q2, 4 * sizeof(uint32_t)); q2 += 8;
+            const __m256i q2_1 = _mm256_set_epi64x(
+                (long long)iq2xxs_grid[aux8[3]], (long long)iq2xxs_grid[aux8[2]],
+                (long long)iq2xxs_grid[aux8[1]], (long long)iq2xxs_grid[aux8[0]]);
+            const __m256i q2_2 = _mm256_set_epi64x(
+                (long long)iq2xxs_grid[aux8[11]], (long long)iq2xxs_grid[aux8[10]],
+                (long long)iq2xxs_grid[aux8[9]], (long long)iq2xxs_grid[aux8[8]]);
+            const __m256i s2_1 = _mm256_set_epi64x(
+                (long long)qwen4_cpu_sign64((aux32[1] >> 21) & 127), (long long)qwen4_cpu_sign64((aux32[1] >> 14) & 127),
+                (long long)qwen4_cpu_sign64((aux32[1] >> 7) & 127), (long long)qwen4_cpu_sign64(aux32[1] & 127));
+            const __m256i s2_2 = _mm256_set_epi64x(
+                (long long)qwen4_cpu_sign64((aux32[3] >> 21) & 127), (long long)qwen4_cpu_sign64((aux32[3] >> 14) & 127),
+                (long long)qwen4_cpu_sign64((aux32[3] >> 7) & 127), (long long)qwen4_cpu_sign64(aux32[3] & 127));
+            const __m256i q8s_1 = _mm256_sign_epi8(q8_1, s2_1);
+            const __m256i q8s_2 = _mm256_sign_epi8(q8_2, s2_2);
+            const __m256i sc1 = _mm256_set1_epi16((short)(2 * (aux32[1] >> 28) + 1));
+            const __m256i sc2 = _mm256_set1_epi16((short)(2 * (aux32[3] >> 28) + 1));
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(_mm256_maddubs_epi16(q2_1, q8s_1), sc1));
+            sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(_mm256_maddubs_epi16(q2_2, q8s_2), sc2));
+        }
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf);
+    }
+    return 0.125f * qwen4_cpu_hsum256_ps(accumf);
+}
+
+/* Batched twin for the prefill mid phase: one IQ2_XXS row against up to 8
+ * activations.  Grid, sign and scale words depend only on the row, so they
+ * are built once per 64-value step and reused for every token; per token
+ * only the q8 loads, sign flip, maddubs and madd remain.  Per-token
+ * accumulation keeps the single-kernel order, so results are bit-identical. */
+static void qwen4_cpu_dot_iq2_xxs_q8k_batch(const void *row, const block_q8_K *const *ys,
+                                            float *out, uint32_t n, uint32_t k) {
+    const block_iq2_xxs *x = (const block_iq2_xxs *)row;
+    const uint32_t nb = k / QK_K;
+    if (n == 0u) return;
+    if (n > 8u) n = 8u;
+    pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
+    uint32_t aux32[4];
+    const uint8_t *aux8 = (const uint8_t *)aux32;
+    __m256 accumf[8];
+    for (uint32_t b = 0; b < n; b++) accumf[b] = _mm256_setzero_ps();
+    for (uint32_t i = 0; i < nb; i++) {
+        const float dr = f16_to_f32(x[i].d);
+        const uint16_t *q2 = x[i].qs;
+        __m256i sumi1[8], sumi2[8];
+        for (uint32_t b = 0; b < n; b++) { sumi1[b] = _mm256_setzero_si256(); sumi2[b] = _mm256_setzero_si256(); }
+        for (uint32_t ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            memcpy(aux32, q2, 4 * sizeof(uint32_t)); q2 += 8;
+            const __m256i q2_1 = _mm256_set_epi64x(
+                (long long)iq2xxs_grid[aux8[3]], (long long)iq2xxs_grid[aux8[2]],
+                (long long)iq2xxs_grid[aux8[1]], (long long)iq2xxs_grid[aux8[0]]);
+            const __m256i q2_2 = _mm256_set_epi64x(
+                (long long)iq2xxs_grid[aux8[11]], (long long)iq2xxs_grid[aux8[10]],
+                (long long)iq2xxs_grid[aux8[9]], (long long)iq2xxs_grid[aux8[8]]);
+            const __m256i s2_1 = _mm256_set_epi64x(
+                (long long)qwen4_cpu_sign64((aux32[1] >> 21) & 127), (long long)qwen4_cpu_sign64((aux32[1] >> 14) & 127),
+                (long long)qwen4_cpu_sign64((aux32[1] >> 7) & 127), (long long)qwen4_cpu_sign64(aux32[1] & 127));
+            const __m256i s2_2 = _mm256_set_epi64x(
+                (long long)qwen4_cpu_sign64((aux32[3] >> 21) & 127), (long long)qwen4_cpu_sign64((aux32[3] >> 14) & 127),
+                (long long)qwen4_cpu_sign64((aux32[3] >> 7) & 127), (long long)qwen4_cpu_sign64(aux32[3] & 127));
+            const __m256i sc1 = _mm256_set1_epi16((short)(2 * (aux32[1] >> 28) + 1));
+            const __m256i sc2 = _mm256_set1_epi16((short)(2 * (aux32[3] >> 28) + 1));
+            for (uint32_t b = 0; b < n; b++) {
+                const int8_t *q8 = ys[b][i].qs;
+                const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8);
+                const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)(q8 + 32));
+                const __m256i q8s_1 = _mm256_sign_epi8(q8_1, s2_1);
+                const __m256i q8s_2 = _mm256_sign_epi8(q8_2, s2_2);
+                sumi1[b] = _mm256_add_epi32(sumi1[b], _mm256_madd_epi16(_mm256_maddubs_epi16(q2_1, q8s_1), sc1));
+                sumi2[b] = _mm256_add_epi32(sumi2[b], _mm256_madd_epi16(_mm256_maddubs_epi16(q2_2, q8s_2), sc2));
+            }
+        }
+        for (uint32_t b = 0; b < n; b++) {
+            accumf[b] = _mm256_fmadd_ps(_mm256_set1_ps(dr * ys[b][i].d),
+                                        _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1[b], sumi2[b])), accumf[b]);
+        }
+    }
+    for (uint32_t b = 0; b < n; b++) out[b] = 0.125f * qwen4_cpu_hsum256_ps(accumf[b]);
+}
+
+/* IQ2_XS: 256 values per 74-byte block, low 9 bits of each uint16 are the
+ * grid index and the high 7 the sign.  ggml's 128-value step: the sign bits
+ * are gathered with shift+xor+shuffle and compared against the bit selectors
+ * instead of eight 7-bit table lookups (which dominated the scalar-extract
+ * version), two 4-bit scales per 32 values via g_iq2s_sc16. */
+static DS4_MAYBE_UNUSED float qwen4_cpu_dot_iq2_xs_q8k_maddubs(const void *row, const block_q8_K *y, uint32_t k) {
+    const block_iq2_xs *x = (const block_iq2_xs *)row;
+    const uint32_t nb = k / QK_K;
+    static const uint8_t block_sign_shuffle_mask_1[32] = {
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
+        0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06,
+    };
+    static const uint8_t block_sign_shuffle_mask_2[32] = {
+        0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a,
+        0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e,
+    };
+    static const uint8_t bit_selector_mask_bytes[32] = {
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+    };
+    static const uint8_t k_bit_helper[32] = {
+        0x00, 0x80, 0x80, 0x00, 0x80, 0x00, 0x00, 0x80, 0x80, 0x00, 0x00, 0x80, 0x00, 0x80, 0x80, 0x00,
+        0x00, 0x80, 0x80, 0x00, 0x80, 0x00, 0x00, 0x80, 0x80, 0x00, 0x00, 0x80, 0x00, 0x80, 0x80, 0x00,
+    };
+    const __m256i bit_selector_mask = _mm256_loadu_si256((const __m256i *)bit_selector_mask_bytes);
+    const __m256i block_sign_shuffle_1 = _mm256_loadu_si256((const __m256i *)block_sign_shuffle_mask_1);
+    const __m256i block_sign_shuffle_2 = _mm256_loadu_si256((const __m256i *)block_sign_shuffle_mask_2);
+    const __m256i bit_helper = _mm256_loadu_si256((const __m256i *)k_bit_helper);
+    const __m256i m511 = _mm256_set1_epi16(511);
+    const __m256i mone = _mm256_set1_epi8(1);
+    pthread_once(&g_qwen4_sc16_once, qwen4_cpu_sc16_init);
+    __m256i aux_gindex;
+    const uint16_t *gindex = (const uint16_t *)&aux_gindex;
+    __m256 accumf = _mm256_setzero_ps();
+    for (uint32_t i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d) * y[i].d;
+        const uint16_t *qs = x[i].qs;
+        const uint8_t *sc = x[i].scales;
+        const int8_t *q8 = y[i].qs;
+        __m256i sumi1 = _mm256_setzero_si256();
+        __m256i sumi2 = _mm256_setzero_si256();
+        for (uint32_t ib32 = 0; ib32 < QK_K / 32; ib32 += 4) {
+            const __m256i q2_data = _mm256_loadu_si256((const __m256i *)qs); qs += 16;
+            aux_gindex = _mm256_and_si256(q2_data, m511);
+            const __m256i partial_sign_bits = _mm256_srli_epi16(q2_data, 9);
+            const __m256i partial_sign_bits_upper = _mm256_srli_epi16(q2_data, 13);
+            const __m256i partial_sign_bits_for_counting = _mm256_xor_si256(partial_sign_bits, partial_sign_bits_upper);
+            const __m256i odd_bits = _mm256_shuffle_epi8(bit_helper, partial_sign_bits_for_counting);
+            const __m256i full_sign_bits = _mm256_or_si256(partial_sign_bits, odd_bits);
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q8_3 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q8_4 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q2_1 = _mm256_set_epi64x(
+                (long long)iq2xs_grid[gindex[3]], (long long)iq2xs_grid[gindex[2]],
+                (long long)iq2xs_grid[gindex[1]], (long long)iq2xs_grid[gindex[0]]);
+            const __m256i q2_2 = _mm256_set_epi64x(
+                (long long)iq2xs_grid[gindex[7]], (long long)iq2xs_grid[gindex[6]],
+                (long long)iq2xs_grid[gindex[5]], (long long)iq2xs_grid[gindex[4]]);
+            const __m256i q2_3 = _mm256_set_epi64x(
+                (long long)iq2xs_grid[gindex[11]], (long long)iq2xs_grid[gindex[10]],
+                (long long)iq2xs_grid[gindex[9]], (long long)iq2xs_grid[gindex[8]]);
+            const __m256i q2_4 = _mm256_set_epi64x(
+                (long long)iq2xs_grid[gindex[15]], (long long)iq2xs_grid[gindex[14]],
+                (long long)iq2xs_grid[gindex[13]], (long long)iq2xs_grid[gindex[12]]);
+            const __m128i full_signs_l = _mm256_castsi256_si128(full_sign_bits);
+            const __m128i full_signs_h = _mm256_extractf128_si256(full_sign_bits, 1);
+            const __m256i full_signs_1 = _mm256_inserti128_si256(_mm256_castsi128_si256(full_signs_l), full_signs_l, 1);
+            const __m256i full_signs_2 = _mm256_inserti128_si256(_mm256_castsi128_si256(full_signs_h), full_signs_h, 1);
+            __m256i signs = _mm256_shuffle_epi8(full_signs_1, block_sign_shuffle_1);
+            signs = _mm256_cmpeq_epi8(_mm256_and_si256(signs, bit_selector_mask), bit_selector_mask);
+            const __m256i q8s_1 = _mm256_sign_epi8(q8_1, _mm256_or_si256(signs, mone));
+            signs = _mm256_shuffle_epi8(full_signs_1, block_sign_shuffle_2);
+            signs = _mm256_cmpeq_epi8(_mm256_and_si256(signs, bit_selector_mask), bit_selector_mask);
+            const __m256i q8s_2 = _mm256_sign_epi8(q8_2, _mm256_or_si256(signs, mone));
+            signs = _mm256_shuffle_epi8(full_signs_2, block_sign_shuffle_1);
+            signs = _mm256_cmpeq_epi8(_mm256_and_si256(signs, bit_selector_mask), bit_selector_mask);
+            const __m256i q8s_3 = _mm256_sign_epi8(q8_3, _mm256_or_si256(signs, mone));
+            signs = _mm256_shuffle_epi8(full_signs_2, block_sign_shuffle_2);
+            signs = _mm256_cmpeq_epi8(_mm256_and_si256(signs, bit_selector_mask), bit_selector_mask);
+            const __m256i q8s_4 = _mm256_sign_epi8(q8_4, _mm256_or_si256(signs, mone));
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(_mm256_maddubs_epi16(q2_1, q8s_1),
+                _mm256_loadu_si256((const __m256i *)g_iq2s_sc16[sc[ib32 + 0]])));
+            sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(_mm256_maddubs_epi16(q2_2, q8s_2),
+                _mm256_loadu_si256((const __m256i *)g_iq2s_sc16[sc[ib32 + 1]])));
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(_mm256_maddubs_epi16(q2_3, q8s_3),
+                _mm256_loadu_si256((const __m256i *)g_iq2s_sc16[sc[ib32 + 2]])));
+            sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(_mm256_maddubs_epi16(q2_4, q8s_4),
+                _mm256_loadu_si256((const __m256i *)g_iq2s_sc16[sc[ib32 + 3]])));
+        }
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf);
+    }
+    return 0.125f * qwen4_cpu_hsum256_ps(accumf);
+}
+
+/* Batched twin for the prefill mid phase: one IQ2_XS row against up to 8
+ * activations.  Grid vectors, full sign bits and the four sign masks depend
+ * only on the row, so they are built once per 128-value step and reused for
+ * every token; per token only the q8 loads, sign flips, maddubs and madd
+ * remain.  Per-token order is that of the single-token kernel (int32 sums
+ * are exact, the two halves fold at the end), so results are bit-identical. */
+static void qwen4_cpu_dot_iq2_xs_q8k_batch(const void *row, const block_q8_K *const *ys,
+                                           float *out, uint32_t n, uint32_t k) {
+    const block_iq2_xs *x = (const block_iq2_xs *)row;
+    const uint32_t nb = k / QK_K;
+    if (n == 0u) return;
+    if (n > 8u) n = 8u;
+    static const uint8_t block_sign_shuffle_mask_1[32] = {
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
+        0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06,
+    };
+    static const uint8_t block_sign_shuffle_mask_2[32] = {
+        0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a,
+        0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e,
+    };
+    static const uint8_t bit_selector_mask_bytes[32] = {
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+    };
+    static const uint8_t k_bit_helper[32] = {
+        0x00, 0x80, 0x80, 0x00, 0x80, 0x00, 0x00, 0x80, 0x80, 0x00, 0x00, 0x80, 0x00, 0x80, 0x80, 0x00,
+        0x00, 0x80, 0x80, 0x00, 0x80, 0x00, 0x00, 0x80, 0x80, 0x00, 0x00, 0x80, 0x00, 0x80, 0x80, 0x00,
+    };
+    const __m256i bit_selector_mask = _mm256_loadu_si256((const __m256i *)bit_selector_mask_bytes);
+    const __m256i block_sign_shuffle_1 = _mm256_loadu_si256((const __m256i *)block_sign_shuffle_mask_1);
+    const __m256i block_sign_shuffle_2 = _mm256_loadu_si256((const __m256i *)block_sign_shuffle_mask_2);
+    const __m256i bit_helper = _mm256_loadu_si256((const __m256i *)k_bit_helper);
+    const __m256i m511 = _mm256_set1_epi16(511);
+    const __m256i mone = _mm256_set1_epi8(1);
+    pthread_once(&g_qwen4_sc16_once, qwen4_cpu_sc16_init);
+    __m256i aux_gindex;
+    const uint16_t *gindex = (const uint16_t *)&aux_gindex;
+    __m256 accumf[8];
+    for (uint32_t b = 0; b < n; b++) accumf[b] = _mm256_setzero_ps();
+    for (uint32_t i = 0; i < nb; i++) {
+        const float dr = f16_to_f32(x[i].d);
+        const uint16_t *qs = x[i].qs;
+        const uint8_t *sc = x[i].scales;
+        __m256i sumi1[8], sumi2[8];
+        for (uint32_t b = 0; b < n; b++) { sumi1[b] = _mm256_setzero_si256(); sumi2[b] = _mm256_setzero_si256(); }
+        for (uint32_t ib32 = 0; ib32 < QK_K / 32; ib32 += 4) {
+            const __m256i q2_data = _mm256_loadu_si256((const __m256i *)qs); qs += 16;
+            aux_gindex = _mm256_and_si256(q2_data, m511);
+            const __m256i partial_sign_bits = _mm256_srli_epi16(q2_data, 9);
+            const __m256i partial_sign_bits_upper = _mm256_srli_epi16(q2_data, 13);
+            const __m256i partial_sign_bits_for_counting = _mm256_xor_si256(partial_sign_bits, partial_sign_bits_upper);
+            const __m256i odd_bits = _mm256_shuffle_epi8(bit_helper, partial_sign_bits_for_counting);
+            const __m256i full_sign_bits = _mm256_or_si256(partial_sign_bits, odd_bits);
+            const __m256i q2_1 = _mm256_set_epi64x(
+                (long long)iq2xs_grid[gindex[3]], (long long)iq2xs_grid[gindex[2]],
+                (long long)iq2xs_grid[gindex[1]], (long long)iq2xs_grid[gindex[0]]);
+            const __m256i q2_2 = _mm256_set_epi64x(
+                (long long)iq2xs_grid[gindex[7]], (long long)iq2xs_grid[gindex[6]],
+                (long long)iq2xs_grid[gindex[5]], (long long)iq2xs_grid[gindex[4]]);
+            const __m256i q2_3 = _mm256_set_epi64x(
+                (long long)iq2xs_grid[gindex[11]], (long long)iq2xs_grid[gindex[10]],
+                (long long)iq2xs_grid[gindex[9]], (long long)iq2xs_grid[gindex[8]]);
+            const __m256i q2_4 = _mm256_set_epi64x(
+                (long long)iq2xs_grid[gindex[15]], (long long)iq2xs_grid[gindex[14]],
+                (long long)iq2xs_grid[gindex[13]], (long long)iq2xs_grid[gindex[12]]);
+            const __m128i full_signs_l = _mm256_castsi256_si128(full_sign_bits);
+            const __m128i full_signs_h = _mm256_extractf128_si256(full_sign_bits, 1);
+            const __m256i full_signs_1 = _mm256_inserti128_si256(_mm256_castsi128_si256(full_signs_l), full_signs_l, 1);
+            const __m256i full_signs_2 = _mm256_inserti128_si256(_mm256_castsi128_si256(full_signs_h), full_signs_h, 1);
+            __m256i signs = _mm256_shuffle_epi8(full_signs_1, block_sign_shuffle_1);
+            const __m256i sgn_1 = _mm256_or_si256(_mm256_cmpeq_epi8(_mm256_and_si256(signs, bit_selector_mask), bit_selector_mask), mone);
+            signs = _mm256_shuffle_epi8(full_signs_1, block_sign_shuffle_2);
+            const __m256i sgn_2 = _mm256_or_si256(_mm256_cmpeq_epi8(_mm256_and_si256(signs, bit_selector_mask), bit_selector_mask), mone);
+            signs = _mm256_shuffle_epi8(full_signs_2, block_sign_shuffle_1);
+            const __m256i sgn_3 = _mm256_or_si256(_mm256_cmpeq_epi8(_mm256_and_si256(signs, bit_selector_mask), bit_selector_mask), mone);
+            signs = _mm256_shuffle_epi8(full_signs_2, block_sign_shuffle_2);
+            const __m256i sgn_4 = _mm256_or_si256(_mm256_cmpeq_epi8(_mm256_and_si256(signs, bit_selector_mask), bit_selector_mask), mone);
+            const __m256i scv_1 = _mm256_loadu_si256((const __m256i *)g_iq2s_sc16[sc[ib32 + 0]]);
+            const __m256i scv_2 = _mm256_loadu_si256((const __m256i *)g_iq2s_sc16[sc[ib32 + 1]]);
+            const __m256i scv_3 = _mm256_loadu_si256((const __m256i *)g_iq2s_sc16[sc[ib32 + 2]]);
+            const __m256i scv_4 = _mm256_loadu_si256((const __m256i *)g_iq2s_sc16[sc[ib32 + 3]]);
+            for (uint32_t b = 0; b < n; b++) {
+                const int8_t *q8 = ys[b][i].qs + 32 * (int32_t)ib32;
+                const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)(q8 + 0));
+                const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)(q8 + 32));
+                const __m256i q8_3 = _mm256_loadu_si256((const __m256i *)(q8 + 64));
+                const __m256i q8_4 = _mm256_loadu_si256((const __m256i *)(q8 + 96));
+                sumi1[b] = _mm256_add_epi32(sumi1[b], _mm256_madd_epi16(_mm256_maddubs_epi16(q2_1, _mm256_sign_epi8(q8_1, sgn_1)), scv_1));
+                sumi2[b] = _mm256_add_epi32(sumi2[b], _mm256_madd_epi16(_mm256_maddubs_epi16(q2_2, _mm256_sign_epi8(q8_2, sgn_2)), scv_2));
+                sumi1[b] = _mm256_add_epi32(sumi1[b], _mm256_madd_epi16(_mm256_maddubs_epi16(q2_3, _mm256_sign_epi8(q8_3, sgn_3)), scv_3));
+                sumi2[b] = _mm256_add_epi32(sumi2[b], _mm256_madd_epi16(_mm256_maddubs_epi16(q2_4, _mm256_sign_epi8(q8_4, sgn_4)), scv_4));
+            }
+        }
+        for (uint32_t b = 0; b < n; b++) {
+            accumf[b] = _mm256_fmadd_ps(_mm256_set1_ps(dr * ys[b][i].d),
+                                        _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1[b], sumi2[b])), accumf[b]);
+        }
+    }
+    for (uint32_t b = 0; b < n; b++) out[b] = 0.125f * qwen4_cpu_hsum256_ps(accumf[b]);
+}
+
+/* IQ3_XXS: 256 values per 98-byte block.  Eight grid bytes (four-value rows,
+ * uint32) plus four sign/scale bytes per 32 values; one 4-bit scale each. */
+static DS4_MAYBE_UNUSED float qwen4_cpu_dot_iq3_xxs_q8k_maddubs(const void *row, const block_q8_K *y, uint32_t k) {
+    const block_iq3_xxs *x = (const block_iq3_xxs *)row;
+    const uint32_t nb = k / QK_K;
+    pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
+    __m256 accumf = _mm256_setzero_ps();
+    for (uint32_t i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d) * y[i].d;
+        const uint8_t *q3 = x[i].qs;
+        const uint8_t *gas = x[i].qs + QK_K / 4;
+        const int8_t *q8 = y[i].qs;
+        __m256i sumi1 = _mm256_setzero_si256();
+        __m256i sumi2 = _mm256_setzero_si256();
+        for (uint32_t ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q2_1 = _mm256_set_epi32(
+                (int)iq3xxs_grid[q3[7]], (int)iq3xxs_grid[q3[6]], (int)iq3xxs_grid[q3[5]], (int)iq3xxs_grid[q3[4]],
+                (int)iq3xxs_grid[q3[3]], (int)iq3xxs_grid[q3[2]], (int)iq3xxs_grid[q3[1]], (int)iq3xxs_grid[q3[0]]);
+            q3 += 8;
+            const __m256i q2_2 = _mm256_set_epi32(
+                (int)iq3xxs_grid[q3[7]], (int)iq3xxs_grid[q3[6]], (int)iq3xxs_grid[q3[5]], (int)iq3xxs_grid[q3[4]],
+                (int)iq3xxs_grid[q3[3]], (int)iq3xxs_grid[q3[2]], (int)iq3xxs_grid[q3[1]], (int)iq3xxs_grid[q3[0]]);
+            q3 += 8;
+            uint32_t aux32[2];
+            memcpy(aux32, gas, 8); gas += 8;
+            const __m256i s2_1 = _mm256_set_epi64x(
+                (long long)qwen4_cpu_sign64((aux32[0] >> 21) & 127), (long long)qwen4_cpu_sign64((aux32[0] >> 14) & 127),
+                (long long)qwen4_cpu_sign64((aux32[0] >> 7) & 127), (long long)qwen4_cpu_sign64(aux32[0] & 127));
+            const __m256i s2_2 = _mm256_set_epi64x(
+                (long long)qwen4_cpu_sign64((aux32[1] >> 21) & 127), (long long)qwen4_cpu_sign64((aux32[1] >> 14) & 127),
+                (long long)qwen4_cpu_sign64((aux32[1] >> 7) & 127), (long long)qwen4_cpu_sign64(aux32[1] & 127));
+            const __m256i q8s_1 = _mm256_sign_epi8(q8_1, s2_1);
+            const __m256i q8s_2 = _mm256_sign_epi8(q8_2, s2_2);
+            const __m256i sc1 = _mm256_set1_epi16((short)(2 * (aux32[0] >> 28) + 1));
+            const __m256i sc2 = _mm256_set1_epi16((short)(2 * (aux32[1] >> 28) + 1));
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(_mm256_maddubs_epi16(q2_1, q8s_1), sc1));
+            sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(_mm256_maddubs_epi16(q2_2, q8s_2), sc2));
+        }
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf);
+    }
+    return 0.25f * qwen4_cpu_hsum256_ps(accumf);
+}
+
+/* Batched twin for the prefill mid phase: one IQ3_XXS row against up to 8
+ * activations.  Grid, sign words and scales depend only on the row, so they
+ * are built once per 64-value step and reused for every token; per token
+ * only the q8 loads, sign flips, maddubs and madd remain.  Same per-token
+ * operation order as the single-token kernel (0.25 scale kept). */
+static void qwen4_cpu_dot_iq3_xxs_q8k_batch(const void *row, const block_q8_K *const *ys,
+                                            float *out, uint32_t n, uint32_t k) {
+    const block_iq3_xxs *x = (const block_iq3_xxs *)row;
+    const uint32_t nb = k / QK_K;
+    if (n == 0u) return;
+    if (n > 8u) n = 8u;
+    pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
+    __m256 accumf[8];
+    for (uint32_t b = 0; b < n; b++) accumf[b] = _mm256_setzero_ps();
+    for (uint32_t i = 0; i < nb; i++) {
+        const float dr = f16_to_f32(x[i].d);
+        const uint8_t *q3 = x[i].qs;
+        const uint8_t *gas = x[i].qs + QK_K / 4;
+        __m256i sumi1[8], sumi2[8];
+        for (uint32_t b = 0; b < n; b++) { sumi1[b] = _mm256_setzero_si256(); sumi2[b] = _mm256_setzero_si256(); }
+        for (uint32_t ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            const __m256i q2_1 = _mm256_set_epi32(
+                (int)iq3xxs_grid[q3[7]], (int)iq3xxs_grid[q3[6]], (int)iq3xxs_grid[q3[5]], (int)iq3xxs_grid[q3[4]],
+                (int)iq3xxs_grid[q3[3]], (int)iq3xxs_grid[q3[2]], (int)iq3xxs_grid[q3[1]], (int)iq3xxs_grid[q3[0]]);
+            q3 += 8;
+            const __m256i q2_2 = _mm256_set_epi32(
+                (int)iq3xxs_grid[q3[7]], (int)iq3xxs_grid[q3[6]], (int)iq3xxs_grid[q3[5]], (int)iq3xxs_grid[q3[4]],
+                (int)iq3xxs_grid[q3[3]], (int)iq3xxs_grid[q3[2]], (int)iq3xxs_grid[q3[1]], (int)iq3xxs_grid[q3[0]]);
+            q3 += 8;
+            uint32_t aux32[2];
+            memcpy(aux32, gas, 8); gas += 8;
+            const __m256i s2_1 = _mm256_set_epi64x(
+                (long long)qwen4_cpu_sign64((aux32[0] >> 21) & 127), (long long)qwen4_cpu_sign64((aux32[0] >> 14) & 127),
+                (long long)qwen4_cpu_sign64((aux32[0] >> 7) & 127), (long long)qwen4_cpu_sign64(aux32[0] & 127));
+            const __m256i s2_2 = _mm256_set_epi64x(
+                (long long)qwen4_cpu_sign64((aux32[1] >> 21) & 127), (long long)qwen4_cpu_sign64((aux32[1] >> 14) & 127),
+                (long long)qwen4_cpu_sign64((aux32[1] >> 7) & 127), (long long)qwen4_cpu_sign64(aux32[1] & 127));
+            const __m256i sc1 = _mm256_set1_epi16((short)(2 * (aux32[0] >> 28) + 1));
+            const __m256i sc2 = _mm256_set1_epi16((short)(2 * (aux32[1] >> 28) + 1));
+            for (uint32_t b = 0; b < n; b++) {
+                const int8_t *q8 = ys[b][i].qs + 32 * (int32_t)ib32;
+                const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)(q8 + 0));
+                const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)(q8 + 32));
+                sumi1[b] = _mm256_add_epi32(sumi1[b], _mm256_madd_epi16(_mm256_maddubs_epi16(q2_1, _mm256_sign_epi8(q8_1, s2_1)), sc1));
+                sumi2[b] = _mm256_add_epi32(sumi2[b], _mm256_madd_epi16(_mm256_maddubs_epi16(q2_2, _mm256_sign_epi8(q8_2, s2_2)), sc2));
+            }
+        }
+        for (uint32_t b = 0; b < n; b++) {
+            accumf[b] = _mm256_fmadd_ps(_mm256_set1_ps(dr * ys[b][i].d),
+                                        _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1[b], sumi2[b])), accumf[b]);
+        }
+    }
+    for (uint32_t b = 0; b < n; b++) out[b] = 0.25f * qwen4_cpu_hsum256_ps(accumf[b]);
+}
+#endif /* DS4_CPU_IQ2S_Q8K */
+
+static DS4_MAYBE_UNUSED float qwen4_cpu_dot_iq3_s_q8k_generic(const void *row, const block_q8_K *y, uint32_t k) {
+    const block_iq3_s *x = (const block_iq3_s *)row;
+    const uint32_t nb = k / QK_K;
+    float sumf = 0.0f;
+    for (uint32_t i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d) * y[i].d;
+        const int8_t *q8 = y[i].qs;
+        int32_t bsum = 0;
+        for (uint32_t t = 0; t < 4; t++) {
+            const int32_t ls1 = 1 + 2 * (x[i].scales[t] & 0xf);
+            const int32_t ls2 = 1 + 2 * (x[i].scales[t] >> 4);
+            for (uint32_t half = 0; half < 2; half++) {
+                const uint8_t *q = x[i].qs + t * 16u + half * 8u;
+                const uint8_t *sc = x[i].signs + t * 8u + half * 4u;
+                const uint8_t qhb = x[i].qh[2u * t + half];
+                int32_t sumi = 0;
+                for (uint32_t l = 0; l < 4; l++) {
+                    const uint8_t signs = sc[l];
+                    const uint8_t *g1 = (const uint8_t *)(iq3s_grid + (q[2 * l + 0] | ((qhb << (8 - 2 * l)) & 256)));
+                    const uint8_t *g2 = (const uint8_t *)(iq3s_grid + (q[2 * l + 1] | ((qhb << (7 - 2 * l)) & 256)));
+                    for (int j = 0; j < 4; j++) {
+                        sumi += (int32_t)q8[j + 0] * (int32_t)g1[j] * (signs & kmask_iq2xs[j + 0] ? -1 : 1);
+                        sumi += (int32_t)q8[j + 4] * (int32_t)g2[j] * (signs & kmask_iq2xs[j + 4] ? -1 : 1);
+                    }
+                    q8 += 8;
+                }
+                bsum += (half == 0 ? ls1 : ls2) * sumi;
+            }
+        }
+        sumf += d * (float)bsum;
+    }
+    return sumf;
+}
+
+#if defined(DS4_CPU_IQ2S_Q8K)
+/* IQ3_S: 256 values per 110-byte block.  ggml's shape: 16 grid bytes + two
+ * qh scale-bit words per 64 values, sign masks via the same shuffle trick as
+ * IQ2_S, one 4-bit scale per 32 values (low nibble first). */
+static DS4_MAYBE_UNUSED float qwen4_cpu_dot_iq3_s_q8k_maddubs(const void *row, const block_q8_K *y, uint32_t k) {
+    const block_iq3_s *x = (const block_iq3_s *)row;
+    const uint32_t nb = k / QK_K;
+    static const uint8_t k_mask1[32] = {
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+        2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+    };
+    static const uint8_t k_mask2[32] = {
+        1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128,
+        1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128,
+    };
+    const __m256i mask1 = _mm256_loadu_si256((const __m256i *)k_mask1);
+    const __m256i mask2 = _mm256_loadu_si256((const __m256i *)k_mask2);
+    const __m256i idx_shift = _mm256_set_epi32(1, 2, 3, 4, 5, 6, 7, 8);
+    const __m256i idx_mask = _mm256_set1_epi32(256);
+    typedef union {
+        __m256i vec[2];
+        uint32_t index[16];
+    } index_t;
+    index_t idx;
+    __m256 accumf = _mm256_setzero_ps();
+    for (uint32_t i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d) * y[i].d;
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        const uint16_t *signs = (const uint16_t *)x[i].signs;
+        const int8_t *q8 = y[i].qs;
+        __m256i sumi1 = _mm256_setzero_si256();
+        __m256i sumi2 = _mm256_setzero_si256();
+        for (uint32_t ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i idx_l = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)qs)); qs += 16;
+            idx.vec[0] = _mm256_set1_epi32(qh[ib32 + 0]);
+            idx.vec[1] = _mm256_set1_epi32(qh[ib32 + 1]);
+            idx.vec[0] = _mm256_and_si256(_mm256_sllv_epi32(idx.vec[0], idx_shift), idx_mask);
+            idx.vec[1] = _mm256_and_si256(_mm256_sllv_epi32(idx.vec[1], idx_shift), idx_mask);
+            idx.vec[0] = _mm256_or_si256(idx.vec[0], _mm256_cvtepi16_epi32(_mm256_castsi256_si128(idx_l)));
+            idx.vec[1] = _mm256_or_si256(idx.vec[1], _mm256_cvtepi16_epi32(_mm256_extractf128_si256(idx_l, 1)));
+            const __m256i q2_1 = _mm256_set_epi32(
+                (int)iq3s_grid[idx.index[7]], (int)iq3s_grid[idx.index[6]], (int)iq3s_grid[idx.index[5]], (int)iq3s_grid[idx.index[4]],
+                (int)iq3s_grid[idx.index[3]], (int)iq3s_grid[idx.index[2]], (int)iq3s_grid[idx.index[1]], (int)iq3s_grid[idx.index[0]]);
+            const __m256i q2_2 = _mm256_set_epi32(
+                (int)iq3s_grid[idx.index[15]], (int)iq3s_grid[idx.index[14]], (int)iq3s_grid[idx.index[13]], (int)iq3s_grid[idx.index[12]],
+                (int)iq3s_grid[idx.index[11]], (int)iq3s_grid[idx.index[10]], (int)iq3s_grid[idx.index[9]], (int)iq3s_grid[idx.index[8]]);
+            __m256i aux256 = _mm256_set1_epi32(signs[0] | ((uint32_t)signs[1] << 16));
+            aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256, mask1), mask2);
+            const __m256i s2_1 = _mm256_cmpeq_epi8(aux256, mask2);
+            const __m256i q8s_1 = _mm256_sub_epi8(_mm256_xor_si256(s2_1, q8_1), s2_1);
+            aux256 = _mm256_set1_epi32(signs[2] | ((uint32_t)signs[3] << 16));
+            aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256, mask1), mask2);
+            const __m256i s2_2 = _mm256_cmpeq_epi8(aux256, mask2);
+            const __m256i q8s_2 = _mm256_sub_epi8(_mm256_xor_si256(s2_2, q8_2), s2_2);
+            signs += 4;
+            const __m256i sc1 = _mm256_set1_epi16((short)(2 * (x[i].scales[ib32 / 2] & 0xf) + 1));
+            const __m256i sc2 = _mm256_set1_epi16((short)(2 * (x[i].scales[ib32 / 2] >> 4) + 1));
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(_mm256_maddubs_epi16(q2_1, q8s_1), sc1));
+            sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(_mm256_maddubs_epi16(q2_2, q8s_2), sc2));
+        }
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf);
+    }
+    return qwen4_cpu_hsum256_ps(accumf);
+}
+
+/* Batched twin for the prefill mid phase: one IQ3_S row against up to 8
+ * activations.  Grid indices, sign masks and the two per-32 scales depend
+ * only on the row, so they are built once per 64-value step and reused for
+ * every token; per token only the q8 loads, sign flips, maddubs and madd
+ * remain.  Same per-token operation order as the single-token kernel. */
+static void qwen4_cpu_dot_iq3_s_q8k_batch(const void *row, const block_q8_K *const *ys,
+                                          float *out, uint32_t n, uint32_t k) {
+    const block_iq3_s *x = (const block_iq3_s *)row;
+    const uint32_t nb = k / QK_K;
+    if (n == 0u) return;
+    if (n > 8u) n = 8u;
+    static const uint8_t k_mask1[32] = {
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+        2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+    };
+    static const uint8_t k_mask2[32] = {
+        1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128,
+        1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128,
+    };
+    const __m256i mask1 = _mm256_loadu_si256((const __m256i *)k_mask1);
+    const __m256i mask2 = _mm256_loadu_si256((const __m256i *)k_mask2);
+    const __m256i idx_shift = _mm256_set_epi32(1, 2, 3, 4, 5, 6, 7, 8);
+    const __m256i idx_mask = _mm256_set1_epi32(256);
+    typedef union {
+        __m256i vec[2];
+        uint32_t index[16];
+    } index_t;
+    index_t idx;
+    __m256 accumf[8];
+    for (uint32_t b = 0; b < n; b++) accumf[b] = _mm256_setzero_ps();
+    for (uint32_t i = 0; i < nb; i++) {
+        const float dr = f16_to_f32(x[i].d);
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        const uint16_t *signs = (const uint16_t *)x[i].signs;
+        __m256i sumi1[8], sumi2[8];
+        for (uint32_t b = 0; b < n; b++) { sumi1[b] = _mm256_setzero_si256(); sumi2[b] = _mm256_setzero_si256(); }
+        for (uint32_t ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            const __m256i idx_l = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)qs)); qs += 16;
+            idx.vec[0] = _mm256_set1_epi32(qh[ib32 + 0]);
+            idx.vec[1] = _mm256_set1_epi32(qh[ib32 + 1]);
+            idx.vec[0] = _mm256_and_si256(_mm256_sllv_epi32(idx.vec[0], idx_shift), idx_mask);
+            idx.vec[1] = _mm256_and_si256(_mm256_sllv_epi32(idx.vec[1], idx_shift), idx_mask);
+            idx.vec[0] = _mm256_or_si256(idx.vec[0], _mm256_cvtepi16_epi32(_mm256_castsi256_si128(idx_l)));
+            idx.vec[1] = _mm256_or_si256(idx.vec[1], _mm256_cvtepi16_epi32(_mm256_extractf128_si256(idx_l, 1)));
+            const __m256i q2_1 = _mm256_set_epi32(
+                (int)iq3s_grid[idx.index[7]], (int)iq3s_grid[idx.index[6]], (int)iq3s_grid[idx.index[5]], (int)iq3s_grid[idx.index[4]],
+                (int)iq3s_grid[idx.index[3]], (int)iq3s_grid[idx.index[2]], (int)iq3s_grid[idx.index[1]], (int)iq3s_grid[idx.index[0]]);
+            const __m256i q2_2 = _mm256_set_epi32(
+                (int)iq3s_grid[idx.index[15]], (int)iq3s_grid[idx.index[14]], (int)iq3s_grid[idx.index[13]], (int)iq3s_grid[idx.index[12]],
+                (int)iq3s_grid[idx.index[11]], (int)iq3s_grid[idx.index[10]], (int)iq3s_grid[idx.index[9]], (int)iq3s_grid[idx.index[8]]);
+            __m256i aux256 = _mm256_set1_epi32(signs[0] | ((uint32_t)signs[1] << 16));
+            aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256, mask1), mask2);
+            const __m256i s2_1 = _mm256_cmpeq_epi8(aux256, mask2);
+            aux256 = _mm256_set1_epi32(signs[2] | ((uint32_t)signs[3] << 16));
+            aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256, mask1), mask2);
+            const __m256i s2_2 = _mm256_cmpeq_epi8(aux256, mask2);
+            signs += 4;
+            const __m256i sc1 = _mm256_set1_epi16((short)(2 * (x[i].scales[ib32 / 2] & 0xf) + 1));
+            const __m256i sc2 = _mm256_set1_epi16((short)(2 * (x[i].scales[ib32 / 2] >> 4) + 1));
+            for (uint32_t b = 0; b < n; b++) {
+                const int8_t *q8 = ys[b][i].qs + 32 * (int32_t)ib32;
+                const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)(q8 + 0));
+                const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)(q8 + 32));
+                sumi1[b] = _mm256_add_epi32(sumi1[b], _mm256_madd_epi16(_mm256_maddubs_epi16(q2_1, _mm256_sub_epi8(_mm256_xor_si256(s2_1, q8_1), s2_1)), sc1));
+                sumi2[b] = _mm256_add_epi32(sumi2[b], _mm256_madd_epi16(_mm256_maddubs_epi16(q2_2, _mm256_sub_epi8(_mm256_xor_si256(s2_2, q8_2), s2_2)), sc2));
+            }
+        }
+        for (uint32_t b = 0; b < n; b++) {
+            accumf[b] = _mm256_fmadd_ps(_mm256_set1_ps(dr * ys[b][i].d),
+                                        _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1[b], sumi2[b])), accumf[b]);
+        }
+    }
+    for (uint32_t b = 0; b < n; b++) out[b] = qwen4_cpu_hsum256_ps(accumf[b]);
+}
+#endif /* DS4_CPU_IQ2S_Q8K */
+
+static float qwen4_cpu_dot_iq3_s_q8k(const void *row, const block_q8_K *y, uint32_t k) {
+#if defined(DS4_CPU_IQ2S_Q8K)
+    return qwen4_cpu_dot_iq3_s_q8k_maddubs(row, y, k);
+#else
+    return qwen4_cpu_dot_iq3_s_q8k_generic(row, y, k);
+#endif
+}
+
+static float qwen4_cpu_dot_iq2_xxs_q8k(const void *row, const block_q8_K *y, uint32_t k) {
+#if defined(DS4_CPU_IQ2S_Q8K)
+    return qwen4_cpu_dot_iq2_xxs_q8k_maddubs(row, y, k);
+#else
+    return qwen4_cpu_dot_iq2_xxs_q8k_generic(row, y, k);
+#endif
+}
+
+static float qwen4_cpu_dot_iq2_xs_q8k(const void *row, const block_q8_K *y, uint32_t k) {
+#if defined(DS4_CPU_IQ2S_Q8K)
+    return qwen4_cpu_dot_iq2_xs_q8k_maddubs(row, y, k);
+#else
+    return qwen4_cpu_dot_iq2_xs_q8k_generic(row, y, k);
+#endif
+}
+
+static float qwen4_cpu_dot_iq3_xxs_q8k(const void *row, const block_q8_K *y, uint32_t k) {
+#if defined(DS4_CPU_IQ2S_Q8K)
+    return qwen4_cpu_dot_iq3_xxs_q8k_maddubs(row, y, k);
+#else
+    return qwen4_cpu_dot_iq3_xxs_q8k_generic(row, y, k);
+#endif
+}
+
+/* One packed expert row dotted with an fp32 activation vector.  Returns 0 for
+ * types without a CPU kernel (the caller then keeps the GPU path). */
+static DS4_MAYBE_UNUSED float ds4_vec_dot_q2_0_f32(int n, const block_q2_0 *x, const float *y);
+static DS4_MAYBE_UNUSED void ds4_dequant_row_q2_0(const block_q2_0 *x, float *y, int64_t k);
+
+static float qwen4_cpu_row_dot(uint32_t type, const void *row, const float *x, uint32_t k) {
+    switch (type) {
+    case DS4_TENSOR_IQ4_NL:
+#ifdef DS4_CPU_AVX512
+        return qwen4_cpu_dot_iq4_nl_simd(row, x, k);
+#else
+        return ds4_vec_dot_iq4_nl_f32((int)k, (const block_iq4_nl *)row, x);
+#endif
+    case DS4_TENSOR_IQ2_S:
+#ifdef DS4_CPU_AVX512
+        return qwen4_cpu_dot_iq2_s_simd(row, x, k);
+#else
+        return ds4_vec_dot_iq2_s_f32((int)k, (const block_iq2_s *)row, x);
+#endif
+    case DS4_TENSOR_IQ3_S:
+#ifdef DS4_CPU_AVX512
+        return qwen4_cpu_dot_iq3_s_simd(row, x, k);
+#else
+        return ds4_vec_dot_iq3_s_f32((int)k, (const block_iq3_s *)row, x);
+#endif
+    case DS4_TENSOR_Q2_0:
+#ifdef DS4_CPU_AVX512
+        return qwen4_cpu_dot_q2_0_simd(row, x, k);
+#else
+        return ds4_vec_dot_q2_0_f32((int)k, (const block_q2_0 *)row, x);
+#endif
+    default:
+        return 0.0f;
+    }
+}
+
+/* Types with a Q8_K activation kernel: 256-value blocks only. */
+static bool qwen4_cpu_q8k_type(uint32_t type) {
+    return type == DS4_TENSOR_IQ2_XXS || type == DS4_TENSOR_IQ2_XS ||
+           type == DS4_TENSOR_IQ2_S || type == DS4_TENSOR_IQ3_XXS ||
+           type == DS4_TENSOR_IQ3_S;
+}
+
+/* Same, but with a pre-quantized Q8_K activation: 256-value rows take the
+ * int8 kernels above, every other type and build keeps the fp32 path. */
+static float qwen4_cpu_row_dot_q8k(uint32_t type, const void *row, const block_q8_K *xq,
+                                   const float *x, uint32_t k) {
+    if (xq) {
+        switch (type) {
+        case DS4_TENSOR_IQ2_XXS: return qwen4_cpu_dot_iq2_xxs_q8k(row, xq, k);
+        case DS4_TENSOR_IQ2_XS:  return qwen4_cpu_dot_iq2_xs_q8k(row, xq, k);
+        case DS4_TENSOR_IQ2_S:   return qwen4_cpu_dot_iq2_s_q8k(row, xq, k);
+        case DS4_TENSOR_IQ3_XXS: return qwen4_cpu_dot_iq3_xxs_q8k(row, xq, k);
+        case DS4_TENSOR_IQ3_S:   return qwen4_cpu_dot_iq3_s_q8k(row, xq, k);
+        default: break;
+        }
+    }
+    return qwen4_cpu_row_dot(type, row, x, k);
+}
+
+/* Two weight rows against the same chunk of tokens: the q8 activation loads
+ * are shared, so the activation stream (the measured limit of the mid phase,
+ * see the isolated bench) is read once per two rows instead of once per row.
+ * 2 rows x up to 8 tokens: the 2x8 shape does 2 grid assemblies per 8 tokens
+ * (4 tokens made it 2 per 4, which ate part of the traffic win).  16
+ * accumulators + 8 q8 zmm may spill; the bench decides. */ 
+static void qwen4_cpu_dot_iq2_s_q8k_vnni_batch2(const void *row0, const void *row1,
+                                               const block_q8_K *const *ys, float *out0,
+                                               float *out1, uint32_t n, uint32_t k) {
+    const block_iq2_s *xa = (const block_iq2_s *)row0, *xb = (const block_iq2_s *)row1;
+    const uint32_t nb = k / QK_K;
+    if (n == 0u) return;
+    if (n > 8u) n = 8u;
+    const __m512i bitpat = _mm512_set1_epi64((long long)0x8040201008040201ULL);
+    const __m512i bcast = _mm512_broadcast_i32x4(_mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8, 8, 8, 8, 8));
+    pthread_once(&g_qwen4_sc16_once, qwen4_cpu_sc16_init);
+    __m512i acc[2][8];
+    float sumf[2][8];
+    for (int r = 0; r < 2; r++)
+        for (uint32_t b = 0; b < n; b++) { acc[r][b] = _mm512_setzero_si512(); sumf[r][b] = 0.0f; }
+    for (uint32_t i = 0; i < nb; i++) {
+        const float dr[2] = { f16_to_f32(xa[i].d), f16_to_f32(xb[i].d) };
+        const block_iq2_s *xr[2] = { &xa[i], &xb[i] };
+        for (uint32_t s = 0; s < QK_K / 32; s += 2) {
+            __m512i q8v[8];
+            for (uint32_t b = 0; b < n; b++)
+                q8v[b] = _mm512_loadu_si512((const void *)(ys[b][i].qs + 32 * s));
+            for (int r = 0; r < 2; r++) {
+                const block_iq2_s *x = xr[r];
+                const uint8_t *qs = x->qs + 8 * (s >> 1);
+                const uint8_t *qh = x->qh;
+                const uint8_t *sgn = x->qs + QK_K / 8;
+                const __m512i g = _mm512_set_epi64(
+                    (long long)iq2s_grid[qs[7] | ((qh[s + 1] << 2) & 0x300)],
+                    (long long)iq2s_grid[qs[6] | ((qh[s + 1] << 4) & 0x300)],
+                    (long long)iq2s_grid[qs[5] | ((qh[s + 1] << 6) & 0x300)],
+                    (long long)iq2s_grid[qs[4] | ((qh[s + 1] << 8) & 0x300)],
+                    (long long)iq2s_grid[qs[3] | ((qh[s + 0] << 2) & 0x300)],
+                    (long long)iq2s_grid[qs[2] | ((qh[s + 0] << 4) & 0x300)],
+                    (long long)iq2s_grid[qs[1] | ((qh[s + 0] << 6) & 0x300)],
+                    (long long)iq2s_grid[qs[0] | ((qh[s + 0] << 8) & 0x300)]);
+                const __m512i rep = _mm512_shuffle_epi8(
+                    _mm512_cvtepu8_epi64(_mm_loadl_epi64((const __m128i *)(sgn + 4 * s))), bcast);
+                const __mmask64 neg = _mm512_test_epi8_mask(rep, bitpat);
+                const __m512i scv = _mm512_inserti64x4(
+                    _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *)g_iq2s_sc16[x->scales[s + 0]])),
+                    _mm256_loadu_si256((const __m256i *)g_iq2s_sc16[x->scales[s + 1]]), 1);
+                for (uint32_t b = 0; b < n; b++) {
+                    const __m512i q8s = _mm512_mask_sub_epi8(q8v[b], neg, _mm512_setzero_si512(), q8v[b]);
+                    acc[r][b] = _mm512_dpwssd_epi32(acc[r][b], _mm512_maddubs_epi16(g, q8s), scv);
+                }
+            }
+        }
+        for (int r = 0; r < 2; r++)
+            for (uint32_t b = 0; b < n; b++) {
+                sumf[r][b] += dr[r] * ys[b][i].d * (float)_mm512_reduce_add_epi32(acc[r][b]);
+                acc[r][b] = _mm512_setzero_si512();
+            }
+    }
+    for (uint32_t b = 0; b < n; b++) { out0[b] = 0.125f * sumf[0][b]; out1[b] = 0.125f * sumf[1][b]; }
+}
+
+/* One weight row against a chunk of activations: batched where a batched
+ * kernel exists (IQ2_S VNNI shares the row assembly across tokens),
+ * per-token otherwise.  Used by the prefill mid phase. */
+static void qwen4_cpu_row_dot_q8k_batch(uint32_t type, const void *row, const block_q8_K *const *xq,
+                                        float *out, uint32_t n, uint32_t k) {
+#if defined(DS4_CPU_IQ2S_Q8K_VNNI)
+    if (type == DS4_TENSOR_IQ2_S) {
+        qwen4_cpu_dot_iq2_s_q8k_vnni_batch(row, xq, out, n, k);
+        return;
+    }
+#endif
+#if defined(DS4_CPU_IQ2S_Q8K)
+    if (type == DS4_TENSOR_IQ2_XXS) {
+        qwen4_cpu_dot_iq2_xxs_q8k_batch(row, xq, out, n, k);
+        return;
+    }
+    if (type == DS4_TENSOR_IQ2_XS) {
+        qwen4_cpu_dot_iq2_xs_q8k_batch(row, xq, out, n, k);
+        return;
+    }
+    if (type == DS4_TENSOR_IQ3_S) {
+        qwen4_cpu_dot_iq3_s_q8k_batch(row, xq, out, n, k);
+        return;
+    }
+    if (type == DS4_TENSOR_IQ3_XXS) {
+        qwen4_cpu_dot_iq3_xxs_q8k_batch(row, xq, out, n, k);
+        return;
+    }
+#endif
+    for (uint32_t b = 0; b < n; b++) out[b] = qwen4_cpu_row_dot_q8k(type, row, xq[b], NULL, k);
+}
+
+/* One fp32 weight row against a chunk of activations, storing straight into
+ * per-token destinations.  Batched where a twin exists (IQ4_NL/Q2_0 down),
+ * per-token otherwise.  Used by the prefill down phase. */
+static void qwen4_cpu_row_dot_fp32_batch_store(uint32_t type, const void *row, const float *const *xs,
+                                               float *const *outs, uint32_t n, uint32_t k) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+    if (type == DS4_TENSOR_IQ4_NL) {
+        qwen4_cpu_dot_iq4_nl_batch(row, xs, outs, n, k);
+        return;
+    }
+    if (type == DS4_TENSOR_Q2_0) {
+        qwen4_cpu_dot_q2_0_batch(row, xs, outs, n, k);
+        return;
+    }
+#endif
+    for (uint32_t b = 0; b < n; b++) *outs[b] = qwen4_cpu_row_dot(type, row, xs[b], k);
+}
+
+/* CPU-side MoE expert types: the Unsloth packs' routed experts (ISTA mixes
+ * IQ2_XXS/IQ2_XS/IQ3_XXS gate/up with Q2_0/IQ4_NL down). */
+static bool qwen4_cpu_expert_type(uint32_t type) {
+    return type == DS4_TENSOR_IQ2_XXS || type == DS4_TENSOR_IQ2_XS ||
+           type == DS4_TENSOR_IQ2_S || type == DS4_TENSOR_IQ3_XXS ||
+           type == DS4_TENSOR_IQ3_S || type == DS4_TENSOR_IQ4_NL ||
+           type == DS4_TENSOR_Q2_0;
+}
+
+#ifdef DS4_TEST_HOOKS
+/* Test hooks: A/B the SIMD expert kernels against the scalar reference
+ * (dequantize-then-sum) so the bit gymnastics can be checked without a
+ * model load.  tests/test_qwen4_cpu_dot.c drives them. */
+float ds4_test_qwen4_cpu_dot(uint32_t type, const void *row, const float *x, uint32_t k) {
+    return qwen4_cpu_row_dot(type, row, x, k);
+}
+
+float ds4_test_qwen4_ref_dot(uint32_t type, const void *row, const float *x, uint32_t k) {
+    switch (type) {
+    case DS4_TENSOR_IQ4_NL: return ds4_vec_dot_iq4_nl_f32((int)k, (const block_iq4_nl *)row, x);
+    case DS4_TENSOR_IQ2_S: return ds4_vec_dot_iq2_s_f32((int)k, (const block_iq2_s *)row, x);
+    case DS4_TENSOR_IQ3_S: return ds4_vec_dot_iq3_s_f32((int)k, (const block_iq3_s *)row, x);
+    case DS4_TENSOR_Q2_0: return ds4_vec_dot_q2_0_f32((int)k, (const block_q2_0 *)row, x);
+    default: return 0.0f;
+    }
+}
+
+/* Packed block size and the value count it covers, so the test can build
+ * synthetic rows without GGUF metadata. */
+uint32_t ds4_test_qwen4_block_bytes(uint32_t type, uint32_t *values) {
+    switch (type) {
+    case DS4_TENSOR_IQ4_NL: *values = 32; return (uint32_t)sizeof(block_iq4_nl);
+    case DS4_TENSOR_IQ2_S: *values = 256; return (uint32_t)sizeof(block_iq2_s);
+    case DS4_TENSOR_IQ3_S: *values = 256; return (uint32_t)sizeof(block_iq3_s);
+    case DS4_TENSOR_IQ2_XXS: *values = 256; return (uint32_t)sizeof(block_iq2_xxs);
+    case DS4_TENSOR_IQ2_XS: *values = 256; return (uint32_t)sizeof(block_iq2_xs);
+    case DS4_TENSOR_IQ3_XXS: *values = 256; return (uint32_t)sizeof(block_iq3_xxs);
+    case DS4_TENSOR_Q2_0: *values = 64; return (uint32_t)sizeof(block_q2_0);
+    default: *values = 0; return 0;
+    }
+}
+
+/* Dequantize one packed row; the test sums the true values itself instead of
+ * going through ds4_vec_dot_* (those assume 256-value blocks and would read
+ * IQ4_NL rows with the wrong stride). */
+void ds4_test_qwen4_dequant_row(uint32_t type, const void *row, float *out, uint32_t k) {
+    switch (type) {
+    case DS4_TENSOR_IQ4_NL: ds4_dequant_row_iq4_nl((const block_iq4_nl *)row, out, (int64_t)k); break;
+    case DS4_TENSOR_IQ2_S: ds4_dequant_row_iq2_s((const block_iq2_s *)row, out, (int64_t)k); break;
+    case DS4_TENSOR_IQ3_S: ds4_dequant_row_iq3_s((const block_iq3_s *)row, out, (int64_t)k); break;
+    case DS4_TENSOR_IQ2_XXS: ds4_dequant_row_iq2_xxs((const block_iq2_xxs *)row, out, (int64_t)k); break;
+    case DS4_TENSOR_IQ2_XS: ds4_dequant_row_iq2_xs((const block_iq2_xs *)row, out, (int64_t)k); break;
+    case DS4_TENSOR_IQ3_XXS: ds4_dequant_row_iq3_xxs((const block_iq3_xxs *)row, out, (int64_t)k); break;
+    case DS4_TENSOR_Q2_0: ds4_dequant_row_q2_0((const block_q2_0 *)row, out, (int64_t)k); break;
+    default: break;
+    }
+}
+
+/* Q8_K side of the int8 IQ2_S kernel: quantize/dequantize a whole activation
+ * and run the kernel variants.  Block bytes exposes sizeof(block_q8_K) so the
+ * test can size its buffers without the private type. */
+uint32_t ds4_test_qwen4_q8k_block_bytes(void) {
+    return (uint32_t)sizeof(block_q8_K);
+}
+
+const char *ds4_test_qwen4_q8k_kernel_name(void) {
+#if defined(DS4_CPU_IQ2S_Q8K_VNNI)
+    return "avx512-vnni";
+#elif defined(DS4_CPU_IQ2S_Q8K)
+    return "avx2-maddubs";
+#else
+    return "generic";
+#endif
+}
+
+void ds4_test_qwen4_quantize_row_q8k(const float *x, void *yq, uint32_t k) {
+    ds4_quantize_row_q8_K(x, (block_q8_K *)yq, (int64_t)k);
+}
+
+void ds4_test_qwen4_dequant_row_q8k(const void *yq, float *out, uint32_t k) {
+    const block_q8_K *y = (const block_q8_K *)yq;
+    for (uint32_t i = 0; i < k; i += QK_K) {
+        for (uint32_t j = 0; j < QK_K; j++) out[i + j] = y[i / QK_K].d * (float)y[i / QK_K].qs[j];
+    }
+}
+
+/* Batched mid path (see qwen4_cpu_row_dot_q8k_batch): one row against n
+ * activations, used to measure the kernel without the model around it. */
+void ds4_test_qwen4_cpu_dot_q8k_batch2(const void *row0, const void *row1, const void *const *xq,
+                                       float *out0, float *out1, uint32_t n, uint32_t k) {
+    qwen4_cpu_dot_iq2_s_q8k_vnni_batch2(row0, row1, (const block_q8_K *const *)xq,
+                                        out0, out1, n, k);
+}
+
+void ds4_test_qwen4_cpu_dot_q8k_batch(uint32_t type, const void *row, const void *const *xq,
+                                      float *out, uint32_t n, uint32_t k) {
+    qwen4_cpu_row_dot_q8k_batch(type, row, (const block_q8_K *const *)xq, out, n, k);
+}
+
+float ds4_test_qwen4_cpu_dot_q8k(uint32_t type, const void *row, const void *yq, uint32_t k) {
+    const block_q8_K *y = (const block_q8_K *)yq;
+    switch (type) {
+    case DS4_TENSOR_IQ2_XXS: return qwen4_cpu_dot_iq2_xxs_q8k(row, y, k);
+    case DS4_TENSOR_IQ2_XS:  return qwen4_cpu_dot_iq2_xs_q8k(row, y, k);
+    case DS4_TENSOR_IQ2_S:   return qwen4_cpu_dot_iq2_s_q8k(row, y, k);
+    case DS4_TENSOR_IQ3_XXS: return qwen4_cpu_dot_iq3_xxs_q8k(row, y, k);
+    case DS4_TENSOR_IQ3_S:   return qwen4_cpu_dot_iq3_s_q8k(row, y, k);
+    default: return 0.0f;
+    }
+}
+
+float ds4_test_qwen4_ref_dot_q8k(uint32_t type, const void *row, const void *yq, uint32_t k) {
+    const block_q8_K *y = (const block_q8_K *)yq;
+    switch (type) {
+    case DS4_TENSOR_IQ2_XXS: return qwen4_cpu_dot_iq2_xxs_q8k_generic(row, y, k);
+    case DS4_TENSOR_IQ2_XS:  return qwen4_cpu_dot_iq2_xs_q8k_generic(row, y, k);
+    case DS4_TENSOR_IQ2_S:   return qwen4_cpu_dot_iq2_s_q8k_generic(row, y, k);
+    case DS4_TENSOR_IQ3_XXS: return qwen4_cpu_dot_iq3_xxs_q8k_generic(row, y, k);
+    case DS4_TENSOR_IQ3_S:   return qwen4_cpu_dot_iq3_s_q8k_generic(row, y, k);
+    default: return 0.0f;
+    }
+}
+
+/* Each compiled variant, so the test can A/B both on a VNNI build. */
+float ds4_test_qwen4_cpu_dot_q8k_maddubs(uint32_t type, const void *row, const void *yq, uint32_t k) {
+#if defined(DS4_CPU_IQ2S_Q8K)
+    const block_q8_K *y = (const block_q8_K *)yq;
+    switch (type) {
+    case DS4_TENSOR_IQ2_XXS: return qwen4_cpu_dot_iq2_xxs_q8k_maddubs(row, y, k);
+    case DS4_TENSOR_IQ2_XS:  return qwen4_cpu_dot_iq2_xs_q8k_maddubs(row, y, k);
+    case DS4_TENSOR_IQ2_S:   return qwen4_cpu_dot_iq2_s_q8k_maddubs(row, y, k);
+    case DS4_TENSOR_IQ3_XXS: return qwen4_cpu_dot_iq3_xxs_q8k_maddubs(row, y, k);
+    case DS4_TENSOR_IQ3_S:   return qwen4_cpu_dot_iq3_s_q8k_maddubs(row, y, k);
+    default: return 0.0f;
+    }
+#else
+    (void)type; (void)row; (void)yq; (void)k;
+    return 0.0f;
+#endif
+}
+
+float ds4_test_qwen4_cpu_dot_q8k_vnni(uint32_t type, const void *row, const void *yq, uint32_t k) {
+#if defined(DS4_CPU_IQ2S_Q8K_VNNI)
+    if (type != DS4_TENSOR_IQ2_S) return 0.0f;
+    return qwen4_cpu_dot_iq2_s_q8k_vnni(row, (const block_q8_K *)yq, k);
+#else
+    (void)type; (void)row; (void)yq; (void)k;
+    return 0.0f;
+#endif
+}
+#endif /* DS4_TEST_HOOKS */
+
+/* Byte-exact mirror of llama.cpp dequantize_row_q2_0 (00=-1..11=+2). */
+static DS4_MAYBE_UNUSED void ds4_dequant_row_q2_0(const block_q2_0 *x, float *y, int64_t k) {
+    const int64_t nb = k / QK2_0;
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d);
+        for (int j = 0; j < QK2_0; j++) {
+            const unsigned q = (x[i].qs[j / 4] >> ((j % 4) * 2)) & 3u;
+            y[i * QK2_0 + j] = ((int)q - 1) * d;
+        }
+    }
+}
+
+static DS4_MAYBE_UNUSED float ds4_vec_dot_q2_0_f32(int n, const block_q2_0 *x, const float *y) {
+    const int nb = n / QK2_0;
+    float sumf = 0.0f;
+    float buf[QK2_0];
+    for (int i = 0; i < nb; i++) {
+        ds4_dequant_row_q2_0(x + i, buf, QK2_0);
+        for (int j = 0; j < QK2_0; j++) sumf += buf[j] * y[i * QK2_0 + j];
+    }
+    return sumf;
+}
+
 static void ds4_vec_dot_q8_K_q8_K(int n, float *s,
                                   const block_q8_K *x,
                                   const block_q8_K *y) {
@@ -5402,6 +7572,13 @@ static void tensor_expect_f16_or_q8_0_layout(
 static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 ||
            type == DS4_TENSOR_IQ2_XXS ||
+           type == DS4_TENSOR_IQ2_XS ||
+           type == DS4_TENSOR_IQ2_S ||
+           type == DS4_TENSOR_IQ3_XXS ||
+           type == DS4_TENSOR_IQ3_S ||
+           type == DS4_TENSOR_IQ4_XS ||
+           type == DS4_TENSOR_IQ4_NL ||
+           type == DS4_TENSOR_Q2_0 ||
            type == DS4_TENSOR_Q2_K ||
            type == DS4_TENSOR_Q4_K ||
            type == DS4_TENSOR_Q5_K ||
@@ -5413,6 +7590,13 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     switch (type) {
     case DS4_TENSOR_Q8_0:    return 34;
     case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
+    case DS4_TENSOR_IQ2_XS:  return sizeof(block_iq2_xs);
+    case DS4_TENSOR_IQ3_XXS: return sizeof(block_iq3_xxs);
+    case DS4_TENSOR_IQ2_S:   return sizeof(block_iq2_s);
+    case DS4_TENSOR_IQ3_S:   return sizeof(block_iq3_s);
+    case DS4_TENSOR_IQ4_XS:  return sizeof(block_iq4_xs);
+    case DS4_TENSOR_Q2_0:    return sizeof(block_q2_0);
+    case DS4_TENSOR_IQ4_NL:  return sizeof(block_iq4_nl);
     case DS4_TENSOR_Q2_K:    return sizeof(block_q2_K);
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
     case DS4_TENSOR_Q5_K:    return sizeof(block_q5_K);
@@ -5887,17 +8071,22 @@ static bool weights_qwen4_layer_has_required(const ds4_layer_weights *l, uint32_
     return true;
 }
 
-/* Dense Qwen projections: Q8_0, F16 or F32, plus BF16 and Q4_0 from the upstream GGUF. */
+/* Dense Qwen projections: Q8_0, F16 or F32, plus BF16 and Q4_0 from the recipe GGUF,
+ * Q6_K from Unsloth UD packs, Q5_K (output) and IQ3_S (embeddings) from ISTA GSQ,
+ * plus ISTA's Q4_K, IQ4_NL/IQ4_XS and Q2_0 dense projections (all have
+ * CPU-ref rows, layout entries and CUDA readers). */
 static bool tensor_type_is_qwen4_dense(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_F16 || type == DS4_TENSOR_F32 ||
-           type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q4_0;
+           type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q4_0 || type == DS4_TENSOR_Q6_K ||
+           type == DS4_TENSOR_Q5_K || type == DS4_TENSOR_IQ3_S || type == DS4_TENSOR_Q4_K ||
+           type == DS4_TENSOR_IQ4_NL || type == DS4_TENSOR_IQ4_XS || type == DS4_TENSOR_Q2_0;
 }
 
 static void tensor_expect_qwen4_dense_layout(
         const ds4_tensor *t, uint32_t ndim, uint64_t d0, uint64_t d1, uint64_t d2) {
     if (!t) ds4_die("internal error: missing tensor while validating layout");
     if (!tensor_type_is_qwen4_dense(t->type)) {
-        fprintf(stderr, "ds4: tensor %.*s has type %u, expected Q8_0, Q4_0, F16, BF16 or F32\n",
+        fprintf(stderr, "ds4: tensor %.*s has type %u, expected a dense type (Q8_0/Q4_0/F16/BF16/F32/Q6_K/Q5_K/IQ3_S/Q4_K/IQ4_NL/IQ4_XS/Q2_0)\n",
                 (int)t->name.len, t->name.ptr, t->type);
         exit(1);
     }
@@ -5945,8 +8134,10 @@ static void weights_validate_qwen4_layout(
         ds4_die("Qwen GGUF lacks its n-grams; repack with gguf-tools/qwen4_native_ngrams.py");
     if (w->ple_embd) {
         const uint32_t t = w->ple_embd->type;
-        if (t != DS4_TENSOR_BF16) {
-            fprintf(stderr, "ds4: n-gram embeddings must use original BF16, got type %u\n", t);
+        /* Recipe packs keep the original BF16 table; Unsloth UD packs carry
+         * the same rows in IQ4_NL, dequantized on read. */
+        if (t != DS4_TENSOR_BF16 && t != DS4_TENSOR_IQ4_NL) {
+            fprintf(stderr, "ds4: n-gram embeddings must use original BF16 or packed IQ4_NL, got type %u\n", t);
             exit(1);
         }
         if (w->ple_embd->ndim != 2 || w->ple_embd->dim[0] != DS4_N_PLE_HEAD_DIM ||
@@ -6015,7 +8206,11 @@ static void weights_validate_qwen4_layout(
             tensor_expect_layout(l->ple_conv, l->ple_conv->type == DS4_TENSOR_F16 ? DS4_TENSOR_F16 : DS4_TENSOR_F32,
                                  2, DS4_N_PLE_CONV, hc_dim, 0);
         }
-        tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
+        /* Unsloth ISTA stores the MoE routers in BF16; the recipe uses F32.
+         * Routing math consumes float rows either way (ref_row / scalar). */
+        tensor_expect_layout(l->ffn_gate_inp, l->ffn_gate_inp->type == DS4_TENSOR_BF16 ?
+                             DS4_TENSOR_BF16 : DS4_TENSOR_F32,
+                             2, DS4_N_EMBD, DS4_N_EXPERT, 0);
         tensor_expect_qwen4_expert_layout(l->ffn_gate_exps, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
         tensor_expect_qwen4_expert_layout(l->ffn_up_exps,   DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
         /* Q2_K down rows store 640 logical inputs in three 256-value blocks.
@@ -6027,11 +8222,18 @@ static void weights_validate_qwen4_layout(
             fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
             exit(1);
         }
-        /* llama.cpp writes the shared-expert gate as a 1-D [n_embd] tensor */
+        /* llama.cpp writes the shared-expert gate as a 1-D [n_embd] tensor;
+         * Unsloth ISTA stores the routers in BF16. */
         if (l->ffn_gate_inp_shexp->ndim == 1) {
-            tensor_expect_layout(l->ffn_gate_inp_shexp, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+            tensor_expect_layout(l->ffn_gate_inp_shexp,
+                                 l->ffn_gate_inp_shexp->type == DS4_TENSOR_BF16 ?
+                                 DS4_TENSOR_BF16 : DS4_TENSOR_F32,
+                                 1, DS4_N_EMBD, 0, 0);
         } else {
-            tensor_expect_layout(l->ffn_gate_inp_shexp, DS4_TENSOR_F32, 2, DS4_N_EMBD, 1, 0);
+            tensor_expect_layout(l->ffn_gate_inp_shexp,
+                                 l->ffn_gate_inp_shexp->type == DS4_TENSOR_BF16 ?
+                                 DS4_TENSOR_BF16 : DS4_TENSOR_F32,
+                                 2, DS4_N_EMBD, 1, 0);
         }
         tensor_expect_qwen4_dense_layout(l->ffn_gate_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
         tensor_expect_qwen4_dense_layout(l->ffn_up_shexp,   2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
@@ -7431,7 +9633,7 @@ static void qwen4_rope_configure(uint32_t native_ctx) {
 #endif
 }
 
-static void config_validate_qwen4_model(const ds4_model *m) {
+static void config_validate_qwen4_model(const ds4_model *m, bool mtp_sidecar) {
     const uint32_t n_embd = required_u32(m, "qwen4exp.embedding_length");
     if (n_embd == DS4_SHAPE_QWEN4_EXP.n_embd) {
         g_ds4_shape = DS4_SHAPE_QWEN4_EXP;
@@ -7454,8 +9656,19 @@ static void config_validate_qwen4_model(const ds4_model *m) {
     }
     g_ds4_shape.n_layer -= DS4_N_NEXTN_PREDICT - nextn;
     g_ds4_shape.n_nextn_predict = nextn;
+    /* An external sidecar supplies the missing MTP block: restore the
+     * full 48+1 profile. The block itself is validated at bind time. */
+    if (mtp_sidecar) {
+        if (DS4_N_NEXTN_PREDICT != 0 || g_ds4_shape.n_layer != DS4_SHAPE_QWEN4_EXP.n_layer - 1u) {
+            fprintf(stderr, "ds4: --mtp-model needs a 48-block trunk without an in-file MTP block\n");
+            exit(1);
+        }
+        g_ds4_shape.n_layer = DS4_SHAPE_QWEN4_EXP.n_layer;
+        g_ds4_shape.n_nextn_predict = 1u;
+    }
 
-    config_expect_u32("block_count", required_u32(m, "qwen4exp.block_count"), DS4_N_LAYER);
+    config_expect_u32("block_count", required_u32(m, "qwen4exp.block_count"),
+                      DS4_N_LAYER - (mtp_sidecar ? 1u : 0u));
     config_expect_u32("attention.head_count",
                       required_u32(m, "qwen4exp.attention.head_count"), DS4_N_HEAD);
     config_expect_u32("attention.head_count_kv",
@@ -7500,11 +9713,17 @@ static void config_validate_qwen4_model(const ds4_model *m) {
     config_expect_u32("attention.indexer.top_k",
                       required_u32(m, "qwen4exp.attention.indexer.top_k"), DS4_N_INDEXER_TOP_K);
 
-    /* 0 marks GDN layers; attention layers (and the MTP block) run QSA with ratio 4 */
+    /* 0 marks GDN layers; attention layers (and the MTP block) run QSA with ratio 4.
+     * With an external sidecar the trunk metadata stops at 48 entries; the
+     * MTP block runs QSA by design, so its ratio is synthesized. */
     {
         uint64_t ratios[DS4_MAX_LAYER];
         uint32_t n = 0;
         config_read_qwen4_u64_array(m, "qwen4exp.attention.compress_ratios", ratios, DS4_MAX_LAYER, &n);
+        if (n == DS4_N_LAYER - 1u && mtp_sidecar && DS4_N_NEXTN_PREDICT == 1u) {
+            ratios[n] = 4u;
+            n = DS4_N_LAYER;
+        }
         if (n < DS4_N_LAYER) ds4_die("qwen4exp.attention.compress_ratios is shorter than the layer count");
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
             const uint32_t expected = ds4_qwen4_layer_is_linear(il) ? 0u : 4u;
@@ -7621,7 +9840,7 @@ int ds4_kv_type_from_name(const char *name, int *q8_out) {
     return 0;
 }
 
-static void config_validate_model(const ds4_model *m) {
+static void config_validate_model(const ds4_model *m, bool mtp_sidecar) {
     g_ds4_flash_vision_exp = false;
     ds4_str arch = {0};
     if (model_get_string(m, "general.architecture", &arch)) {
@@ -7638,7 +9857,7 @@ static void config_validate_model(const ds4_model *m) {
             return;
         }
         if (ds4_streq(arch, "qwen4exp")) {
-            config_validate_qwen4_model(m);
+            config_validate_qwen4_model(m, mtp_sidecar);
             return;
         }
         if (ds4_streq(arch, "qwen35")) {
@@ -10582,7 +12801,9 @@ static void weights_bind(
         weights_bind_layer(&w->layer[il], m, il);
     }
     /* GLM nextn/MTP block(s): excluded from the executable pass but bound
-     * so the drafter can run them. Only when the full model is loaded. */
+     * so the drafter can run them. Only when the full model is loaded.
+     * An absorbed sidecar's blk.48 already lives in this model, so the
+     * tail always binds from m. */
     if (!load_slice &&
         (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA || ds4_model_is_qwen4()) &&
         start == 0 && end == executable_layers - 1u) {
@@ -44945,6 +47166,11 @@ struct ds4_engine {
     ds4_engine_tp_state tp;
     bool metal_ready;
     bool mtp_ready;
+    /* Qwen3.8-Flash MTP from an external sidecar (--mtp-model): the file
+     * supplies trunk layer N-1 (blk.48.*) while embeddings and the output
+     * head stay the trunk's. Set when the sidecar is consumed so the
+     * generic support-model block below skips it. */
+    bool qwen4_mtp_external;
     bool vision_ready;
     bool vision_map_ready;
     bool share_session_prefill_workspace;
@@ -60175,13 +62401,27 @@ static void qwen4_ple_step(int token, int *prev, uint32_t *rows);
 static bool qwen4_ngram_row(const ds4_model *m, uint32_t row, float *out) {
     const ds4_tensor *t = m->ngram_tensor;
     if (!t || m->ngram_fd < 0 || !out || row >= t->dim[1] ||
-        t->type != DS4_TENSOR_BF16 || !t->dim[0] || t->dim[0] > 160) {
+        (t->type != DS4_TENSOR_BF16 && t->type != DS4_TENSOR_IQ4_NL) ||
+        !t->dim[0] || t->dim[0] > 160) {
         errno = EINVAL;
         return false;
     }
+    /* Row stride comes from the packed size, not the element width: IQ4_NL
+     * rows are dim0/32 18-byte blocks, not dim0 half floats. */
+    if (t->bytes == 0 || t->dim[1] == 0 || t->bytes % t->dim[1] != 0) {
+        errno = EINVAL;
+        return false;
+    }
+    const uint64_t row_bytes = t->bytes / t->dim[1];
     uint8_t raw[320];
-    const uint32_t bytes = (uint32_t)t->dim[0] * 2u;
-    const uint64_t offset = t->abs_offset + (uint64_t)row * bytes;
+    if (row_bytes == 0 || row_bytes > sizeof(raw)) {
+        errno = EINVAL;
+        return false;
+    }
+    const uint32_t bytes = (uint32_t)row_bytes;
+    /* Split shards keep tensor bytes at file-local offsets; pread addresses
+     * the table's own shard file, so global abs_offset is wrong there. */
+    const uint64_t offset = t->file_offset + (uint64_t)row * bytes;
     uint32_t done = 0;
     while (done < bytes) {
         ssize_t n = pread(m->ngram_fd, raw + done, bytes - done, (off_t)(offset + done));
@@ -60191,6 +62431,20 @@ static bool qwen4_ngram_row(const ds4_model *m, uint32_t row, float *out) {
             return false;
         }
         done += (uint32_t)n;
+    }
+    if (t->type == DS4_TENSOR_IQ4_NL) {
+        if (t->dim[0] % 32u != 0 ||
+            row_bytes != (uint64_t)(t->dim[0] / 32u) * sizeof(block_iq4_nl)) {
+            errno = EINVAL;
+            return false;
+        }
+        /* Integer grid values cannot be NaN; no EDOM check applies. */
+        ds4_dequant_row_iq4_nl((const block_iq4_nl *)raw, out, (int64_t)t->dim[0]);
+        return true;
+    }
+    if (row_bytes != (uint64_t)t->dim[0] * 2u) {
+        errno = EINVAL;
+        return false;
     }
     for (size_t i = 0; i < t->dim[0]; i++) {
         uint32_t bits = ((uint32_t)raw[2*i] | ((uint32_t)raw[2*i+1] << 8)) << 16;
@@ -60434,11 +62688,13 @@ typedef struct ds4_qwen4_gpu_graph {
     /* MTP: staged predictor input, its residual, and the recurrent-state
      * snapshot that verify rollback restores */
     ds4_gpu_tensor *mtp_e, *mtp_cat, *mtp_proj, *mtp_R, *mtp_argmax, *mtp_argmax_tmp;
-    /* MTP draft head over a ranked vocabulary subset: gathered Q8 rows, their
-     * token ids, and whether the lazy load was attempted */
+    /* MTP draft head over a ranked vocabulary subset: gathered rows, their
+     * token ids, the row type they were gathered as, and whether the lazy
+     * load was attempted */
     ds4_gpu_tensor *draft_head;
     int32_t *draft_ids;
     uint32_t draft_rows;
+    uint32_t draft_head_type;
     bool draft_head_tried;
     ds4_gpu_tensor *snap_lin_state[DS4_MAX_LAYER];
     ds4_gpu_tensor *snap_lin_hist[DS4_MAX_LAYER];
@@ -60489,32 +62745,100 @@ typedef struct ds4_qwen4_gpu_graph {
     bool dump_prompt_rows;
 } ds4_qwen4_gpu_graph;
 
+/* Dense types the GPU graph can execute. CUDA additionally handles the
+ * Unsloth projections (matvec/unpack readers in ds4_qwen4_cuda.cuh);
+ * Metal and ROCm keep the recipe set: no kernels for it there. */
 static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
-    return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_F32 ||
-                 t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_Q4_0);
+    if (!t) return false;
+    switch (t->type) {
+    case DS4_TENSOR_Q8_0:
+    case DS4_TENSOR_F16:
+    case DS4_TENSOR_F32:
+    case DS4_TENSOR_BF16:
+    case DS4_TENSOR_Q4_0:
+        return true;
+#ifdef DS4_HAS_QWEN4_GPU
+    case DS4_TENSOR_Q6_K:
+    case DS4_TENSOR_Q5_K:
+    case DS4_TENSOR_IQ3_S:
+    case DS4_TENSOR_IQ4_XS:
+    case DS4_TENSOR_Q2_0:
+    case DS4_TENSOR_Q4_K:
+    case DS4_TENSOR_IQ4_NL:
+        return true;
+#endif
+    default:
+        return false;
+    }
 }
 
-/* expert types the tiled prefill GEMM stages (kernel_qwen4_moe_mm_*) */
+/* expert types the tiled prefill GEMM stages (kernel_qwen4_moe_mm_*).
+ * Restricted to types whose whole expert tensors can live on device:
+ * the tiled path caches entire tensors, so enabling it for streamed
+ * Unsloth experts OOMs the arena and falls back to unregistered host
+ * reads (illegal memory access). Unsloth prefills stay on the exact
+ * per-token path until a streaming-aware tiled path exists. */
 static bool qwen4_expert_type_has_mm(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_MXFP4 || type == DS4_TENSOR_Q4_K ||
            type == DS4_TENSOR_Q2_K || type == DS4_TENSOR_IQ2_XXS;
 }
 
+/* Routed expert types the GPU graph can execute. CUDA additionally handles
+ * Unsloth IQ2_S gate/up (256-wide rows) and IQ4_NL down (32-wide rows)
+ * through the moe_mv decode readers; the tiled prefill GEMM stays on the
+ * recipe types, so Unsloth prefills run the exact per-token path. */
 static bool qwen4_graph_expert_ok(const ds4_tensor *t) {
-    return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_MXFP4 || t->type == DS4_TENSOR_Q4_0 ||
-                 t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_F32 ||
-                 ((t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q2_K || t->type == DS4_TENSOR_IQ2_XXS) &&
-                  (t->dim[0] % 256u) == 0));
+    if (!t) return false;
+    switch (t->type) {
+    case DS4_TENSOR_Q8_0:
+    case DS4_TENSOR_MXFP4:
+    case DS4_TENSOR_Q4_0:
+    case DS4_TENSOR_F16:
+    case DS4_TENSOR_BF16:
+    case DS4_TENSOR_F32:
+        return true;
+    case DS4_TENSOR_Q4_K:
+    case DS4_TENSOR_Q2_K:
+    case DS4_TENSOR_IQ2_XXS:
+        return (t->dim[0] % 256u) == 0;
+#ifdef DS4_HAS_QWEN4_GPU
+    case DS4_TENSOR_IQ2_XS:
+    case DS4_TENSOR_IQ3_XXS:
+    case DS4_TENSOR_IQ2_S:
+        return (t->dim[0] % 256u) == 0;
+    case DS4_TENSOR_IQ3_S:
+        return (t->dim[0] % 256u) == 0;
+    case DS4_TENSOR_IQ4_XS:
+        return (t->dim[0] % 256u) == 0;
+    case DS4_TENSOR_IQ4_NL:
+        return (t->dim[0] % 32u) == 0;
+    case DS4_TENSOR_Q2_0:
+        return (t->dim[0] % 64u) == 0;
+#endif
+    default:
+        return false;
+    }
 }
 
 /* The Metal graph runs a subset of what the loader accepts. */
 static bool qwen4_graph_weights_supported(const ds4_weights *w) {
     if (!qwen4_graph_dense_ok(w->token_embd) || !qwen4_graph_dense_ok(w->output) ||
         !qwen4_graph_dense_ok(w->output_hc_down) || !qwen4_graph_dense_ok(w->output_hc_up)) {
+#ifdef DS4_HAS_QWEN4_GPU
+        fprintf(stderr, "ds4: Qwen3.8 GPU graph needs Q8_0/Q4_0/Q6_K/Q5_K/IQ3_S/IQ4_XS/Q2_0/F16/BF16/F32 dense weights\n");
+#else
         fprintf(stderr, "ds4: Qwen3.8 GPU graph needs Q8_0/Q4_0/F16/BF16/F32 dense weights\n");
+#endif
         return false;
     }
-    if (!w->ple_embd || w->ple_embd->type != DS4_TENSOR_BF16) {
+    /* PLE rows are gathered on the host and uploaded, so the packed IQ4_NL
+     * table needs no device reader; CUDA accepts it, other graphs do not. */
+    const bool ple_ok = w->ple_embd && (w->ple_embd->type == DS4_TENSOR_BF16
+#ifdef DS4_HAS_QWEN4_GPU
+        || w->ple_embd->type == DS4_TENSOR_IQ4_NL
+#endif
+    );
+    if (!ple_ok) {
         fprintf(stderr, "ds4: Qwen3.8 requires original BF16 n-grams in the model GGUF\n");
         return false;
     }
@@ -60533,7 +62857,13 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
         const ds4_layer_weights *l = &w->layer[il];
         const ds4_tensor *hc[4] = { l->hc_attn_up, l->hc_attn_inject, l->hc_ffn_up, l->hc_ffn_inject };
         for (int i = 0; i < 4; i++) {
-            if (hc[i]->type != DS4_TENSOR_F16 && hc[i]->type != DS4_TENSOR_F32 && hc[i]->type != DS4_TENSOR_Q8_0) {
+            const bool hc_up_ok = hc[i]->type == DS4_TENSOR_F16 || hc[i]->type == DS4_TENSOR_F32 ||
+                                  hc[i]->type == DS4_TENSOR_Q8_0
+#if defined(DS4_HAS_QWEN4_GPU) && !defined(DS4_HAS_QWEN4_METAL)
+                                  || hc[i]->type == DS4_TENSOR_BF16
+#endif
+                ;
+            if (!hc_up_ok) {
                 fprintf(stderr, "ds4: Qwen3.8 GPU graph needs F16/F32/Q8_0 hc up/inject weights (layer %u)\n", il);
                 return false;
             }
@@ -60563,8 +62893,13 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
         }
         if (!qwen4_graph_expert_ok(l->ffn_gate_exps) || !qwen4_graph_expert_ok(l->ffn_up_exps) ||
             !qwen4_graph_expert_ok(l->ffn_down_exps)) {
+#ifdef DS4_HAS_QWEN4_GPU
+            fprintf(stderr, "ds4: Qwen3.8 GPU graph: unsupported routed expert type in layer %u "
+                    "(q8_0, mxfp4, q4_K, q2_K, iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq4_xs, iq4_nl, q2_0, f16, f32)\n", il);
+#else
             fprintf(stderr, "ds4: Qwen3.8 GPU graph: unsupported routed expert type in layer %u "
                     "(q8_0, mxfp4, q4_K, q2_K, iq2_xxs, f16, f32)\n", il);
+#endif
             return false;
         }
     }
@@ -60943,9 +63278,21 @@ static void qwen4_graph_reset(ds4_qwen4_gpu_graph *g) {
     (void)ds4_gpu_synchronize();
     const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
     const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (g->layer_lin_state[il]) ds4_gpu_tensor_fill_f32(g->layer_lin_state[il], 0.0f, v_dim * DS4_N_LIN_HEAD_DIM);
         if (g->layer_lin_hist[il]) ds4_gpu_tensor_fill_f32(g->layer_lin_hist[il], 0.0f, (uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim);
+        /* Full-attention KV, indexer keys and pooled block keys are NOT
+         * positionally self-healing: a forward only (re)computes blocks
+         * intersecting its chunk, so a partial trailing block keeps the
+         * previous request's rows and poisons the next request's block
+         * selection from its first decode token. Zero them like the GDN
+         * state above to restore exact fresh-boot semantics. Counts are
+         * in floats; the fp16 caches hold zeros either way. */
+        if (g->layer_k_cache[il]) ds4_gpu_tensor_fill_f32(g->layer_k_cache[il], 0.0f, (uint64_t)g->ctx_cap * kv_dim / 2u);
+        if (g->layer_v_cache[il]) ds4_gpu_tensor_fill_f32(g->layer_v_cache[il], 0.0f, (uint64_t)g->ctx_cap * kv_dim / 2u);
+        if (g->layer_ik_cache[il]) ds4_gpu_tensor_fill_f32(g->layer_ik_cache[il], 0.0f, (uint64_t)g->ctx_cap * DS4_N_INDEXER_HEAD_DIM);
+        if (g->layer_block_key[il]) ds4_gpu_tensor_fill_f32(g->layer_block_key[il], 0.0f, (uint64_t)g->n_block_cap * DS4_N_INDEXER_HEAD_DIM / 2u);
     }
     ds4_gpu_tensor_fill_f32(g->ple_hist, 0.0f, (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM * DS4_N_EMBD * DS4_N_HC);
     for (uint32_t i = 0; i < DS4_MAX_PLE_NGRAM; i++) g->ple_prev[i] = DS4_PLE_EOS_ID;
@@ -61053,7 +63400,14 @@ static bool qwen4_mtp_draft_head_load(ds4_qwen4_gpu_graph *g, const ds4_model *m
     if (g->draft_head_tried) return g->draft_head != NULL;
     g->draft_head_tried = true;
     const char *path = getenv("DS4_QWEN4_MTP_DRAFT_VOCAB");
-    if (!path || !path[0] || w->type != DS4_TENSOR_Q8_0 || w->ndim < 2 || (w->dim[0] % 32u) != 0) return false;
+    if (!path || !path[0] || !w || w->ndim < 2) return false;
+#if !defined(DS4_HAS_QWEN4_GPU) || defined(DS4_HAS_QWEN4_METAL)
+    /* Q6_K subset scoring needs the CUDA weights-tensor kernel; other
+     * backends keep the Q8_0-only gathered head. */
+    if (w->type != DS4_TENSOR_Q8_0) return false;
+#endif
+    const uint64_t row_bytes = qwen4_mtp_draft_row_bytes(w->type, w->dim[0]);
+    if (!row_bytes) return false;
     FILE *fp = fopen(path, "r");
     if (!fp) { fprintf(stderr, "ds4: Qwen3.8 MTP draft vocabulary %s: %s\n", path, strerror(errno)); return false; }
     const uint64_t V = w->dim[1];
@@ -61068,18 +63422,20 @@ static bool qwen4_mtp_draft_head_load(ds4_qwen4_gpu_graph *g, const ds4_model *m
     }
     fclose(fp);
     free(seen);
-    if (!ids || n == 0 || n >= V) {
+    if (!ids || n == 0 || n >= V || (uint64_t)n > UINT64_MAX / row_bytes) {
         fprintf(stderr, "ds4: Qwen3.8 MTP draft vocabulary %s: need 1..%" PRIu64 " distinct ids (got %u)\n", path, V - 1u, n);
         free(ids);
         return false;
     }
-    const uint64_t row_bytes = (w->dim[0] / 32u) * 34u;
     const uint64_t bytes = (uint64_t)n * row_bytes;
     uint8_t *rows = malloc(bytes);
     ds4_gpu_tensor *head = rows ? ds4_gpu_tensor_alloc(bytes) : NULL;
-    if (rows && head) {
-        const uint8_t *src = (const uint8_t *)m->map + w->abs_offset;
-        for (uint32_t i = 0; i < n; i++) memcpy(rows + (uint64_t)i * row_bytes, src + (uint64_t)ids[i] * row_bytes, row_bytes);
+    if (rows && head && !qwen4_mtp_draft_gather_rows(m, w, ids, n, rows)) {
+        fprintf(stderr, "ds4: Qwen3.8 MTP draft vocabulary %s: row gather failed\n", path);
+        ds4_gpu_tensor_free(head);
+        free(ids);
+        free(rows);
+        return false;
     }
     const bool ok = rows && head && ds4_gpu_tensor_write(head, 0, rows, bytes);
     free(rows);
@@ -61092,9 +63448,26 @@ static bool qwen4_mtp_draft_head_load(ds4_qwen4_gpu_graph *g, const ds4_model *m
     g->draft_head = head;
     g->draft_ids = ids;
     g->draft_rows = n;
+    g->draft_head_type = w->type;
     fprintf(stderr, "ds4: Qwen3.8 MTP draft head: %u of %" PRIu64 " vocabulary rows from %s (%.0f MiB)\n",
             n, V, path, (double)bytes / (1024.0 * 1024.0));
     return true;
+}
+
+/* Score the gathered draft head with the same kernel geometry the full head
+ * would use for its type; Q8_0 keeps its dedicated entry on every backend. */
+static bool qwen4_mtp_draft_head_matmul(ds4_qwen4_gpu_graph *g, const ds4_tensor *output, uint32_t head_rows) {
+    if (!g || !g->draft_head || !output || !head_rows || output->ndim < 1 ||
+        output->dim[0] == 0 || output->dim[0] > UINT32_MAX) return false;
+    if (g->draft_head_type == DS4_TENSOR_Q8_0)
+        return ds4_gpu_qwen4_matmul_q8_0_weights_tensor(g->logits, g->draft_head,
+                (uint32_t)output->dim[0], head_rows, g->mixed) != 0;
+#if defined(DS4_HAS_QWEN4_GPU) && !defined(DS4_HAS_QWEN4_METAL)
+    if (g->draft_head_type == DS4_TENSOR_Q6_K)
+        return ds4_gpu_qwen4_matmul_weights_tensor(g->logits, g->draft_head, g->draft_head_type,
+                (uint32_t)output->dim[0], head_rows, g->mixed) != 0;
+#endif
+    return false;
 }
 
 /* Decode-sized batches (a token, or the 2/3-token MTP verify) take the fused
@@ -61185,6 +63558,9 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
           qwen4_gemv(g->z, m, l->lin_gate, g->mixed, T))) {
         return false;
     }
+#if defined(DS4_HAS_QWEN4_GPU) && !defined(DS4_HAS_QWEN4_METAL)
+    ds4_gpu_prof_mark(8); /* GDN sub-stage: qkv/gate projections (diagnostic) */
+#endif
     bool ok;
     if (qwen4_graph_fused(g, T)) {
         ok = ds4_gpu_qwen4_gdn_front_tensor(g->qkv, g->layer_lin_hist[il], g->mixed, g->ga, g->gb, m->map, m->size,
@@ -61202,17 +63578,29 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
                                            l->lin_dt_bias->abs_offset, T, DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD,
                                            DS4_N_LIN_HEAD_DIM);
     }
+#if defined(DS4_HAS_QWEN4_GPU) && !defined(DS4_HAS_QWEN4_METAL)
+    ds4_gpu_prof_mark(9); /* GDN sub-stage: front (conv + alpha/beta + a/dt) */
+#endif
     if (ok) {
         ok = ds4_gpu_qwen4_gdn_scan_tensor(g->lin_o, g->layer_lin_state[il], g->qkv, g->ga, g->gb, T,
                                            DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM,
                                            g->snap_after_first ? g->snap_lin_state[il] : NULL, 0u,
                                            g->snap_after_second ? g->snap2_lin_state[il] : NULL, 1u) != 0;
     }
+#if defined(DS4_HAS_QWEN4_GPU) && !defined(DS4_HAS_QWEN4_METAL)
+    ds4_gpu_prof_mark(10); /* GDN sub-stage: scan (recurrence) */
+#endif
     if (ok) {
         ok = ds4_gpu_qwen4_gdn_out_tensor(g->lin_o, g->z, m->map, m->size, l->lin_norm->abs_offset, T,
                                           DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS) != 0;
     }
+#if defined(DS4_HAS_QWEN4_GPU) && !defined(DS4_HAS_QWEN4_METAL)
+    ds4_gpu_prof_mark(11); /* GDN sub-stage: out (norm + gate) */
+#endif
     if (ok) ok = qwen4_gemv(g->blk, m, l->lin_out, g->lin_o, T);
+#if defined(DS4_HAS_QWEN4_GPU) && !defined(DS4_HAS_QWEN4_METAL)
+    ds4_gpu_prof_mark(12); /* GDN sub-stage: lin_out projection */
+#endif
     return ok;
 }
 
@@ -61360,6 +63748,15 @@ static bool qwen4_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
  * an extra slot, weighted reduce with the hc combine folded in */
 static bool qwen4_moe_profile_boundary(bool enabled, double *last, double *elapsed) {
     if (!enabled) return true;
+    /* DS4_QWEN4_MOE_PROFILE_NO_SYNC=1 skips the per-boundary device sync so the
+     * CPU-MoE 'flush' phase reports the real per-layer GPU backlog instead of
+     * being masked by the profiler's own drains (diagnostics only). */
+    if (getenv("DS4_QWEN4_MOE_PROFILE_NO_SYNC")) {
+        const double now_ = now_sec();
+        *elapsed = now_ - *last;
+        *last = now_;
+        return true;
+    }
     if (!ds4_gpu_end_commands()) return false;
     const double now = now_sec();
     *elapsed = now - *last;
@@ -61367,8 +63764,610 @@ static bool qwen4_moe_profile_boundary(bool enabled, double *last, double *elaps
     return glm_graph_begin_commands_if_needed();
 }
 
+/* ------------------------------------------------------------------------
+ * CPU routed-expert MoE (decode).
+ *
+ * Decode touches ~1 GB/token of packed routed experts.  Streaming those to
+ * the GPU over this machine's link (Gen3 x16: ~12 GB/s practical, far less
+ * once page-cache misses go to NVMe) caps decode near 5 tok/s; the same
+ * bytes come out of system RAM several times faster, which is the route
+ * llama.cpp's auto-fit takes (MoE tensors to system memory).  This path
+ * reads the mmapped expert rows on the CPU (AVX-512 kernels above), uploads
+ * only the per-slot down outputs (NS x embd floats) and lets the GPU reduce
+ * them together with the shared expert.  Opt-in: DS4_QWEN4_CPU_MOE=1.
+ * ------------------------------------------------------------------------ */
+typedef struct {
+    const char *gate_base;
+    const char *up_base;
+    const char *down_base;
+    uint64_t gate_rb, up_rb, down_rb;
+    uint32_t gate_type, up_type, down_type;
+    uint32_t k_in, k_ff, k_out, ns;
+    const float *x;
+    const block_q8_K *xq; /* optional: x quantized for the int8 IQ2_S kernel */
+    int32_t *ids; /* clamped in place: -1 marks a hole */
+    float *mid;  /* [ns][k_ff] */
+    float *part; /* [ns][k_out] */
+} qwen4_cpu_moe_job;
+
+/* Packed row stride of a routed-expert tensor (bytes are the exact packed
+ * size; Q2_K down rows carry their padding inside the stride). */
+static uint64_t qwen4_cpu_expert_row_bytes(const ds4_tensor *t) {
+    if (!t || t->dim[1] == 0 || t->dim[2] == 0 || t->bytes == 0) return 0;
+    if (t->bytes % t->dim[2] != 0) return 0;
+    const uint64_t per_expert = t->bytes / t->dim[2];
+    if (per_expert % t->dim[1] != 0) return 0;
+    return per_expert / t->dim[1];
+}
+
+/* Rows = ns * k_ff: one gate/up pair per ff row, silu(gate) * up like the
+ * per-(token, slot) GPU kernel. */
+static void qwen4_cpu_moe_mid_rows(void *vjob, uint64_t r0, uint64_t r1) {
+    qwen4_cpu_moe_job *job = (qwen4_cpu_moe_job *)vjob;
+    for (uint64_t r = r0; r < r1; r++) {
+        const uint32_t slot = (uint32_t)(r / job->k_ff);
+        const uint32_t row = (uint32_t)(r % job->k_ff);
+        const int32_t e = job->ids[slot];
+        float *dst = job->mid + (uint64_t)slot * job->k_ff + row;
+        if (e < 0) {
+            *dst = 0.0f;
+            continue;
+        }
+        const char *gr = job->gate_base + ((uint64_t)e * job->k_ff + row) * job->gate_rb;
+        const char *ur = job->up_base + ((uint64_t)e * job->k_ff + row) * job->up_rb;
+        const float a = qwen4_cpu_row_dot_q8k(job->gate_type, gr, job->xq, job->x, job->k_in);
+        const float b = qwen4_cpu_row_dot_q8k(job->up_type, ur, job->xq, job->x, job->k_in);
+        *dst = silu(a) * b;
+    }
+}
+
+/* Rows = ns * k_out: down projection of each slot's mid vector. */
+static void qwen4_cpu_moe_down_rows(void *vjob, uint64_t r0, uint64_t r1) {
+    qwen4_cpu_moe_job *job = (qwen4_cpu_moe_job *)vjob;
+    for (uint64_t r = r0; r < r1; r++) {
+        const uint32_t slot = (uint32_t)(r / job->k_out);
+        const uint32_t row = (uint32_t)(r % job->k_out);
+        const int32_t e = job->ids[slot];
+        float *dst = job->part + (uint64_t)slot * job->k_out + row;
+        if (e < 0) {
+            *dst = 0.0f;
+            continue;
+        }
+        const char *dr = job->down_base + ((uint64_t)e * job->k_out + row) * job->down_rb;
+        *dst = qwen4_cpu_row_dot(job->down_type, dr, job->mid + (uint64_t)slot * job->k_ff, job->k_ff);
+    }
+}
+
+/* Host scratch for the CPU MoE (decode is serialized by the engine lock). */
+typedef struct {
+    float *x;
+    block_q8_K *xq; /* Q8_K view of x for the int8 IQ2_S kernel */
+    int32_t *ids;
+    float *mid;
+    float *part;
+    uint32_t cap_ns;
+} qwen4_cpu_moe_scratch;
+static qwen4_cpu_moe_scratch g_qwen4_cpu_moe;
+
+static bool qwen4_cpu_moe_scratch_ready(uint32_t ns) {
+    if (g_qwen4_cpu_moe.cap_ns >= ns && g_qwen4_cpu_moe.x && g_qwen4_cpu_moe.xq && g_qwen4_cpu_moe.ids &&
+        g_qwen4_cpu_moe.mid && g_qwen4_cpu_moe.part) {
+        return true;
+    }
+    ds4_gpu_host_free(g_qwen4_cpu_moe.x);
+    ds4_gpu_host_free(g_qwen4_cpu_moe.xq);
+    ds4_gpu_host_free(g_qwen4_cpu_moe.ids);
+    ds4_gpu_host_free(g_qwen4_cpu_moe.mid);
+    ds4_gpu_host_free(g_qwen4_cpu_moe.part);
+    memset(&g_qwen4_cpu_moe, 0, sizeof(g_qwen4_cpu_moe));
+    const uint32_t cap = ns > 0 ? ns : 1u;
+    /* Pinned: these buffers cross the bus once per layer, and the driver's
+     * pageable staging dominates a 10 KB transfer. */
+    g_qwen4_cpu_moe.x = (float *)ds4_gpu_host_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+    g_qwen4_cpu_moe.xq = (block_q8_K *)ds4_gpu_host_alloc((uint64_t)(DS4_N_EMBD / QK_K + 1) * sizeof(block_q8_K));
+    g_qwen4_cpu_moe.ids = (int32_t *)ds4_gpu_host_alloc((uint64_t)cap * sizeof(int32_t));
+    g_qwen4_cpu_moe.mid = (float *)ds4_gpu_host_alloc((uint64_t)cap * DS4_N_FF_EXP * sizeof(float));
+    g_qwen4_cpu_moe.part = (float *)ds4_gpu_host_alloc((uint64_t)cap * DS4_N_EMBD * sizeof(float));
+    if (!g_qwen4_cpu_moe.x || !g_qwen4_cpu_moe.xq || !g_qwen4_cpu_moe.ids || !g_qwen4_cpu_moe.mid || !g_qwen4_cpu_moe.part) {
+        ds4_gpu_host_free(g_qwen4_cpu_moe.x);
+        ds4_gpu_host_free(g_qwen4_cpu_moe.xq);
+        ds4_gpu_host_free(g_qwen4_cpu_moe.ids);
+        ds4_gpu_host_free(g_qwen4_cpu_moe.mid);
+        ds4_gpu_host_free(g_qwen4_cpu_moe.part);
+        memset(&g_qwen4_cpu_moe, 0, sizeof(g_qwen4_cpu_moe));
+        return false;
+    }
+    g_qwen4_cpu_moe.cap_ns = cap;
+    return true;
+}
+
+static bool qwen4_cpu_moe_enabled(const ds4_layer_weights *l) {
+    const char *env = getenv("DS4_QWEN4_CPU_MOE");
+    if (!env || !env[0] || strcmp(env, "0") == 0 || !l) return false;
+    return qwen4_cpu_expert_type(l->ffn_gate_exps->type) &&
+           qwen4_cpu_expert_type(l->ffn_down_exps->type) &&
+           l->ffn_up_exps->type == l->ffn_gate_exps->type &&
+           DS4_N_EMBD == 2560u && (DS4_N_EMBD % 32u) == 0 && (DS4_N_FF_EXP % 32u) == 0 &&
+           qwen4_graph_dense_ok(l->ffn_gate_shexp) && qwen4_graph_dense_ok(l->ffn_up_shexp) &&
+           qwen4_graph_dense_ok(l->ffn_down_shexp);
+}
+
+/* Read the selection and the MoE input back, run the experts on the CPU and
+ * upload the per-slot outputs.  The router/top-k kernels are flushed first;
+ * the GPU command batch is reopened before returning. */
+static bool qwen4_graph_moe_cpu(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                                uint32_t T) {
+    if (T != 1u || DS4_N_EXPERT_USED > 64u) return false;
+    const uint32_t ns = DS4_N_EXPERT_USED;
+    if (!qwen4_cpu_moe_scratch_ready(ns)) return false;
+    const uint64_t gate_rb = qwen4_cpu_expert_row_bytes(l->ffn_gate_exps);
+    const uint64_t up_rb = qwen4_cpu_expert_row_bytes(l->ffn_up_exps);
+    const uint64_t down_rb = qwen4_cpu_expert_row_bytes(l->ffn_down_exps);
+    if (!gate_rb || !up_rb || !down_rb) return false;
+    const double t_flush0 = now_sec();
+    if (!ds4_gpu_end_commands()) return false;
+    const double t_flush = now_sec();
+    (void)t_flush0;
+    const double t_pre = now_sec();
+    if (!ds4_gpu_tensor_read(g->selected, 0, g_qwen4_cpu_moe.ids, (uint64_t)ns * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_read(g->mixed, 0, g_qwen4_cpu_moe.x, (uint64_t)DS4_N_EMBD * sizeof(float))) {
+        return false;
+    }
+    const double t0 = now_sec();
+    /* Shared expert: dense projections that depend only on `mixed`.  Enqueue
+     * them before the routed-expert compute so the GPU works while the host
+     * runs the parallel dots; the reduce below consumes sh_out in stream
+     * order.  The caller skips its own shared-expert block for this path. */
+#if defined(DS4_HAS_QWEN4_GPU) && !defined(DS4_HAS_QWEN4_METAL)
+    if (!(qwen4_gemv(g->sh_gate, m, l->ffn_gate_shexp, g->mixed, T) &&
+          qwen4_gemv(g->sh_up, m, l->ffn_up_shexp, g->mixed, T) &&
+          ds4_gpu_swiglu_tensor(g->sh_mid, g->sh_gate, g->sh_up, T * DS4_N_FF_EXP, 0.0f, 1.0f) &&
+          qwen4_gemv(g->sh_out, m, l->ffn_down_shexp, g->sh_mid, T))) {
+        return false;
+    }
+#endif
+    qwen4_cpu_moe_job job;
+    memset(&job, 0, sizeof(job));
+    job.gate_base = (const char *)m->map + l->ffn_gate_exps->abs_offset;
+    job.up_base = (const char *)m->map + l->ffn_up_exps->abs_offset;
+    job.down_base = (const char *)m->map + l->ffn_down_exps->abs_offset;
+    job.gate_rb = gate_rb;
+    job.up_rb = up_rb;
+    job.down_rb = down_rb;
+    job.gate_type = l->ffn_gate_exps->type;
+    job.up_type = l->ffn_up_exps->type;
+    job.down_type = l->ffn_down_exps->type;
+    job.k_in = DS4_N_EMBD;
+    job.k_ff = DS4_N_FF_EXP;
+    job.k_out = DS4_N_EMBD;
+    job.ns = ns;
+    job.x = g_qwen4_cpu_moe.x;
+    job.ids = g_qwen4_cpu_moe.ids;
+    job.mid = g_qwen4_cpu_moe.mid;
+    job.part = g_qwen4_cpu_moe.part;
+#ifdef DS4_CPU_IQ2S_Q8K
+    /* One Q8_K quantization per MoE input: every 256-value expert row of this
+     * layer shares it (gate and up are the same type by the enabled gate).
+     * DS4_QWEN4_CPU_MOE_FP32=1 forces the fp32 kernel for A/B runs. */
+    const char *fp32_env = getenv("DS4_QWEN4_CPU_MOE_FP32");
+    const bool force_fp32 = fp32_env && fp32_env[0] && strcmp(fp32_env, "0") != 0;
+    if (!force_fp32 && qwen4_cpu_q8k_type(job.gate_type) && DS4_N_EMBD % QK_K == 0) {
+        ds4_quantize_row_q8_K(g_qwen4_cpu_moe.x, g_qwen4_cpu_moe.xq, DS4_N_EMBD);
+        job.xq = g_qwen4_cpu_moe.xq;
+    }
+#endif
+    for (uint32_t s = 0; s < ns; s++) {
+        if (job.ids[s] < 0 || (uint32_t)job.ids[s] >= DS4_N_EXPERT) job.ids[s] = -1;
+    }
+    ds4_parallel_for_min_rows((uint64_t)ns * job.k_ff, qwen4_cpu_moe_mid_rows, &job, 64);
+    const double t_mid = now_sec();
+    ds4_parallel_for_min_rows((uint64_t)ns * job.k_out, qwen4_cpu_moe_down_rows, &job, 64);
+    const double t_down = now_sec();
+    if (!ds4_gpu_tensor_write(g->part, 0, job.part, (uint64_t)ns * DS4_N_EMBD * sizeof(float))) return false;
+    const double t_write = now_sec();
+    if (getenv("DS4_QWEN4_MOE_PROFILE")) {
+        static uint64_t s_layers;
+        static double s_read, s_mid, s_down, s_write, s_flush;
+        s_layers++;
+        s_flush += t_flush - t_flush0;
+        s_read += t0 - t_pre;          /* device -> host readbacks */
+        s_mid += t_mid - t0;           /* mid phase (gate/up + silu) */
+        s_down += t_down - t_mid;      /* down phase */
+        s_write += t_write - t_down;   /* part upload */
+        if (s_layers % (uint64_t)DS4_N_LAYER == 0) {
+            const double n = (double)s_layers;
+            fprintf(stderr,
+                    "ds4: Qwen MoE cpu ms/layer flush=%.3f read=%.3f mid=%.3f down=%.3f write=%.3f total=%.3f -> %.1f ms/token\n",
+                    s_flush / n * 1e3, s_read / n * 1e3, s_mid / n * 1e3, s_down / n * 1e3, s_write / n * 1e3,
+                    (s_read + s_mid + s_down + s_write) / n * 1e3,
+                    (s_read + s_mid + s_down + s_write) / n * 1e3 * (double)DS4_N_LAYER);
+        }
+    }
+    return glm_graph_begin_commands_if_needed();
+}
+
+/* ------------------------------------------------------------------------
+ * CPU routed-expert MoE for prefill chunks (T > 1).
+ *
+ * The GPU path streams every expert row once per token over PCIe (~180
+ * ms/token measured on UD-IQ3_XXS), while llama.cpp's prefill instead batches
+ * the tokens per expert so each weight row is read once per chunk and reused
+ * for every token that selected it.  This driver does the same: the T x NS
+ * selection comes back once per layer, a counting sort builds per-expert
+ * token lists, and the mid/down dots run row-major inside each expert so the
+ * packed rows stay hot in L1/L2.  Same CPU kernels as the T=1 path (Q8_K for
+ * 256-value types, fp32 for IQ4_NL/Q2_0 down), so decode and prefill agree.
+ * ------------------------------------------------------------------------ */
+typedef struct {
+    uint32_t cap_t, cap_ns;
+    float *x;            /* [T][embd] fp32 readback */
+    block_q8_K *xq;      /* [T][embd/256] */
+    int32_t *ids;        /* [T*ns] */
+    int32_t *counts;     /* [DS4_N_EXPERT] */
+    int32_t *offsets;    /* [DS4_N_EXPERT+1] */
+    int32_t *cursor;     /* [DS4_N_EXPERT] */
+    uint32_t *tok_idx;   /* [T*ns] */
+    uint8_t *slot_idx;   /* [T*ns] */
+    float *mid;          /* [T*ns][ff] */
+    float *part;         /* [T*ns][embd] */
+} qwen4_cpu_moe_pf_scratch;
+static qwen4_cpu_moe_pf_scratch g_qwen4_cpu_moe_pf;
+
+static void qwen4_cpu_moe_pf_release(void) {
+    ds4_gpu_host_free(g_qwen4_cpu_moe_pf.x);
+    ds4_gpu_host_free(g_qwen4_cpu_moe_pf.xq);
+    ds4_gpu_host_free(g_qwen4_cpu_moe_pf.ids);
+    ds4_gpu_host_free(g_qwen4_cpu_moe_pf.counts);
+    ds4_gpu_host_free(g_qwen4_cpu_moe_pf.offsets);
+    ds4_gpu_host_free(g_qwen4_cpu_moe_pf.cursor);
+    ds4_gpu_host_free(g_qwen4_cpu_moe_pf.tok_idx);
+    ds4_gpu_host_free(g_qwen4_cpu_moe_pf.slot_idx);
+    ds4_gpu_host_free(g_qwen4_cpu_moe_pf.mid);
+    ds4_gpu_host_free(g_qwen4_cpu_moe_pf.part);
+    memset(&g_qwen4_cpu_moe_pf, 0, sizeof(g_qwen4_cpu_moe_pf));
+}
+
+static bool qwen4_cpu_moe_pf_ready(uint32_t ns, uint32_t T) {
+    if (g_qwen4_cpu_moe_pf.cap_t >= T && g_qwen4_cpu_moe_pf.cap_ns >= ns &&
+        g_qwen4_cpu_moe_pf.x && g_qwen4_cpu_moe_pf.xq && g_qwen4_cpu_moe_pf.ids &&
+        g_qwen4_cpu_moe_pf.counts && g_qwen4_cpu_moe_pf.offsets && g_qwen4_cpu_moe_pf.cursor &&
+        g_qwen4_cpu_moe_pf.tok_idx && g_qwen4_cpu_moe_pf.slot_idx && g_qwen4_cpu_moe_pf.mid &&
+        g_qwen4_cpu_moe_pf.part) {
+        return true;
+    }
+    qwen4_cpu_moe_pf_release();
+    const uint64_t slots = (uint64_t)T * ns;
+    g_qwen4_cpu_moe_pf.x = (float *)ds4_gpu_host_alloc((uint64_t)T * DS4_N_EMBD * sizeof(float));
+    g_qwen4_cpu_moe_pf.xq = (block_q8_K *)ds4_gpu_host_alloc((uint64_t)T * (DS4_N_EMBD / QK_K + 1) * sizeof(block_q8_K));
+    g_qwen4_cpu_moe_pf.ids = (int32_t *)ds4_gpu_host_alloc(slots * sizeof(int32_t));
+    g_qwen4_cpu_moe_pf.counts = (int32_t *)ds4_gpu_host_alloc(DS4_N_EXPERT * sizeof(int32_t));
+    g_qwen4_cpu_moe_pf.offsets = (int32_t *)ds4_gpu_host_alloc((DS4_N_EXPERT + 1) * sizeof(int32_t));
+    g_qwen4_cpu_moe_pf.cursor = (int32_t *)ds4_gpu_host_alloc(DS4_N_EXPERT * sizeof(int32_t));
+    g_qwen4_cpu_moe_pf.tok_idx = (uint32_t *)ds4_gpu_host_alloc(slots * sizeof(uint32_t));
+    g_qwen4_cpu_moe_pf.slot_idx = (uint8_t *)ds4_gpu_host_alloc(slots);
+    g_qwen4_cpu_moe_pf.mid = (float *)ds4_gpu_host_alloc(slots * DS4_N_FF_EXP * sizeof(float));
+    g_qwen4_cpu_moe_pf.part = (float *)ds4_gpu_host_alloc(slots * DS4_N_EMBD * sizeof(float));
+    if (!g_qwen4_cpu_moe_pf.x || !g_qwen4_cpu_moe_pf.xq || !g_qwen4_cpu_moe_pf.ids ||
+        !g_qwen4_cpu_moe_pf.counts || !g_qwen4_cpu_moe_pf.offsets || !g_qwen4_cpu_moe_pf.cursor ||
+        !g_qwen4_cpu_moe_pf.tok_idx || !g_qwen4_cpu_moe_pf.slot_idx || !g_qwen4_cpu_moe_pf.mid ||
+        !g_qwen4_cpu_moe_pf.part) {
+        qwen4_cpu_moe_pf_release();
+        return false;
+    }
+    g_qwen4_cpu_moe_pf.cap_t = T;
+    g_qwen4_cpu_moe_pf.cap_ns = ns;
+    return true;
+}
+
+typedef struct {
+    const float *x;
+    block_q8_K *xq;
+    uint32_t k, nb;
+} qwen4_cpu_moe_pf_q8_job;
+
+static void qwen4_cpu_moe_pf_quant_rows(void *vjob, uint64_t t0, uint64_t t1) {
+    const qwen4_cpu_moe_pf_q8_job *j = (const qwen4_cpu_moe_pf_q8_job *)vjob;
+    for (uint64_t t = t0; t < t1; t++) {
+        ds4_quantize_row_q8_K(j->x + t * j->k, j->xq + t * j->nb, j->k);
+    }
+}
+
+typedef struct {
+    const qwen4_cpu_moe_pf_scratch *s;
+    const char *gate_base, *up_base, *down_base;
+    uint64_t gate_rb, up_rb, down_rb;
+    uint32_t gate_type, up_type, down_type;
+    uint32_t k_in, k_ff, k_out, ns, nb_in;
+} qwen4_cpu_moe_pf_job;
+
+/* Rows = NE * k_ff: one (expert, gate/up row) per row; the expert's token
+ * list is walked inside so the packed row is read once and reused. */
+/* 8-way silu(a)*y for the prefill mid.  silu() calls expf once per element and
+ * the mid phase does that 8 times per (row, token-chunk); the scalar version
+ * measured ~45 ms/layer on UD-IQ3_XXS (mid 439.9 -> 394.6 ms when replaced by a
+ * plain multiply).  e^x with a clamped exponent keeps 1/(1+e^-x) saturating to
+ * 0/1 for any input, so no select is needed.  Accuracy ~1e-7 relative, far
+ * below the Q8_K activation quantization that feeds this dot. */
+static inline __m512 qwen4_cpu_exp512(__m512 x) {
+    const __m512 ln2 = _mm512_set1_ps(0.6931471805599453f);
+    const __m512 inv_ln2 = _mm512_set1_ps(1.4426950408889634f);
+    __m512 k = _mm512_roundscale_ps(_mm512_mul_ps(x, inv_ln2),
+                                    _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    k = _mm512_max_ps(_mm512_min_ps(k, _mm512_set1_ps(127.0f)), _mm512_set1_ps(-126.0f));
+    const __m512 f = _mm512_fnmadd_ps(k, ln2, x);
+    __m512 p = _mm512_set1_ps(1.0f / 720.0f);
+    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(1.0f / 120.0f));
+    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(1.0f / 24.0f));
+    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(1.0f / 6.0f));
+    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(0.5f));
+    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(1.0f));
+    p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(1.0f));
+    const __m512i bits = _mm512_slli_epi32(
+        _mm512_add_epi32(_mm512_cvtps_epi32(k), _mm512_set1_epi32(127)), 23);
+    return _mm512_mul_ps(p, _mm512_castsi512_ps(bits));
+}
+
+static void qwen4_cpu_silu8_mul(const float *a, const float *y, float *out) {
+    /* A/B for the prefill mid: DS4_QWEN4_MID_SILU=0 scalar silu() (old path),
+     * 1 = 8-way vector (default), 2 = plain product (reference only, wrong
+     * math) - measured in one binary so the expert mix stays identical. */
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("DS4_QWEN4_MID_SILU");
+        mode = e ? atoi(e) : 1;
+    }
+    if (mode == 2) {
+        for (int i = 0; i < 8; i++) out[i] = a[i] * y[i];
+        return;
+    }
+    if (mode == 0) {
+        for (int i = 0; i < 8; i++) out[i] = silu(a[i]) * y[i];
+        return;
+    }
+#if defined(__AVX512F__)
+    const __m512 x = _mm512_loadu_ps(a);
+    const __m512 yy = _mm512_loadu_ps(y);
+    const __m512 one = _mm512_set1_ps(1.0f);
+    const __m512 e = qwen4_cpu_exp512(_mm512_sub_ps(_mm512_setzero_ps(), x));
+    const __m512 sig = _mm512_div_ps(one, _mm512_add_ps(one, e));
+    _mm512_storeu_ps(out, _mm512_mul_ps(_mm512_mul_ps(x, sig), yy));
+#else
+    for (int i = 0; i < 8; i++) out[i] = silu(a[i]) * y[i];
+#endif
+}
+
+static void qwen4_cpu_moe_pf_mid_rows(void *vjob, uint64_t r0, uint64_t r1) {
+    const qwen4_cpu_moe_pf_job *j = (const qwen4_cpu_moe_pf_job *)vjob;
+    const qwen4_cpu_moe_pf_scratch *s = j->s;
+    /* Diagnostics (value-checked, "0" disables): NOKERNEL skips the dot
+     * kernels, DUP runs them twice and keeps the second result.  DUP is the
+     * clean way to weigh the kernels on the critical path: same output, more
+     * work, so the delta of ms/chunk is exactly what the kernels cost. */
+    static int nokern = -1, middup = -1, outer = -1;
+    if (nokern < 0) {
+        const char *e = getenv("DS4_QWEN4_MID_NOKERNEL");
+        nokern = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    if (middup < 0) {
+        const char *e = getenv("DS4_QWEN4_MID_DUP");
+        middup = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    if (outer < 0) {
+        /* Chunk-outer (8 activations, 23 KB, L1-hot across all k_ff rows) is
+         * the default since it measured +5.2% end-to-end; ROWOUTER=1 restores
+         * the old per-row walk for A/B (and is where NOKERNEL/DUP apply). */
+        const char *e = getenv("DS4_QWEN4_MID_ROWOUTER");
+        outer = (e && e[0] && e[0] != '0') ? 0 : 1;
+    }
+    if (outer) {
+        /* Token-chunk outer, rows inner: the 8 activation vectors (23 KB) stay
+         * in L1 for all k_ff rows instead of being re-walked per row (100 KB
+         * per expert, three times the L1).  Same arithmetic per (row, token),
+         * same accumulation order -> bit-identical results. */
+        uint64_t R = r0;
+        while (R < r1) {
+            const uint32_t e = (uint32_t)(R / j->k_ff);
+            const int32_t lo = s->offsets[e], hi = s->offsets[e + 1];
+            const uint64_t eend = ((uint64_t)e + 1u) * j->k_ff;
+            const uint64_t rend = (eend < r1) ? eend : r1;
+            if (lo == hi) { R = rend; continue; }
+            for (int32_t base = lo; base < hi; base += 8) {
+                const uint32_t m = (uint32_t)((hi - base) < 8 ? (hi - base) : 8);
+                const block_q8_K *xq[8];
+                for (uint32_t b = 0; b < m; b++) xq[b] = s->xq + (uint64_t)s->tok_idx[base + (int32_t)b] * j->nb_in;
+                for (uint64_t R2 = R; R2 < rend; R2++) {
+                    const uint32_t row = (uint32_t)(R2 % j->k_ff);
+                    const char *gr = j->gate_base + ((uint64_t)e * j->k_ff + row) * j->gate_rb;
+                    const char *ur = j->up_base + ((uint64_t)e * j->k_ff + row) * j->up_rb;
+                    float va[8], vb[8];
+                    qwen4_cpu_row_dot_q8k_batch(j->gate_type, gr, xq, va, m, j->k_in);
+                    qwen4_cpu_row_dot_q8k_batch(j->up_type, ur, xq, vb, m, j->k_in);
+                    qwen4_cpu_silu8_mul(va, vb, va);
+                    for (uint32_t b = 0; b < m; b++) {
+                        const uint32_t t = s->tok_idx[base + (int32_t)b], slot = s->slot_idx[base + (int32_t)b];
+                        s->mid[((uint64_t)t * j->ns + slot) * j->k_ff + row] = va[b];
+                    }
+                }
+            }
+            R = rend;
+        }
+        return;
+    }
+    for (uint64_t R = r0; R < r1; R++) {
+        const uint32_t e = (uint32_t)(R / j->k_ff);
+        const int32_t lo = s->offsets[e], hi = s->offsets[e + 1];
+        if (lo == hi) continue;
+        const uint32_t row = (uint32_t)(R % j->k_ff);
+        const char *gr = j->gate_base + ((uint64_t)e * j->k_ff + row) * j->gate_rb;
+        const char *ur = j->up_base + ((uint64_t)e * j->k_ff + row) * j->up_rb;
+        for (int32_t base = lo; base < hi; base += 8) {
+            const uint32_t m = (uint32_t)((hi - base) < 8 ? (hi - base) : 8);
+            const block_q8_K *xq[8];
+            float va[8], vb[8];
+            for (uint32_t b = 0; b < m; b++) xq[b] = s->xq + (uint64_t)s->tok_idx[base + (int32_t)b] * j->nb_in;
+            if (nokern) {
+                for (uint32_t b = 0; b < m; b++) va[b] = (float)(uintptr_t)gr[b] + (float)(uintptr_t)ur[b];
+            } else {
+                if (middup) {
+                    qwen4_cpu_row_dot_q8k_batch(j->gate_type, gr, xq, va, m, j->k_in);
+                    qwen4_cpu_row_dot_q8k_batch(j->up_type, ur, xq, vb, m, j->k_in);
+                }
+                qwen4_cpu_row_dot_q8k_batch(j->gate_type, gr, xq, va, m, j->k_in);
+                qwen4_cpu_row_dot_q8k_batch(j->up_type, ur, xq, vb, m, j->k_in);
+                qwen4_cpu_silu8_mul(va, vb, va);
+            }
+            for (uint32_t b = 0; b < m; b++) {
+                const uint32_t t = s->tok_idx[base + (int32_t)b], slot = s->slot_idx[base + (int32_t)b];
+                s->mid[((uint64_t)t * j->ns + slot) * j->k_ff + row] = va[b];
+            }
+        }
+    }
+}
+
+/* Rows = NE * k_out: same batching for the down projection. */
+static void qwen4_cpu_moe_pf_down_rows(void *vjob, uint64_t r0, uint64_t r1) {
+    const qwen4_cpu_moe_pf_job *j = (const qwen4_cpu_moe_pf_job *)vjob;
+    const qwen4_cpu_moe_pf_scratch *s = j->s;
+    /* Token-outer / row-inner: the 640-float mid vector of one token stays
+     * in cache while its dot runs over the expert's rows, instead of being
+     * re-read for every row (the old order touched it once per (row,token)
+     * pair = ~34x per row).  Per-element results are unchanged. */
+    uint64_t R = r0;
+    while (R < r1) {
+        const uint32_t e = (uint32_t)(R / j->k_out);
+        const int32_t lo = s->offsets[e], hi = s->offsets[e + 1];
+        const uint64_t e_end = ((uint64_t)e + 1u) * j->k_out;
+        const uint64_t rend = r1 < e_end ? r1 : e_end;
+        if (lo != hi) {
+            const uint32_t row0 = (uint32_t)(R % j->k_out);
+            const uint32_t nrows = (uint32_t)(rend - R);
+            const char *drow0 = j->down_base + ((uint64_t)e * j->k_out + row0) * j->down_rb;
+            for (int32_t base = lo; base < hi; base += 8) {
+                const uint32_t m = (uint32_t)((hi - base) < 8 ? (hi - base) : 8);
+                const float *xs[8];
+                float *outs0[8], *outs[8];
+                for (uint32_t b = 0; b < m; b++) {
+                    const uint32_t t = s->tok_idx[base + (int32_t)b], slot = s->slot_idx[base + (int32_t)b];
+                    xs[b] = s->mid + ((uint64_t)t * j->ns + slot) * j->k_ff;
+                    outs0[b] = s->part + ((uint64_t)t * j->ns + slot) * j->k_out + row0;
+                }
+                const char *dr = drow0;
+                for (uint32_t r = 0; r < nrows; r++) {
+                    for (uint32_t b = 0; b < m; b++) outs[b] = outs0[b] + r;
+                    qwen4_cpu_row_dot_fp32_batch_store(j->down_type, dr, xs, outs, m, j->k_ff);
+                    dr += j->down_rb;
+                }
+            }
+        }
+        R = rend;
+    }
+}
+
+/* Prefill driver: read selection+activations back, batch by expert, compute
+ * mid+down on the CPU, return the per-slot outputs.  Falls back to the GPU
+ * path on any shape/alloc failure. */
+static bool qwen4_graph_moe_cpu_prefill(ds4_qwen4_gpu_graph *g, const ds4_model *m,
+                                        const ds4_layer_weights *l, uint32_t T) {
+    const uint32_t ns = DS4_N_EXPERT_USED, ne = DS4_N_EXPERT;
+    if (T < 2u || T > 4096u || ns == 0u || ns > 64u) return false;
+    if (!qwen4_cpu_moe_pf_ready(ns, T)) return false;
+    qwen4_cpu_moe_pf_scratch *s = &g_qwen4_cpu_moe_pf;
+    const uint64_t gate_rb = qwen4_cpu_expert_row_bytes(l->ffn_gate_exps);
+    const uint64_t up_rb = qwen4_cpu_expert_row_bytes(l->ffn_up_exps);
+    const uint64_t down_rb = qwen4_cpu_expert_row_bytes(l->ffn_down_exps);
+    if (!gate_rb || !up_rb || !down_rb) return false;
+    const uint32_t k_ff = DS4_N_FF_EXP;
+    const double t0 = now_sec();
+    if (!ds4_gpu_end_commands()) return false;
+    const double t1 = now_sec();
+    if (!ds4_gpu_tensor_read(g->selected, 0, s->ids, (uint64_t)T * ns * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_read(g->mixed, 0, s->x, (uint64_t)T * DS4_N_EMBD * sizeof(float))) return false;
+    const double t2 = now_sec();
+    /* Counting sort of the T x NS selection into per-expert token lists. */
+    memset(s->counts, 0, (size_t)ne * sizeof(int32_t));
+    for (uint64_t i = 0; i < (uint64_t)T * ns; i++) {
+        const int32_t e = s->ids[i];
+        if (e < 0 || (uint32_t)e >= ne) { s->ids[i] = -1; continue; }
+        s->counts[e]++;
+    }
+    s->offsets[0] = 0;
+    for (uint32_t e = 0; e < ne; e++) s->offsets[e + 1] = s->offsets[e] + s->counts[e];
+    memcpy(s->cursor, s->offsets, (size_t)ne * sizeof(int32_t));
+    for (uint64_t i = 0; i < (uint64_t)T * ns; i++) {
+        const int32_t e = s->ids[i];
+        if (e < 0) continue;
+        s->tok_idx[s->cursor[e]] = (uint32_t)(i / ns);
+        s->slot_idx[s->cursor[e]] = (uint8_t)(i % ns);
+        s->cursor[e]++;
+    }
+    qwen4_cpu_moe_pf_q8_job qj = { s->x, s->xq, DS4_N_EMBD, DS4_N_EMBD / QK_K };
+    ds4_parallel_for_min_rows(T, qwen4_cpu_moe_pf_quant_rows, &qj, 2);
+    const double t3 = now_sec();
+    {
+        static int cnt = -1;
+        if (cnt < 0) {
+            const char *e = getenv("DS4_QWEN4_MOE_COUNT");
+            cnt = (e && e[0] && e[0] != '0') ? 1 : 0;
+        }
+        if (cnt) {
+            const uint64_t pairs = (uint64_t)s->offsets[ne];
+            /* Activations re-read: every one of the k_ff gate rows (and the k_ff
+             * up rows) walks all of its expert's tokens at k_in*1.14 bytes each. */
+            const double act_mb = 2.0 * (double)k_ff * (double)pairs * (double)DS4_N_EMBD * 1.14 / 1e6;
+            /* Weights read once per layer: gate+up rows of every expert. */
+            const double w_mb = (double)ne * (double)k_ff * (double)DS4_N_EMBD * 2.0 * 0.2575 / 1e6;
+            const double gmac = 2.0 * (double)DS4_N_EMBD * (double)k_ff * (double)pairs / 1e9;
+            fprintf(stderr,
+                    "ds4: MoE count T=%u ne=%u ns=%u k_in=%u k_ff=%u pairs=%llu MACs=%.2f GMAC act=%.0f MB w=%.0f MB\n",
+                    T, ne, ns, (unsigned)DS4_N_EMBD, k_ff, (unsigned long long)pairs, gmac, act_mb, w_mb);
+        }
+    }
+    qwen4_cpu_moe_pf_job job;
+    memset(&job, 0, sizeof(job));
+    job.s = s;
+    job.gate_base = (const char *)m->map + l->ffn_gate_exps->abs_offset;
+    job.up_base = (const char *)m->map + l->ffn_up_exps->abs_offset;
+    job.down_base = (const char *)m->map + l->ffn_down_exps->abs_offset;
+    job.gate_rb = gate_rb;
+    job.up_rb = up_rb;
+    job.down_rb = down_rb;
+    job.gate_type = l->ffn_gate_exps->type;
+    job.up_type = l->ffn_up_exps->type;
+    job.down_type = l->ffn_down_exps->type;
+    job.k_in = DS4_N_EMBD;
+    job.k_ff = k_ff;
+    job.k_out = DS4_N_EMBD;
+    job.ns = ns;
+    job.nb_in = DS4_N_EMBD / QK_K;
+    ds4_parallel_for_min_rows((uint64_t)ne * k_ff, qwen4_cpu_moe_pf_mid_rows, &job, 16);
+    const double t4 = now_sec();
+    ds4_parallel_for_min_rows((uint64_t)ne * DS4_N_EMBD, qwen4_cpu_moe_pf_down_rows, &job, 16);
+    const double t5 = now_sec();
+    if (!ds4_gpu_tensor_write(g->part, 0, s->part, (uint64_t)T * ns * DS4_N_EMBD * sizeof(float))) return false;
+    const double t6 = now_sec();
+    if (getenv("DS4_QWEN4_MOE_PROFILE")) {
+        static uint64_t s_chunks;
+        static double s_flush, s_read, s_lists, s_mid, s_down, s_write;
+        s_chunks++;
+        s_flush += t1 - t0;
+        s_read += t2 - t1;
+        s_lists += t3 - t2;
+        s_mid += t4 - t3;
+        s_down += t5 - t4;
+        s_write += t6 - t5;
+        if (s_chunks % 8u == 0) {
+            const double n = (double)s_chunks;
+            fprintf(stderr,
+                    "ds4: Qwen MoE cpu prefill ms/chunk T=%u flush=%.1f read=%.1f lists+q8=%.1f mid=%.1f down=%.1f write=%.1f total=%.1f\n",
+                    T, s_flush / n * 1e3, s_read / n * 1e3, s_lists / n * 1e3, s_mid / n * 1e3,
+                    s_down / n * 1e3, s_write / n * 1e3, (s_flush + s_read + s_lists + s_mid + s_down + s_write) / n * 1e3);
+        }
+    }
+    return glm_graph_begin_commands_if_needed();
+}
+
 static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l, uint32_t T) {
-    const bool profile = T > 8u && getenv("DS4_QWEN4_MOE_PROFILE") != NULL;
+    const bool profile = T >= 1u && getenv("DS4_QWEN4_MOE_PROFILE") != NULL;
     double elapsed[7] = {0}, last = 0;
     if (!qwen4_moe_profile_boundary(profile, &last, &elapsed[0])) return false;
     bool ok = qwen4_gemv(g->router, m, l->ffn_gate_inp, g->mixed, T) &&
@@ -61376,6 +64375,19 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                                l->ffn_gate_inp_shexp->abs_offset, l->ffn_gate_inp_shexp->type,
                                                DS4_N_EMBD, g->sh_gate_logit, T, DS4_N_EXPERT, DS4_N_EXPERT_USED) &&
               qwen4_moe_profile_boundary(profile, &last, &elapsed[0]);
+    /* CPU routed experts (decode + prefill chunks, opt-in): the top-k ids
+     * come back, the rows are dotted on the CPU and only the per-slot down
+     * outputs go back to the GPU.  The shared expert stays on the GPU as
+     * dense projections, so the reduce below folds it in exactly as the
+     * prefill path does.  DS4_QWEN4_CPU_MOE_PREFILL=0 keeps prefill on the
+     * GPU for A/B runs. */
+    const char *pf_env = getenv("DS4_QWEN4_CPU_MOE_PREFILL");
+    const bool cpu_moe_t1 = ok && T == 1u && qwen4_cpu_moe_enabled(l);
+    const bool cpu_moe_pf = ok && T > 1u && T <= 4096u && qwen4_cpu_moe_enabled(l) &&
+                            !(pf_env && pf_env[0] && strcmp(pf_env, "0") == 0);
+    const bool cpu_moe = cpu_moe_t1 || cpu_moe_pf;
+    if (cpu_moe_t1) ok = qwen4_graph_moe_cpu(g, m, l, T);
+    else if (cpu_moe_pf) ok = qwen4_graph_moe_cpu_prefill(g, m, l, T);
     /* Prefill-sized batches route each expert's tokens through tiled GEMMs
      * (weights read once per 32 tokens) and run the shared expert as dense
      * GEMMs; decode keeps the per-(token, slot) row kernels with the shared
@@ -61391,7 +64403,7 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
 #else
     const uint32_t mm_min = 8u;
 #endif
-    const bool mm = T > mm_min &&
+    const bool mm = !cpu_moe && T > mm_min &&
         (DS4_N_EMBD % 64u) == 0 && (DS4_N_FF_EXP % 64u) == 0 &&
         qwen4_expert_type_has_mm(l->ffn_gate_exps->type) &&
         l->ffn_up_exps->type == l->ffn_gate_exps->type &&
@@ -61443,9 +64455,21 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
         qwen4_graph_dense_ok(l->ffn_gate_shexp) && qwen4_graph_dense_ok(l->ffn_up_shexp) &&
         qwen4_graph_dense_ok(l->ffn_down_shexp);
 #else
-    const bool shared_dense = false;
+    /* CUDA: the per-token slot reads gate and up through one shared type
+     * and stride, so packs with mixed shared-expert types (ISTA GSQ: gate
+     * IQ4_XS, up IQ3_S, down IQ4_NL) misread the up rows and NaN the blend.
+     * Run those through the dense projections (per-type GEMVs), which the
+     * Metal prefill path already exercises. Uniform packs keep the slot. */
+    const bool shared_dense =
+#if defined(DS4_HAS_QWEN4_GPU) && !defined(DS4_HAS_QWEN4_METAL)
+        cpu_moe ||
+        (l->ffn_gate_shexp->type != l->ffn_up_shexp->type &&
+         qwen4_graph_dense_ok(l->ffn_gate_shexp) && qwen4_graph_dense_ok(l->ffn_up_shexp) &&
+         qwen4_graph_dense_ok(l->ffn_down_shexp)) ||
 #endif
-    if (ok && shared_dense) {
+        false;
+#endif
+    if (ok && shared_dense && !cpu_moe_t1) {
         ok = qwen4_gemv(g->sh_gate, m, l->ffn_gate_shexp, g->mixed, T) &&
              qwen4_gemv(g->sh_up, m, l->ffn_up_shexp, g->mixed, T) &&
              ds4_gpu_swiglu_tensor(g->sh_mid, g->sh_gate, g->sh_up, T * DS4_N_FF_EXP, 0.0f, 1.0f) &&
@@ -61472,22 +64496,31 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                                                    DS4_N_FF_EXP, DS4_N_EMBD);
     } else
 #endif
-    if (ok) {
+    if (ok && !cpu_moe) {
         ok = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->mixed, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
                                           l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, DS4_N_EXPERT, T,
                                           DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP,
                                           shared_dense ? 0u : l->ffn_gate_shexp->abs_offset,
                                           shared_dense ? 0u : l->ffn_up_shexp->abs_offset,
-                                          shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type) != 0 &&
-             ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size, l->ffn_down_exps->abs_offset,
+                                          shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type) != 0;
+        if (!qwen4_moe_profile_boundary(profile, &last, &elapsed[1])) ok = false;
+        if (ok) ok = ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size, l->ffn_down_exps->abs_offset,
                                            l->ffn_down_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED, DS4_N_FF_EXP,
                                            DS4_N_EMBD, shared_dense ? 0u : l->ffn_down_shexp->abs_offset,
                                            shared_dense ? UINT32_MAX : l->ffn_down_shexp->type) != 0;
+        if (!qwen4_moe_profile_boundary(profile, &last, &elapsed[2])) ok = false;
     }
     if (ok) {
         ok = ds4_gpu_qwen4_moe_reduce_tensor(g->blk, g->part, g->weights, g->sh_gate_logit,
                                              shared_dense ? g->sh_out : NULL, g->R, g->inj, T, DS4_N_EXPERT_USED,
                                              DS4_N_EXPERT_USED + (shared_dense ? 0u : 1u), DS4_N_EMBD, DS4_N_HC) != 0;
+        if (!qwen4_moe_profile_boundary(profile, &last, &elapsed[3])) ok = false;
+        /* Row-path (decode) profile: the mm-path print above only covers
+         * prefill; decode rows need their own (router/mid/down/reduce). */
+        if (profile) fprintf(stderr,
+                "ds4: Qwen MoE row ms pos=%u T=%u router=%.3f mid=%.3f down=%.3f reduce=%.3f\n",
+                g->pos, T,
+                elapsed[0] * 1e3, elapsed[1] * 1e3, elapsed[2] * 1e3, elapsed[3] * 1e3);
     }
     return ok;
 }
@@ -61558,7 +64591,8 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     static int timing = -1;
     if (timing < 0) {
         const char *tv = getenv("DS4_QWEN4_TIMING");
-        timing = tv ? (atoi(tv) >= 2 ? 2 : 1) : 0;
+        /* 1 = forward split, 2 = prefill stages with syncs, 3 = T=1 host stages without syncs. */
+        timing = tv ? atoi(tv) : 0;
     }
     /* Start the GPU while the host encodes the rest of the trunk. The
      * command queue preserves layer order; zero restores one submission. */
@@ -61579,17 +64613,24 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     /* DS4_QWEN4_TIMING=2 on prefill batches: sync after each stage group and
      * report GPU ms per group (adds sync overhead; diagnostics only) */
     double prof[6] = {0};
-    const bool prof_on = timing == 2 && T > 1u;
+    const bool prof_on = (timing == 2 && T > 1u) || timing == 3;
     double prof_last = prof_on ? now_sec() : 0.0;
+#if defined(DS4_HAS_QWEN4_GPU) && !defined(DS4_HAS_QWEN4_METAL)
+#define QWEN4_GPU_PROF_MARK(i) do { if (timing >= 4) ds4_gpu_prof_mark(i); } while (0)
+#else
+#define QWEN4_GPU_PROF_MARK(i) do { } while (0)
+#endif
 #define QWEN4_PROF(idx_) do { \
         if (prof_on) { \
-            ds4_gpu_end_commands(); \
+            if (timing < 3) ds4_gpu_end_commands(); \
             const double now_ = now_sec(); \
             prof[idx_] += now_ - prof_last; \
             prof_last = now_; \
-            glm_graph_begin_commands_if_needed(); \
+            if (timing < 3) glm_graph_begin_commands_if_needed(); \
         } \
+        QWEN4_GPU_PROF_MARK(idx_); \
     } while (0)
+    QWEN4_GPU_PROF_MARK(6); /* token start: the delta from the previous mark 5 is the head */
     for (uint32_t il = 0; il < n_trunk && ok; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (ds4_qwen4_layer_is_ple(il)) {
@@ -61912,7 +64953,7 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
     if (ok) ok = qwen4_graph_attention(g, m, l, il, idx, T);
     if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, E, hc) != 0;
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
-    if (ok) ok = qwen4_graph_moe(g, m, l, T);
+if (ok) ok = qwen4_graph_moe(g, m, l, T);
     ds4_gpu_tensor *last = NULL;
     const char *argmax_env = getenv("DS4_QWEN4_MTP_GPU_ARGMAX");
     const bool gpu_argmax = want_logits && draft_out && !logits_out &&
@@ -61924,8 +64965,7 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
         last = ds4_gpu_tensor_view(g->mtp_R, (T - 1u) * hc * emb_bytes, hc * emb_bytes);
         g->R = last;
         ok = last && qwen4_graph_hc_mix(g, m, l->nextn_hc_head_norm, l->nextn_hc_head_down, l->nextn_hc_head_up, NULL, 1) &&
-             (gathered ? ds4_gpu_qwen4_matmul_q8_0_weights_tensor(g->logits, g->draft_head, (uint32_t)w->output->dim[0],
-                                                                  head_rows, g->mixed) != 0
+             (gathered ? qwen4_mtp_draft_head_matmul(g, w->output, head_rows)
                        : qwen4_gemv_rows(g->logits, m, w->output, g->mixed, 1, head_rows));
     }
     g->R = R_save;
@@ -62004,15 +65044,18 @@ static bool qwen4_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *
     if (ok) ok = qwen4_graph_attention(g, m, l, il, idx, 1);
     if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, 1, E, hc) != 0;
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, 1);
-    if (ok) ok = qwen4_graph_moe(g, m, l, 1);
-    /* the chained draft only needs its argmax; DS4_QWEN4_MTP_DRAFT_ROWS can
-     * score the frequent-token prefix exactly like the first draft's head */
-    const uint32_t chain_head_rows = qwen4_mtp_draft_rows();
+if (ok) ok = qwen4_graph_moe(g, m, l, 1);
+    /* the chained draft only needs its argmax; with a gathered head it
+     * scores the same subset as the first draft, otherwise the
+     * DS4_QWEN4_MTP_DRAFT_ROWS frequent-token prefix */
+    const bool cgathered = qwen4_mtp_draft_head_load(g, m, w->output);
+    const uint32_t chain_head_rows = cgathered ? g->draft_rows : qwen4_mtp_draft_rows();
     if (ok) {
         last = ds4_gpu_tensor_view(g->mtp_R, 0, hc * emb_bytes);
         g->R = last;
         ok = last && qwen4_graph_hc_mix(g, m, l->nextn_hc_head_norm, l->nextn_hc_head_down, l->nextn_hc_head_up, NULL, 1) &&
-             qwen4_gemv_rows(g->logits, m, w->output, g->mixed, 1, chain_head_rows);
+             (cgathered ? qwen4_mtp_draft_head_matmul(g, w->output, chain_head_rows)
+                        : qwen4_gemv_rows(g->logits, m, w->output, g->mixed, 1, chain_head_rows));
     }
     g->R = R_save;
     if (ok) ok = ds4_gpu_qwen4_argmax_tensor(g->mtp_argmax, g->mtp_argmax_tmp, g->logits, chain_head_rows) != 0;
@@ -62022,6 +65065,8 @@ static bool qwen4_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *
         int32_t token = -1;
         ok = ds4_gpu_tensor_read(g->mtp_argmax, 0, &token, sizeof(token)) != 0;
         if (ok && (token < 0 || (uint32_t)token >= chain_head_rows)) ok = false;
+        if (ok && cgathered) token = g->draft_ids[token];
+        if (ok && (token < 0 || token >= (int32_t)DS4_N_VOCAB)) ok = false;
         if (ok) *draft_out = token;
     }
     if (ok) {
@@ -67399,7 +70444,7 @@ int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *f
 
     if (!fp) fp = stdout;
     model_open(&model, model_path, false, false);
-    config_validate_model(&model);
+    config_validate_model(&model, false);
     vocab_load(&vocab, &model);
     tokenize_rendered_chat_vocab(&vocab, text ? text : "", &tokens);
 
@@ -67422,7 +70467,7 @@ int ds4_dump_chat_tokenization(const char *model_path,
 
     if (!fp) fp = stdout;
     model_open(&model, model_path, false, false);
-    config_validate_model(&model);
+    config_validate_model(&model, false);
     if (ds4_think_mode_level(think_mode) >= 0 &&
         DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41) {
         fprintf(stderr, "ds4: --think-level requires a DeepSeek V4.1 model\n");
@@ -70678,6 +73723,110 @@ static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row,
                     for (uint32_t i = 0; i < 8u; i++) {
                         out[b * 256u + ib32 * 32u + j * 8u + i] = dl * (float)grid[i] * (((signs >> i) & 1u) ? -1.0f : 1.0f);
                     }
+                }
+            }
+        }
+        break;
+    }
+    case DS4_TENSOR_Q6_K: {
+        /* Same bit unpacking as ds4_vec_dot_q6_K_f32: low 4 bits in ql,
+         * high 2 bits in qh, one int8 scale per 16 values, f16 block scale. */
+        const uint64_t blocks = n / 256u;
+        const uint8_t *p = (const uint8_t *)tensor_data(m, t) + row * blocks * 210u;
+        for (uint64_t b = 0; b < blocks; b++, p += 210u) {
+            uint16_t dh;
+            memcpy(&dh, p + 208, sizeof(dh));
+            const float d = f16_to_f32(dh);
+            const uint8_t *ql = p, *qh = p + 128;
+            const int8_t *scales = (const int8_t *)(p + 192);
+            for (uint32_t h = 0; h < 2u; h++) {
+                for (uint32_t l = 0; l < 32u; l++) {
+                    const uint32_t is = l / 16u;
+                    const int q1 = ((int)(ql[l] & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                    const int q2 = ((int)(ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                    const int q3 = ((int)(ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                    const int q4 = ((int)(ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                    out[b * 256u + h * 128u + l] = d * (float)scales[is] * (float)q1;
+                    out[b * 256u + h * 128u + l + 32u] = d * (float)scales[is + 2] * (float)q2;
+                    out[b * 256u + h * 128u + l + 64u] = d * (float)scales[is + 4] * (float)q3;
+                    out[b * 256u + h * 128u + l + 96u] = d * (float)scales[is + 6] * (float)q4;
+                }
+                ql += 64;
+                qh += 32;
+                scales += 8;
+            }
+        }
+        break;
+    }
+    case DS4_TENSOR_IQ2_S: {
+        const uint64_t blocks = n / 256u;
+        ds4_dequant_row_iq2_s(
+            (const block_iq2_s *)((const uint8_t *)tensor_data(m, t) + row * blocks * 82u),
+            out, (int64_t)(blocks * 256u));
+        break;
+    }
+    case DS4_TENSOR_IQ3_S: {
+        const uint64_t blocks = n / 256u;
+        ds4_dequant_row_iq3_s(
+            (const block_iq3_s *)((const uint8_t *)tensor_data(m, t) + row * blocks * 110u),
+            out, (int64_t)(blocks * 256u));
+        break;
+    }
+    case DS4_TENSOR_IQ4_NL: {
+        const uint64_t blocks = n / 32u;
+        ds4_dequant_row_iq4_nl(
+            (const block_iq4_nl *)((const uint8_t *)tensor_data(m, t) + row * blocks * 18u),
+            out, (int64_t)(blocks * 32u));
+        break;
+    }
+    case DS4_TENSOR_IQ2_XS: {
+        const uint64_t blocks = n / 256u;
+        ds4_dequant_row_iq2_xs(
+            (const block_iq2_xs *)((const uint8_t *)tensor_data(m, t) + row * blocks * 74u),
+            out, (int64_t)(blocks * 256u));
+        break;
+    }
+    case DS4_TENSOR_IQ3_XXS: {
+        const uint64_t blocks = n / 256u;
+        ds4_dequant_row_iq3_xxs(
+            (const block_iq3_xxs *)((const uint8_t *)tensor_data(m, t) + row * blocks * 98u),
+            out, (int64_t)(blocks * 256u));
+        break;
+    }
+    case DS4_TENSOR_IQ4_XS: {
+        const uint64_t blocks = n / 256u;
+        ds4_dequant_row_iq4_xs(
+            (const block_iq4_xs *)((const uint8_t *)tensor_data(m, t) + row * blocks * 136u),
+            out, (int64_t)(blocks * 256u));
+        break;
+    }
+    case DS4_TENSOR_Q2_0: {
+        const uint64_t blocks = n / 64u;
+        ds4_dequant_row_q2_0(
+            (const block_q2_0 *)((const uint8_t *)tensor_data(m, t) + row * blocks * 18u),
+            out, (int64_t)(blocks * 64u));
+        break;
+    }
+    case DS4_TENSOR_Q5_K: {
+        /* Same unpacking as ds4_vec_dot_q5_K_f32: 4-bit nibbles in qs,
+         * high bits in qh, Q4_K-style scales and min. */
+        const uint64_t blocks = n / 256u;
+        const uint8_t *p = (const uint8_t *)tensor_data(m, t) + row * blocks * 176u;
+        for (uint64_t b = 0; b < blocks; b++, p += 176u) {
+            uint16_t dh, dmh;
+            memcpy(&dh, p, sizeof(dh));
+            memcpy(&dmh, p + 2, sizeof(dmh));
+            const float d = f16_to_f32(dh), dmin = f16_to_f32(dmh);
+            const uint8_t *scales = p + 4, *qh = p + 16, *ql = p + 48;
+            for (uint32_t g = 0; g < 8u; g++) {
+                uint8_t sc = 0, mn = 0;
+                q4_k_get_scale_min((int)g, scales, &sc, &mn);
+                const uint32_t base = (g >> 1) * 32u, shift = (g & 1u) * 4u;
+                const uint8_t mask = (uint8_t)(1u << g);
+                const float scale = d * (float)sc, minv = dmin * (float)mn;
+                for (uint32_t l = 0; l < 32u; l++) {
+                    const int q = ((ql[base + l] >> shift) & 0x0F) + ((qh[l] & mask) ? 16 : 0);
+                    out[b * 256u + g * 32u + l] = scale * (float)q - minv;
                 }
             }
         }
@@ -74003,6 +77152,8 @@ static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cach
  * fit, an embedded head is simply declined - the trunk keeps running at full
  * context - where a sidecar is closed and the support state cleared.
  */
+static void ds4_gpu_publish_model_files(const ds4_model *m);
+
 static int qwen38_mtp_bind_draft(ds4_engine *e, const ds4_model *src,
                                  bool embedded, int context_hint) {
     weights_bind_qwen38_mtp(&e->qwen38_mtp_weights, src, DS4_N_LAYER);
@@ -74077,14 +77228,14 @@ static int qwen38_mtp_bind_draft(ds4_engine *e, const ds4_model *src,
             free(mtp_sizes);
             return 1;
         }
-        (void)ds4_gpu_set_model_fd_for_map(src->fd, src->map);
+        ds4_gpu_publish_model_files(src);
     }
     const bool cached = accelerator_cache_model_tensors(
         e->backend, src, mtp_offsets, mtp_sizes, mtp_span_count);
     free(mtp_offsets);
     free(mtp_sizes);
     if (!embedded) {
-        (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+        ds4_gpu_publish_model_files(&e->model);
     }
     if (!cached) {
         fprintf(stderr, "ds4: %s failed to prepare the Qwen3.8 MTP draft cache\n",
@@ -74114,6 +77265,32 @@ static int qwen38_mtp_bind_draft(ds4_engine *e, const ds4_model *src,
  * global-attention tensors and preloads only their byte spans. The embedding
  * table and LM head stay the trunk's: nextn.shared_head_norm exists precisely
  * because those are shared. */
+/* Publish a model's files to the GPU backend: the primary fd for legacy
+ * single-file reads plus the shard table for split models. The table is
+ * CUDA-only; other backends keep the fd call they already had. */
+#ifndef DS4_NO_GPU
+static void ds4_gpu_publish_model_files(const ds4_model *m) {
+    if (!m) return;
+    (void)ds4_gpu_set_model_fd_for_map(m->fd, m->map);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    if (m->n_shards > 1) {
+        int fds[DS4_MAX_SHARDS];
+        uint64_t sizes[DS4_MAX_SHARDS], bases[DS4_MAX_SHARDS];
+        for (uint32_t i = 0; i < m->n_shards; i++) {
+            fds[i] = m->shards[i].fd;
+            sizes[i] = m->shards[i].size;
+            bases[i] = m->shards[i].slot_base;
+        }
+        if (!ds4_gpu_set_model_shards(fds, sizes, bases, m->n_shards))
+            ds4_die("cannot publish split shards to the GPU backend");
+    } else {
+        /* Single-file models must clear any earlier split table. */
+        (void)ds4_gpu_set_model_shards(NULL, NULL, NULL, 0);
+    }
+#endif
+}
+#endif
+
 static int qwen38_mtp_sidecar_open(ds4_engine *e, const char *path,
                                    bool graph_backend, int context_hint) {
 #ifndef DS4_NO_GPU
@@ -74296,7 +77473,46 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
-    config_validate_model(&e->model);
+    /* Qwen3.8-Flash MTP from an external sidecar: open it before config so
+     * the shape accounts for the missing in-file MTP block (48 -> 49/1).
+     * The family shape is not selected yet here, so match the architecture
+     * key directly (same key config dispatches on below).
+     * The generic support-model block below skips it via qwen4_mtp_external. */
+    bool qwen4_mtp_sidecar = false;
+    uint64_t qwen4_mtp_draft_dense = 0;
+    ds4_str trunk_arch = {0};
+    const bool trunk_is_qwen4 =
+        model_get_string(&e->model, "general.architecture", &trunk_arch) &&
+        ds4_streq(trunk_arch, "qwen4exp");
+    if (trunk_is_qwen4 && !opt->inspect_only &&
+        opt->mtp_path && opt->mtp_path[0] &&
+        opt->distributed.role == DS4_DISTRIBUTED_NONE && !load_slice &&
+        !e->ssd_streaming && !opt->dspark) {
+        /* Absorb blk.48 into the trunk so single-map math keeps working;
+         * token/output embeddings stay the trunk's (shared design). */
+        ds4_model sidecar;
+        model_open(&sidecar, opt->mtp_path, graph_backend, true);
+        ds4_str sidecar_arch = {0};
+        const bool arch_ok =
+            model_get_string(&sidecar, "general.architecture", &sidecar_arch) &&
+            ds4_streq(sidecar_arch, "qwen4exp");
+        const bool has_block =
+            model_find_tensor(&sidecar, "blk.48.nextn.eh_proj.weight") != NULL &&
+            model_find_tensor(&sidecar, "blk.48.attn_q.weight") != NULL;
+        if (!arch_ok || !has_block) {
+            fprintf(stderr, "ds4: --mtp-model %s is not a Qwen3.8-Flash MTP sidecar "
+                            "(need qwen4exp blk.48 with a nextn head)\n", opt->mtp_path);
+            model_close(&sidecar);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        model_absorb_sidecar(&e->model, &sidecar, graph_backend, &qwen4_mtp_draft_dense);
+        model_close(&sidecar);
+        e->qwen4_mtp_external = true;
+        qwen4_mtp_sidecar = true;
+    }
+    config_validate_model(&e->model, qwen4_mtp_sidecar);
     if (ds4_model_is_qwen4() && !opt->inspect_only) {
         const bool backend_ok =
 #ifdef DS4_HAS_QWEN4_GPU
@@ -74306,11 +77522,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (!backend_ok || opt->tp.role != DS4_TP_NONE || opt->cuda_tensor_parallel ||
             (gpu_cfg && gpu_cfg->n_gpus > 1) ||
             opt->distributed.role != DS4_DISTRIBUTED_NONE || load_slice ||
-            e->ssd_streaming || opt->dspark || e->power_percent != 100 ||
-            (opt->mtp_path && opt->mtp_path[0])) {
+            e->ssd_streaming || opt->dspark || e->power_percent != 100) {
             fprintf(stderr, "ds4: Qwen3.8 requires Metal or single-GPU CUDA (or --cpu --first-token-test); "
-                            "tensor parallelism, pipeline execution, SSD streaming, DSpark, "
-                            "external MTP models and power throttling are not supported\n");
+                            "tensor parallelism, pipeline execution, SSD streaming, DSpark "
+                            "and power throttling are not supported\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -74455,8 +77670,44 @@ static int ds4_engine_open_internal(ds4_engine **out,
                      load_layer_end,
                      load_output,
                      load_output_optional);
+        if (e->qwen4_mtp_external) {
+            /* The sidecar block never went through the layout validator
+             * (it validates trunk range 0..47 only): check it explicitly.
+             * Token embeddings and the output head stay the trunk's. */
+            weights_validate_qwen4_layout(&e->weights, DS4_N_LAYER - 1u, DS4_N_LAYER - 1u,
+                                          false, false);
+#ifndef DS4_NO_GPU
+            /* Streaming-aware residency: the draft block's dense weights
+             * and its KV/state must fit next to the trunk cache. Its
+             * experts stream on demand like the trunk's. */
+            const uint64_t draft_kv = (uint64_t)opt->context_size * 1024u;
+            const uint64_t draft_need = qwen4_mtp_draft_dense + draft_kv + 512ull * 1048576ull;
+            uint64_t free_bytes = 0, total_bytes = 0;
+            const uint64_t reserve = 2ull * 1024ull * 1024ull * 1024ull;
+            const bool bounded = ds4_gpu_memory_info(&free_bytes, &total_bytes) &&
+                                 total_bytes > reserve;
+            if (bounded && draft_need + reserve > free_bytes) {
+                fprintf(stderr,
+                        "ds4: Qwen3.8 MTP sidecar needs ~%.2f GiB free (draft dense %.2f + state), "
+                        "have %.2f of %.2f: lower --ctx or free VRAM\n",
+                        (double)draft_need / 1073741824.0,
+                        (double)qwen4_mtp_draft_dense / 1073741824.0,
+                        (double)free_bytes / 1073741824.0,
+                        (double)total_bytes / 1073741824.0);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            fprintf(stderr,
+                    "ds4: Qwen3.8 MTP sidecar bound: %s (draft dense %.2f GiB)\n",
+                    opt->mtp_path, (double)qwen4_mtp_draft_dense / 1073741824.0);
+#endif
+        }
         if (e->model.ngram_tensor) {
-            fprintf(stderr, "ds4: Qwen BF16 n-grams: %.2f GiB, disk reads only\n",
+            const char *ngram_type = e->model.ngram_tensor->type == DS4_TENSOR_BF16 ?
+                "BF16" : "IQ4_NL";
+            fprintf(stderr, "ds4: Qwen %s n-grams: %.2f GiB, disk reads only\n",
+                    ngram_type,
                     (double)e->model.ngram_tensor->bytes / (1024.0 * 1024.0 * 1024.0));
         }
         if (e->vision_ready && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
@@ -74559,7 +77810,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 if (ready && getenv("DS4_QWEN4_GPU")) {
                     /* Use the normal file-backed CUDA cache, not per-tensor
                      * copies from pageable mmap during the first forward. */
-                    (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+                    ds4_gpu_publish_model_files(&e->model);
                     ready = accelerator_cache_model_tensors(e->backend,
                                                              &e->model,
                                                              NULL, NULL, 0);
@@ -74956,7 +78207,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
     }
     if (opt->mtp_path && opt->mtp_path[0] &&
-        opt->distributed.role == DS4_DISTRIBUTED_NONE) {
+        opt->distributed.role == DS4_DISTRIBUTED_NONE && !e->qwen4_mtp_external) {
         if (e->ssd_streaming) {
             fprintf(stderr, "ds4: --ssd-streaming is not compatible with --mtp-model yet\n");
             ds4_engine_close(e);
@@ -75287,6 +78538,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
         uint64_t *load_offsets = NULL;
         uint64_t *load_sizes = NULL;
         uint32_t load_span_count = 0;
+        /* qwen4 streaming pin list (dense + hot experts); hoisted so the
+         * pin pass below can run after the mapping is established. */
+        uint64_t *doff = NULL;
+        uint64_t *dsize = NULL;
+        uint32_t ndense = 0;
         if (e->ssd_streaming) {
             const bool map_output = load_slice &&
                                     (load_output ||
@@ -75458,6 +78714,97 @@ static int ds4_engine_open_internal(ds4_engine **out,
         } else {
             e->startup_model_span_bytes = e->model.size > e->model.tensor_data_pos ?
                 e->model.size - e->model.tensor_data_pos : 0;
+            /* Expert streaming for big qwen4 MoE on small VRAM (opt-in):
+             * preload only the dense projections (2-D tensors) and leave
+             * the routed experts (3-D) to on-demand range mapping. Without
+             * this the preload tries to cache every expert and OOMs past
+             * ~15 one-gig spans on a 16 GiB card. */
+            const char *stream_experts = getenv("DS4_QWEN4_CUDA_STREAM_EXPERTS");
+            if (e->backend == DS4_BACKEND_CUDA && ds4_model_is_qwen4() &&
+                !load_slice && !tp_shard && !e->ssd_streaming &&
+                stream_experts && stream_experts[0] && strcmp(stream_experts, "0") != 0) {
+                uint64_t cap_spans = e->model.n_tensors + 3u * (uint64_t)DS4_N_LAYER * DS4_N_EXPERT;
+                doff = xmalloc((size_t)cap_spans * sizeof(doff[0]));
+                dsize = xmalloc((size_t)cap_spans * sizeof(dsize[0]));
+                ndense = 0;
+                uint64_t dense_bytes = 0;
+                for (uint64_t i = 0; i < e->model.n_tensors; i++) {
+                    const ds4_tensor *t = &e->model.tensors[i];
+                    if (t->bytes == 0 || t == e->model.ngram_tensor) continue;
+                    if (t->ndim == 3) continue; /* routed expert: stream it */
+                    if (t->abs_offset > e->model.size ||
+                        t->bytes > e->model.size - t->abs_offset) {
+                        free(doff);
+                        free(dsize);
+                        ds4_die("dense tensor points outside mapped weights");
+                    }
+                    doff[ndense] = t->abs_offset;
+                    dsize[ndense] = t->bytes;
+                    dense_bytes += t->bytes;
+                    ndense++;
+                }
+                /* Hot-expert VRAM preload by imatrix rank: the router is
+                 * skewed, so top experts by calibration mass serve a large
+                 * share of selections. Rank file holds "layer expert"
+                 * lines, most-used first (see gguf-tools/imatrix). */
+                const char *rank_path = getenv("DS4_QWEN4_CUDA_HOT_EXPERTS");
+                const char *rank_gb = getenv("DS4_QWEN4_CUDA_HOT_EXPERT_GB");
+                uint64_t hot_budget = 5ull * 1073741824ull;
+                if (rank_gb && rank_gb[0]) {
+                    char *end = NULL;
+                    unsigned long long gb = strtoull(rank_gb, &end, 10);
+                    if (end != rank_gb && gb > 0 && gb <= 64) hot_budget = gb * 1073741824ull;
+                }
+                uint64_t hot_bytes = 0;
+                uint32_t hot_experts = 0;
+                if (rank_path && rank_path[0]) {
+                    FILE *rf = fopen(rank_path, "r");
+                    if (!rf) {
+                        fprintf(stderr, "ds4: hot-expert rank %s unreadable: %s\n",
+                                rank_path, strerror(errno));
+                    } else {
+                        unsigned layer, expert;
+                        while (fscanf(rf, "%u %u", &layer, &expert) == 2) {
+                            if (layer >= (unsigned)DS4_N_LAYER || expert >= DS4_N_EXPERT)
+                                continue;
+                            const ds4_layer_weights *l = &e->weights.layer[layer];
+                            const ds4_tensor *ex[3] = { l->ffn_gate_exps, l->ffn_up_exps,
+                                                        l->ffn_down_exps };
+                            const uint64_t rows[3] = { DS4_N_FF_EXP, DS4_N_FF_EXP, DS4_N_EMBD };
+                            uint64_t off[3];
+                            uint64_t len[3];
+                            bool ok = true;
+                            for (int k = 0; k < 3; k++) {
+                                if (!ex[k] || ex[k]->ndim != 3 || ex[k]->dim[2] <= expert) { ok = false; break; }
+                                uint64_t rb = routed_expert_row_bytes(ex[k]);
+                                if (rb == 0) { ok = false; break; }
+                                off[k] = ex[k]->abs_offset + (uint64_t)expert * rows[k] * rb;
+                                len[k] = rows[k] * rb;
+                                if (off[k] > e->model.size || len[k] > e->model.size - off[k]) { ok = false; break; }
+                            }
+                            if (!ok) continue;
+                            uint64_t need = len[0] + len[1] + len[2];
+                            if (hot_bytes + need > hot_budget) break;
+                            for (int k = 0; k < 3; k++) {
+                                doff[ndense] = off[k];
+                                dsize[ndense] = len[k];
+                                ndense++;
+                            }
+                            hot_bytes += need;
+                            hot_experts++;
+                        }
+                        fclose(rf);
+                    }
+                }
+                load_offsets = doff;
+                load_sizes = dsize;
+                load_span_count = ndense;
+                e->startup_model_span_bytes = dense_bytes + hot_bytes;
+                fprintf(stderr,
+                        "ds4: CUDA qwen4 expert streaming: preloading dense %.2f GiB + %u hot experts, %.2f GiB; rest on demand\n",
+                        (double)dense_bytes / 1073741824.0,
+                        hot_experts, (double)hot_bytes / 1073741824.0);
+            }
             model_map_ok = ds4_gpu_set_model_map_range(e->model.map,
                                                        e->model.size,
                                                        e->model.tensor_data_pos,
@@ -75519,7 +78866,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
-        (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+        ds4_gpu_publish_model_files(&e->model);
         if (!accelerator_cache_model_tensors(e->backend, &e->model,
                                              load_offsets, load_sizes,
                                              load_span_count)) {
@@ -75533,10 +78880,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         free(load_offsets);
         free(load_sizes);
+        /* NOTE: doff/dsize alias load_offsets/load_sizes (set above);
+         * freed once here. Hot-expert pinning was tried (fill dense+hot
+         * first) but measured slower than adaptive fill on single- and
+         * multi-topic runs (static top-2723 covers only ~31% mass and
+         * crowds out the working set), so no pin pass. */
         /* Also apply explicit optional Q8 preload settings to the runtime
          * support model when loaded. */
         if (support_model_runtime_ready) {
-            (void)ds4_gpu_set_model_fd_for_map(e->mtp_model.fd, e->mtp_model.map);
+            ds4_gpu_publish_model_files(&e->mtp_model);
             /* A Qwen3.8 MTP sidecar shares a file with a full unused trunk, so
              * only the bound draft tensors may be preloaded. */
             uint64_t *mtp_offsets = NULL;
@@ -75563,7 +78915,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 *out = NULL;
                 return 1;
             }
-            (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+            ds4_gpu_publish_model_files(&e->model);
         }
         if (e->vision_ready) {
 #if defined(__APPLE__)
@@ -76747,9 +80099,6 @@ void ds4_engine_close(ds4_engine *e) {
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
-    if (e->mtp_model.map) model_close(&e->mtp_model);
-    if (e->vision_model.map) model_close(&e->vision_model);
-    model_close(&e->model);
 #ifndef DS4_NO_GPU
 #ifdef DS4_HAS_QWEN4_GPU
     qwen4_state_pool_free(e);
@@ -76765,6 +80114,12 @@ void ds4_engine_close(ds4_engine *e) {
     }
     ds4_gpu_cleanup();
 #endif
+    /* Unmap the weights only after the accelerator is torn down: its UVA
+     * page tables can still reference the host mapping (direct reads),
+     * and unmapping first faults driver teardown (teardown SIGSEGV). */
+    if (e->mtp_model.map) model_close(&e->mtp_model);
+    if (e->vision_model.map) model_close(&e->vision_model);
+    model_close(&e->model);
     ds4_ssd_memory_lock_release(&e->simulated_memory);
     ds4_release_instance_lock();
     free(e->directional_steering_dirs);
@@ -79467,6 +82822,123 @@ static void qwen38_mtp_refresh_proposal(ds4_session *s, uint32_t pos,
                                         uint32_t hidden_row);
 #endif
 
+/* TEMP-DEBUG (request-2 corruption): flat-logit trap. Scans the host logits
+ * after every prefill chunk and decode step; read-only, negligible cost.
+ * A collapse (zero finite logits, or all-equal) prints position, previous
+ * tokens and top ids so the trigger is reproducible. Remove after diagnosis. */
+/* P0 forensics: when the logits come out non-finite, walk the graph's
+ * activations and recurrent state and report which of them are already
+ * corrupt.  Once per process (the failure repeats for every later token). */
+static bool g_qwen4_tmp_flat_fired;
+#ifdef DS4_HAS_QWEN4_GPU
+static void qwen4_tmp_scan_tensor(const char *name, const ds4_gpu_tensor *t, uint64_t max_floats) {
+    if (!t || t->bytes == 0) return;
+    uint64_t n = t->bytes / sizeof(float);
+    if (n > max_floats) n = max_floats;
+    if (n == 0) return;
+    float *buf = xmalloc((size_t)n * sizeof(float));
+    if (ds4_gpu_tensor_read((ds4_gpu_tensor *)t, 0, buf, n * sizeof(float)) != 0) {
+        uint64_t bad = 0, idx = 0;
+        float first = 0.0f;
+        for (uint64_t i = 0; i < n; i++) {
+            if (!isfinite(buf[i])) {
+                if (!bad) { first = buf[i]; idx = i; }
+                bad++;
+            }
+        }
+        if (bad) {
+            fprintf(stderr, "ds4: [tmp-state] %-14s %llu/%llu non-finite (first idx %llu value %g)\n",
+                    name, (unsigned long long)bad, (unsigned long long)n,
+                    (unsigned long long)idx, (double)first);
+        }
+    }
+    free(buf);
+}
+
+static void qwen4_tmp_state_scan_once(ds4_qwen4_gpu_graph *g, const char *where, bool once) {
+    static bool scanned;
+    if (!g || (once && scanned)) return;
+    if (once) scanned = true;
+    fprintf(stderr, "ds4: [tmp-state] scan at %s: pos=%u\n", where, g->pos);
+    qwen4_tmp_scan_tensor("mixed", g->mixed, 1u << 21);
+    qwen4_tmp_scan_tensor("R", g->R, 1u << 21);
+    qwen4_tmp_scan_tensor("blk", g->blk, 1u << 21);
+    qwen4_tmp_scan_tensor("part", g->part, 1u << 21);
+    qwen4_tmp_scan_tensor("mid", g->mid, 1u << 21);
+    qwen4_tmp_scan_tensor("router", g->router, 1u << 18);
+    qwen4_tmp_scan_tensor("ple_hist", g->ple_hist, 1u << 21);
+    qwen4_tmp_scan_tensor("ple_emb", g->ple_emb, 1u << 21);
+    qwen4_tmp_scan_tensor("pos3", g->pos3, 1u << 16);
+    /* Sparse-attention scratch: not zeroed by the reset, so a stale entry can
+     * still be live when a fresh chunk reads it. */
+    qwen4_tmp_scan_tensor("score", g->score, 1u << 22);
+    qwen4_tmp_scan_tensor("tile_max", g->tile_max, 1u << 22);
+    qwen4_tmp_scan_tensor("attn_part", g->attn_part, 1u << 22);
+    qwen4_tmp_scan_tensor("sel_blocks", g->sel_blocks, 1u << 20);
+    qwen4_tmp_scan_tensor("sel_tokens", g->sel_tokens, 1u << 20);
+    qwen4_tmp_scan_tensor("moe_lists", g->moe_lists, 1u << 20);
+    if (g->n_sel && g->n_sel->bytes >= 4) {
+        int32_t nsel[8] = {0};
+        const uint64_t n = g->n_sel->bytes / 4u < 8u ? g->n_sel->bytes / 4u : 8u;
+        if (ds4_gpu_tensor_read((ds4_gpu_tensor *)g->n_sel, 0, nsel, n * 4u) != 0)
+            fprintf(stderr, "ds4: [tmp-state] n_sel first %llu: %d %d %d %d %d %d %d %d\n",
+                    (unsigned long long)n, nsel[0], nsel[1], nsel[2], nsel[3],
+                    nsel[4], nsel[5], nsel[6], nsel[7]);
+    }
+    qwen4_tmp_scan_tensor("q", g->q, 1u << 20);
+    qwen4_tmp_scan_tensor("iqn", g->iqn, 1u << 20);
+    qwen4_tmp_scan_tensor("attn_o", g->attn_o, 1u << 20);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il += 1u) {
+        if (il > 1u && il + 1u < DS4_N_LAYER) continue;   /* first two and last */
+        qwen4_tmp_scan_tensor("block_key", g->layer_block_key[il], 1u << 16);
+        qwen4_tmp_scan_tensor("lin_state", g->layer_lin_state[il], 1u << 16);
+        qwen4_tmp_scan_tensor("lin_hist", g->layer_lin_hist[il], 1u << 16);
+        qwen4_tmp_scan_tensor("k_cache", g->layer_k_cache[il], 1u << 14);
+        qwen4_tmp_scan_tensor("ik_cache", g->layer_ik_cache[il], 1u << 14);
+    }
+}
+
+static void qwen4_tmp_state_scan(ds4_qwen4_gpu_graph *g, const char *where) {
+    qwen4_tmp_state_scan_once(g, where, true);
+}
+#else
+static void qwen4_tmp_state_scan_once(void *g, const char *where, bool once) {
+    (void)g; (void)where; (void)once;
+}
+static void qwen4_tmp_state_scan(void *g, const char *where) {
+    (void)g; (void)where;
+}
+#endif
+
+static void qwen4_tmp_flat_trap(const float *logits, uint32_t V, const char *where,
+                                uint32_t pos, const int *prev, uint32_t n_prev) {
+    if (!logits || !V) return;
+    uint32_t finite = 0;
+    float mx = -INFINITY, mn = INFINITY;
+    int top[4] = { -1, -1, -1, -1 };
+    for (uint32_t i = 0; i < V; i++) {
+        const float v = logits[i];
+        if (isfinite(v)) {
+            finite++;
+            if (v > mx) mx = v;
+            if (v < mn) mn = v;
+            for (int j = 0; j < 4; j++) {
+                if (top[j] < 0 || v > logits[top[j]]) {
+                    for (int k = 3; k > j; k--) top[k] = top[k - 1];
+                    top[j] = (int)i;
+                    break;
+                }
+            }
+        }
+    }
+    if (finite != 0 && mx != mn) return;
+    g_qwen4_tmp_flat_fired = true;
+    fprintf(stderr, "ds4: [tmp-flat] %s pos=%u finite=%u/%u minmax=[%g,%g] top=%d,%d,%d,%d prev=",
+            where, pos, finite, V, (double)mn, (double)mx, top[0], top[1], top[2], top[3]);
+    for (uint32_t i = 0; i < n_prev; i++) fprintf(stderr, "%s%d", i ? "," : "", prev[i]);
+    fprintf(stderr, "\n");
+}
+
 static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
     if (!s || !prompt) {
         snprintf(err, errlen, "missing session or prompt");
@@ -79502,14 +82974,21 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         int start = 0;
         s->glm_mtp_have = 0;
         s->glm_mtp_have2 = false;
+        /* TEMP-DEBUG (request-2 corruption): remove after diagnosis. */
+        fprintf(stderr, "ds4: [tmp-trace] sync session=%p pos=%u ckpt_len=%d valid=%d prompt_len=%d\n",
+                (const void *)s, s->qwen4_graph.pos, s->checkpoint.len,
+                s->checkpoint_valid ? 1 : 0, prompt ? prompt->len : -1);
         if (s->checkpoint_valid &&
             s->qwen4_graph.pos == (uint32_t)s->checkpoint.len &&
             (!s->qwen4_rewound || prompt->len > s->checkpoint.len) &&
             prompt->len >= s->checkpoint.len &&
             ds4_tokens_starts_with(prompt, &s->checkpoint)) {
             start = s->checkpoint.len;
+            fprintf(stderr, "ds4: [tmp-trace] sync REUSE start=%d\n", start);
         } else {
+            fprintf(stderr, "ds4: [tmp-trace] sync RESET\n");
             qwen4_graph_reset(&s->qwen4_graph);
+            if (getenv("DS4_QWEN4_STATE_SCAN")) qwen4_tmp_state_scan_once(&s->qwen4_graph, "post-reset", false);
             s->checkpoint.len = 0;
             s->checkpoint_valid = false;
         }
@@ -79518,6 +82997,12 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 snprintf(err, errlen, "token id %d at position %d is outside the vocabulary", prompt->v[i], i);
                 return 1;
             }
+        }
+        /* TEMP-DEBUG: prompt ids per request. */
+        {
+            fprintf(stderr, "ds4: [tmp-trace] prompt ids:");
+            for (int i = 0; i < prompt->len; i++) fprintf(stderr, " %d", prompt->v[i]);
+            fprintf(stderr, "\n");
         }
         s->qwen4_graph.vis_spans = s->sync_images;
         s->qwen4_graph.vis_span_count = s->sync_image_count;
@@ -79550,6 +83035,11 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             s->checkpoint_valid = true;
             s->qwen4_rewound = false;
             s->mtp_draft_valid = false;
+            /* TEMP-DEBUG trap: s->logits holds the chunk's last row. */
+            qwen4_tmp_flat_trap(s->logits, DS4_N_VOCAB, "prefill",
+                                (uint32_t)(i - 1), prompt->v + (i >= 4 ? i - 4 : 0),
+                                (uint32_t)(i >= 4 ? 4 : i));
+            if (g_qwen4_tmp_flat_fired) qwen4_tmp_state_scan(&s->qwen4_graph, "prefill-trap");
             if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
         }
         s->qwen4_graph.vis_spans = NULL;
@@ -82195,6 +85685,15 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             s->checkpoint_valid = false;
             return 1;
         }
+        /* TEMP-DEBUG trap: one host-logit row per decode step. */
+        {
+            const int cl = s->checkpoint.len;
+            qwen4_tmp_flat_trap(s->logits, DS4_N_VOCAB, "decode",
+                                (uint32_t)(cl >= 0 ? cl : 0),
+                                cl >= 4 ? s->checkpoint.v + cl - 4 : s->checkpoint.v,
+                                (uint32_t)(cl >= 4 ? 4 : (cl >= 0 ? cl : 0)));
+            if (g_qwen4_tmp_flat_fired) qwen4_tmp_state_scan(&s->qwen4_graph, "decode-trap");
+        }
         token_vec_push(&s->checkpoint, token);
         s->checkpoint_valid = true;
         s->qwen4_rewound = false;
@@ -83528,7 +87027,7 @@ static bool qwen4_graph_encode_native_session_batch(ds4_decode_item *items, int 
         if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down,
                                         l->hc_ffn_up, l->hc_ffn_inject, T);
         QWEN4_BATCH_PROF(5);
-        if (ok) ok = qwen4_graph_moe(g, m, l, T);
+if (ok) ok = qwen4_graph_moe(g, m, l, T);
         QWEN4_BATCH_PROF(6);
     }
     /* The output matrix is the single largest weight read of a decode step,
@@ -83735,7 +87234,7 @@ static bool qwen4_graph_encode_native_session_batch_ragged(const qwen4_batch_mem
         }
         if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, DS4_N_EMBD, DS4_N_HC) != 0;
         if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
-        if (ok) ok = qwen4_graph_moe(g, m, l, T);
+if (ok) ok = qwen4_graph_moe(g, m, l, T);
     }
     if (ok) ok = qwen4_graph_hc_mix(g, m, w->output_hc_norm, w->output_hc_down, w->output_hc_up, NULL, T) &&
                  qwen4_gemv(g->batch_logits, m, w->output, g->mixed, T);
@@ -83817,7 +87316,7 @@ static bool qwen4_batch_mtp_drafts(qwen4_batch_member *mem, int count, const uin
                  qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, N);
     if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, N, E, hc) != 0;
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, N);
-    if (ok) ok = qwen4_graph_moe(g, m, l, N);
+if (ok) ok = qwen4_graph_moe(g, m, l, N);
     /* every session's last committed row, gathered for one pass of the head
      * mixer into the batch's head rows */
     for (int i = 0; ok && i < count; i++) {
