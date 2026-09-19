@@ -151,6 +151,91 @@ static int check_q8k(uint32_t type, const char *name, uint32_t k) {
 
 #include <time.h>
 #include <pthread.h>
+
+static double now_s(void);
+
+/* Same pattern as time_model_like, but with N concurrent workers: the model
+ * runs 16 threads and gets 8.9 GMAC/s per thread while one thread of this exact
+ * pattern does 31.  The scaling curve tells whether the wall is the shared L2
+ * (two SMT siblings, each streaming an expert's ~1 MB of weights into a 1 MB
+ * private L2) or aggregate L3/DRAM bandwidth. */
+typedef struct {
+    uint32_t k, ntok, rows, nb, bs;
+    size_t stride;
+    uint8_t *w;
+    uint8_t *scratch;
+    uint32_t *list;
+    int reps;
+    double sink;
+} ml_mt_ctx;
+
+static void *ml_mt_worker(void *arg) {
+    ml_mt_ctx *c = (ml_mt_ctx *)arg;
+    const void *ptrs[8];
+    float out[8];
+    double sink = 0;
+    for (int rep = 0; rep < c->reps; rep++) {
+        for (uint32_t row = 0; row < c->rows; row++) {
+            const void *wr = (const void *)(c->w + (size_t)row * c->nb * c->bs);
+            for (uint32_t base = 0; base < c->ntok; base += 8) {
+                const uint32_t m = (c->ntok - base) < 8u ? (c->ntok - base) : 8u;
+                for (uint32_t b = 0; b < m; b++)
+                    ptrs[b] = (const void *)(c->scratch + (size_t)c->list[base + b] * c->stride);
+                ds4_test_qwen4_cpu_dot_q8k_batch(IQ2_S, wr, ptrs, out, m, c->k);
+                sink += out[0];
+            }
+        }
+    }
+    c->sink = sink;
+    return NULL;
+}
+
+static void time_model_like_mt(uint32_t k, uint32_t ntok, uint32_t rows, uint32_t nthreads) {
+    uint32_t per = 0;
+    const uint32_t bs = ds4_test_qwen4_block_bytes(IQ2_S, &per);
+    const uint32_t q8bs = ds4_test_qwen4_q8k_block_bytes();
+    if (!bs || !q8bs || k % per || k % 256 || nthreads < 1 || nthreads > 32) return;
+    const uint32_t nb = k / per, nq = k / 256, scratch_tokens = 256u;
+    const size_t stride = (size_t)nq * q8bs;
+    ml_mt_ctx *c = calloc(nthreads, sizeof(*c));
+    pthread_t *th = calloc(nthreads, sizeof(*th));
+    float *x = malloc((size_t)k * sizeof(float));
+    int ok = c && th && x;
+    for (uint32_t t = 0; ok && t < nthreads; t++) {
+        c[t].k = k; c[t].ntok = ntok; c[t].rows = rows; c[t].nb = nb; c[t].bs = bs;
+        c[t].stride = stride; c[t].reps = 120;
+        c[t].w = malloc((size_t)nb * bs * rows);
+        c[t].scratch = malloc((size_t)scratch_tokens * stride);
+        c[t].list = malloc((size_t)ntok * sizeof(*c[t].list));
+        ok = c[t].w && c[t].scratch && c[t].list;
+    }
+    for (uint32_t t = 0; ok && t < nthreads; t++) {
+        for (uint32_t r = 0; r < rows; r++) fill_row(IQ2_S, c[t].w + (size_t)r * nb * bs, k);
+        for (uint32_t v = 0; v < scratch_tokens; v++) {
+            for (uint32_t i = 0; i < k; i++) x[i] = frnd();
+            ds4_test_qwen4_quantize_row_q8k(x, c[t].scratch + (size_t)v * stride, k);
+        }
+        for (uint32_t i = 0; i < ntok; i++)
+            c[t].list[i] = (uint32_t)((uint64_t)i * scratch_tokens / ntok);
+    }
+    if (!ok) {
+        if (c) for (uint32_t t = 0; t < nthreads; t++) { free(c[t].w); free(c[t].scratch); free(c[t].list); }
+        free(c); free(th); free(x);
+        return;
+    }
+    const double t0 = now_s();
+    for (uint32_t t = 1; t < nthreads; t++) pthread_create(&th[t], NULL, ml_mt_worker, &c[t]);
+    ml_mt_worker(&c[0]);
+    for (uint32_t t = 1; t < nthreads; t++) pthread_join(th[t], NULL);
+    const double dt = now_s() - t0;
+    double sink = 0;
+    for (uint32_t t = 0; t < nthreads; t++) sink += c[t].sink;
+    printf("  IQ2_S model-like MT: %2u thread, %u token sparso, riga nuova: %6.1f GMAC/s aggregati (%5.1f per thread, sink %g)\n",
+           nthreads, ntok, (double)k * ntok * rows * c[0].reps * nthreads / dt / 1e9,
+           (double)k * ntok * rows * c[0].reps / dt / 1e9, sink);
+    for (uint32_t t = 0; t < nthreads; t++) { free(c[t].w); free(c[t].scratch); free(c[t].list); }
+    free(c); free(th); free(x);
+}
 static double now_s(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -545,6 +630,7 @@ int main(void) {
         time_model_like(2560, 34, 640, 1, 1, 0);
         time_model_like(2560, 34, 640, 0, 0, 1);
         time_model_like(2560, 34, 640, 1, 1, 1);
+        for (uint32_t nt = 1; nt <= 16u; nt <<= 1) time_model_like_mt(2560, 34, 640, nt);
     }
     rc |= check_type(IQ4_NL, "IQ4_NL", 640);   /* down experts (ff -> embd) */
     rc |= check_type(IQ4_NL, "IQ4_NL", 2560);
