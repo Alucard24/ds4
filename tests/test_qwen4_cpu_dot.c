@@ -340,6 +340,71 @@ static int check_batch2(void) {
     return rc;
 }
 
+/* The model runs the mid at ~9 GMAC/s per thread while this microbenchmark
+ * does 12 even when streaming 12 MB from DRAM.  Something structural in the
+ * model path must cost more than memory.  Emulate it here: an expert's token
+ * list is a small set of *scattered* pointers inside a T-sized q8 scratch
+ * (like tok_idx), and every call uses a fresh weight row (like walking all
+ * k_ff rows per chunk).  Knobs isolate which of the two matters. */
+static void time_model_like(uint32_t k, uint32_t ntok, uint32_t rows, int scatter, int fresh_row, int midstore) {
+    uint32_t per = 0;
+    const uint32_t bs = ds4_test_qwen4_block_bytes(IQ2_S, &per);
+    const uint32_t q8bs = ds4_test_qwen4_q8k_block_bytes();
+    if (!bs || !q8bs || k % per || k % 256 || ntok < 8 || ntok > 64 || rows < 1) return;
+    const uint32_t nb = k / per, nq = k / 256, scratch_tokens = 1739u;
+    const size_t stride = (size_t)nq * q8bs;
+    const size_t wbytes = (size_t)nb * bs * (fresh_row ? rows : 1u);
+    /* Model-shaped mid buffer: T tokens x 10 slots x k_ff floats (35.6 MB). */
+    float *mid = midstore ? calloc((size_t)scratch_tokens * 10u * rows, sizeof(float)) : NULL;
+    uint8_t *w = malloc(wbytes);
+    uint8_t *scratch = malloc((size_t)scratch_tokens * stride);
+    float *x = malloc((size_t)k * sizeof(float));
+    uint32_t *list = malloc((size_t)ntok * sizeof(*list));
+    if (!w || !scratch || !x || !list || (midstore && !mid)) {
+        free(w); free(scratch); free(x); free(list); free(mid);
+        return;
+    }
+    fill_row(IQ2_S, w, k);
+    for (uint32_t r = 1; r < (fresh_row ? rows : 1u); r++) fill_row(IQ2_S, w + (size_t)r * nb * bs, k);
+    for (uint32_t v = 0; v < scratch_tokens; v++) {
+        for (uint32_t i = 0; i < k; i++) x[i] = frnd();
+        ds4_test_qwen4_quantize_row_q8k(x, scratch + (size_t)v * stride, k);
+    }
+    /* The model's list is a random subset of the tokens; keep the same set
+     * across reps so only the access pattern varies. */
+    for (uint32_t i = 0; i < ntok; i++)
+        list[i] = scatter ? (uint32_t)((uint64_t)i * scratch_tokens / ntok) : i;
+    const float *ptrs[8];
+    float out[8];
+    const int reps = 60;
+    float sink = 0;
+    const double t0 = now_s();
+    for (int rep = 0; rep < reps; rep++) {
+        for (uint32_t row = 0; row < rows; row++) {
+            const void *wr = (const void *)(w + (size_t)(fresh_row ? row : 0u) * nb * bs);
+            for (uint32_t base = 0; base < ntok; base += 8) {
+                const uint32_t m = (ntok - base) < 8u ? (ntok - base) : 8u;
+                for (uint32_t b = 0; b < m; b++)
+                    ptrs[b] = (const float *)(scratch + (size_t)list[base + b] * stride);
+                ds4_test_qwen4_cpu_dot_q8k_batch(IQ2_S, wr, (const void **)ptrs, out, m, k);
+                sink += out[0];
+                if (mid) {
+                    /* The model writes each row into its token's mid row: 4 bytes
+                     * per token, one line each, into a 35.6 MB buffer. */
+                    for (uint32_t b = 0; b < m; b++)
+                        mid[((size_t)list[base + b] * 10u + ((base + b) % 10u)) * rows + row] = out[b];
+                }
+            }
+        }
+    }
+    const double dt = now_s() - t0;
+    printf("  IQ2_S model-like ntok=%u rows=%u %-10s %-10s %-10s: %.2f GMAC/s (sink %g)\n",
+           ntok, rows, scatter ? "scattered" : "dense", fresh_row ? "fresh-row" : "same-row",
+           midstore ? "+mid35MB" : "no-mid",
+           (double)k * ntok * rows * reps / dt / 1e9, sink);
+    free(w); free(scratch); free(x); free(list); free(mid);
+}
+
 static void time_type_q8k(uint32_t type, const char *name, uint32_t k) {
     uint32_t per_block = 0;
     const uint32_t bs = ds4_test_qwen4_block_bytes(type, &per_block);
@@ -475,6 +540,11 @@ int main(void) {
         time_batch2_q8k(2560, 8, 8);
         time_batch2_q8k(2560, 4, 4096);
         time_batch2_q8k(2560, 8, 4096);
+        /* Which structural factor makes the model 5x slower than this bench? */
+        time_model_like(2560, 34, 640, 0, 0, 0);
+        time_model_like(2560, 34, 640, 1, 1, 0);
+        time_model_like(2560, 34, 640, 0, 0, 1);
+        time_model_like(2560, 34, 640, 1, 1, 1);
     }
     rc |= check_type(IQ4_NL, "IQ4_NL", 640);   /* down experts (ff -> embd) */
     rc |= check_type(IQ4_NL, "IQ4_NL", 2560);
