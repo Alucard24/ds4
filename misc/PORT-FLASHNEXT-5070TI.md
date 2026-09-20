@@ -11,12 +11,15 @@ IQ2_XXS copre **9 dei 48 layer MoE del modello ISTA** (quello in uso): quei laye
 producevano contributi MoE sbagliati in ogni prefill e in ogni token.  Non era
 coperto da nessun test (il batch era verificato solo per IQ2_S) e `391` passava
 comunque perche' il MoE somma 10 esperti su 512 e l'errore si diluisce.
-Corretto; ora **bit-identico** al kernel a token singolo.
+Corretto; il fallback AVX2 e' **bit-identico** al kernel a token singolo. I nuovi
+percorsi VNNI mantengono la stessa aritmetica intera e differiscono solo per
+l'ordine della riduzione fp32 (entro `1e-4`, verificato sotto).
 
 **2. Copertura dei kernel di produzione CHIUSA.**  Aggiunti
 `check_batch_any()` (5 tipi q8k) e `check_fp32_batch()` (down IQ4_NL/Q2_0, k=640 e
-2560): **tutti e 7 i kernel batch ora danno `0.00e+00`** contro il percorso a token
+2560): **tutti e 7 i kernel batch sono verificati** contro il percorso a token
 singolo, che e' validato contro un riferimento indipendente in doppia precisione.
+I fallback AVX2/fp32 sono `0.00e+00`; IQ3_S/IQ2_XXS VNNI sono entro `1e-4`.
 Da eseguire **sempre** dopo ogni modifica:
 
 ```sh
@@ -43,14 +46,23 @@ AVX2 -> VNNI -> VNNI -> AVX2) conferma il risultato: i due AVX2 sono 507,2 e
 50,55 e 54,67 t/s.  Media indicativa: **mid -8,2%, prefill +6,1%**.  `391` e'
 corretto su ISTA e UD.
 
-**4. Mappa aggiornata del modello ISTA** (il confronto IQ3_S qui sotto e' il solo
-A/B diretto; gli altri rate storici non vanno confrontati fra run):
+**4. IQ2_XXS riscritto e tenuto: AVX-512 VNNI batch.**  IQ2_XXS e' il tipo di
+**9/48 layer** ISTA.  Anche qui un zmm sostituisce le due catene ymm: le otto
+righe di griglia e gli otto pattern di segno sono assemblati una volta, poi
+`vpmaddubs + vpdpwssd` usa un accumulatore int32 per token.  A/B nello stesso
+processo: **25,47 -> 47,91 GMAC/s L1-hot (+88%)**, **20,95 -> 30,24 streamed
+(+44%)**.  Nel modello (IQ3_S VNNI gia' attivo), sequenza AVX2 -> VNNI -> VNNI
+-> AVX2: mid medio **496,3 -> 452,1 ms/layer (-8,9%)**, prefill medio
+**49,13 -> 53,09 t/s (+8,1%)**.  Fallback: `DS4_QWEN4_IQ2XXS_VNNI=0`.
+
+**5. Mappa aggiornata del modello ISTA** (i confronti VNNI qui sotto sono A/B
+diretti; gli altri rate storici non vanno confrontati fra run):
 
 | tipo | kernel | layer | L1-hot | streamed |
 |---|---|---:|---:|---:|
 | IQ2_S | VNNI | 10 | 26,8-30,6 | 6,9-13,0 (oscilla) |
 | **IQ3_S** | **VNNI gather + dpwssd** | **13** | **35,22** | **31,43** |
-| IQ2_XXS | maddubs | 9 | 23,0-23,7 | 8,9-9,4 |
+| IQ2_XXS | **VNNI + dpwssd** | 9 | **47,91** | **30,24** |
 | IQ2_XS | maddubs | 10 | 21,9-26,9 | 8,8-9,9 |
 | IQ3_XXS | maddubs | 6 | 21,4 | 10,0 |
 | IQ4_NL / Q2_0 | fp32 (down) | 18 / 30 | — | — |
@@ -59,10 +71,11 @@ Carico **identico** a UD (T=1739, ne=512, ns=10, k_in=2560, k_ff=640, pairs=1739
 56,98 GMAC/chunk): il divario di velocita' e' tutto nel **tipo**, non nel carico
 (UD usa IQ2_S con VNNI; ISTA ha formati con piu' lookup e catene piu' lunghe).
 
-**5. Prossimo bersaglio:** IQ2_XS (10 layer) e IQ2_XXS (9).  IQ3_S e' ora chiuso:
-il test verifica sia VNNI sia AVX2 contro il kernel singolo, e il bench A/B vive
-nel medesimo binario.  Qualunque nuovo tentativo deve prima battere il proprio
-A/B interno, poi `check_batch_any` e `391` su ISTA prima dell'integrazione.
+**6. Prossimo bersaglio:** IQ2_XS (10 layer), poi IQ3_XXS (6). IQ3_S e IQ2_XXS
+sono ora chiusi: il test verifica sia VNNI sia AVX2 contro il kernel singolo, e
+il bench A/B vive nel medesimo binario. Qualunque nuovo tentativo deve prima
+battere il proprio A/B interno, poi `check_batch_any` e `391` su ISTA prima
+dell'integrazione.
 
 
 
@@ -75,11 +88,11 @@ A/B interno, poi `check_batch_any` e `391` su ISTA prima dell'integrazione.
 | | prefill | note |
 |---|---|---|
 | UD-IQ3_XXS | **55-56,6 t/s** | da **5,5 t/s** a inizio campagna |
-| ISTA GSQ-RCO IQ3_XXS | **50-55 t/s** | IQ3_S VNNI: mid 446-486 ms/layer nella campagna A/B |
+| ISTA GSQ-RCO IQ3_XXS | **52-54 t/s** | IQ3_S + IQ2_XXS VNNI; campagna A/B finale 52,71-53,46 t/s |
 
 `391` corretto su **entrambi** i modelli, `ds4`/`ds4-server` compilati,
 `test_qwen4_cpu_dot` verde; il test verifica esplicitamente VNNI e fallback AVX2
-di IQ3_S.
+di IQ3_S e IQ2_XXS.
 
 **Comando canonico per misurare** (UD; per ISTA cambia solo `-m`):
 
@@ -108,7 +121,7 @@ DS4_CUDA_WEIGHT_CACHE_LIMIT_GB=6 DS4_QWEN4_MOE_PROFILE=1 ./ds4 -m <gguf> \
 | NTA sui kernel di ISTA | -3,7% (mid +5,3%) |
 | staging L1 + flush contiguo | +1,2% = rumore |
 | chunk da 16 token | +6% di tetto nel bench, rompe la residenza L1 |
-| VNNI storico su IQ2_XXS, B=16, accumulatore vettoriale | tutti negativi; non e' il nuovo IQ3_S VNNI x8 |
+| VNNI storico B=16 / accumulatore vettoriale | negativo; non e' il nuovo VNNI x8 di IQ3_S/IQ2_XXS |
 
 **Dove siamo, quantificato**: mid e down stanno all'**86-92%** e **76%** dei tetti
 riprodotti nella loro stessa configurazione (bench `time_model_like_mt`,
@@ -1629,8 +1642,9 @@ per IQ2_S.
 contributo sbagliato su 9 layer viene diluito; `391` continuava a passare.
 
 **Correzione e verifica**:
-- offset aggiunto; tutti e cinque i kernel batch ora danno `0.00e+00` contro il
-  kernel a token singolo (bit-identici);
+- offset aggiunto; i cinque fallback AVX2 danno `0.00e+00` contro il kernel a
+  token singolo (bit-identici). I default VNNI successivi di IQ3_S/IQ2_XXS sono
+  entro `1e-4`, con la sola diversa associazione della riduzione fp32;
 - `391` corretto su **ISTA** (con i 9 layer ora giusti) e su **UD** (controllo);
 - test `test_qwen4_cpu_dot`: **ok**.
 
@@ -1661,15 +1675,15 @@ IQ4_NL   fp32 batch x8 vs singolo: 0.00e+00 ok   (k=640 e k=2560)
 Q2_0     fp32 batch x8 vs singolo: 0.00e+00 ok   (k=640 e k=2560)
 ```
 
-**Stato della copertura dei kernel di produzione** (tutti a `0.00e+00` contro il
-percorso a token singolo, che e' validato contro un riferimento indipendente in
-doppia precisione):
+**Stato della copertura dei kernel di produzione** (tutti confrontati col percorso
+a token singolo, che e' validato contro un riferimento indipendente in doppia
+precisione; AVX2/fp32 esatti, VNNI entro `1e-4`):
 
 | kernel batch | tipo | layer ISTA | esito |
 |---|---|---|---|
-| `iq3_s_q8k_batch` | IQ3_S | 13 | ok |
+| `iq3_s_q8k_vnni_batch` | IQ3_S | 13 | ok (`<=1.60e-06`; AVX2 fallback esatto) |
 | `iq2_xs_q8k_batch` | IQ2_XS | 10 | ok |
-| `iq2_xxs_q8k_batch` | IQ2_XXS | 9 | ok (era **rotto**, corretto) |
+| `iq2_xxs_q8k_vnni_batch` | IQ2_XXS | 9 | ok (`<=3.67e-07`; AVX2 era **rotto**, corretto) |
 | `iq2_s_q8k_vnni_batch` | IQ2_S | 10 | ok |
 | `iq3_xxs_q8k_batch` | IQ3_XXS | 6 | ok |
 | `iq4_nl_batch` (fp32) | IQ4_NL | down di 18 layer | ok |
@@ -1680,7 +1694,7 @@ Da eseguire **sempre** dopo ogni modifica a questi kernel:
 make test-qwen4-cpu-dot && ./tests/test_qwen4_cpu_dot | grep -E "vs singolo|fp32 batch"
 ```
 
-### Mappa completa dei tipi del modello ISTA (dopo il fix)
+### Mappa pre-riscritture VNNI (storica; vedere l'indice per i valori correnti)
 
 Layer MoE per tipo e rate dei kernel batch (L1-hot = stabile, streamed = oscilla
 molto fra run: IQ2_S ha dato 13,00 e poi 6,94 nello stesso giorno, quindi **solo i
@@ -1769,3 +1783,40 @@ quindi il risultato da conservare e' il segno coerente, non la singola punta 54,
 - Corretto anche un bug preesistente del benchmark MT: la sua `printf` mancava il
   placeholder per `ntok`, passava un `uint32_t` a `%f` e produceva output/UB
   corrotti. Ora stampa esplicitamente `chunk` e `token sparsi`.
+
+## IQ2_XXS: riscrittura VNNI batch, vincente e integrata
+
+IQ2_XXS ha otto righe di griglia da 8 byte per passo di 64 valori e otto indici
+separati di segno a 7 bit. Il nuovo batch le unisce in un solo zmm (lane basse:
+primi 32 valori; lane alte: secondi 32), trasforma gli otto pattern `+/-1` in
+una mask byte e fa `vpmaddubs -> vpdpwssd` con le due scale. Come IQ3_S, questo
+porta da due accumulatori ymm a un accumulatore zmm per token.
+
+### A/B del kernel (stesso processo)
+
+```
+IQ2_XXS A/B maddubs x8 nbuf=8    L1-hot : 25.47 GMAC/s
+IQ2_XXS A/B vnni    x8 nbuf=8    L1-hot : 47.91 GMAC/s  (+88%)
+IQ2_XXS A/B maddubs x8 nbuf=4096 streamed: 20.95 GMAC/s
+IQ2_XXS A/B vnni    x8 nbuf=4096 streamed: 30.24 GMAC/s (+44%)
+```
+
+### A/B nel modello ISTA (IQ3_S VNNI gia' attivo, T=1739)
+
+| run | IQ2_XXS VNNI | mid ms/layer | down ms/layer | totale ms/layer | prefill |
+|---|---:|---:|---:|---:|---:|
+| a0 | 0 | 515,5 | 203,0 | 734,8 | 47,55 t/s |
+| b1 | 1 | 444,1 | 191,3 | 651,3 | 53,46 t/s |
+| c1 | 1 | 460,0 | 184,6 | 660,9 | 52,71 t/s |
+| d0 | 0 | 477,1 | 193,3 | 686,5 | 50,71 t/s |
+
+La macchina migliora parzialmente dopo il primo run, quindi non si confrontano
+solo gli estremi: VNNI batte l'AVX2 adiacente in entrambi i lati della sequenza
+(a0->b1 e c1->d0). Media indicativa: **mid -8,9%, prefill +8,1%**.
+
+### Correttezza
+
+- `check_q8k_batch_variants()` e' stato generalizzato: verifica sia `maddubs` sia
+  VNNI per IQ3_S e IQ2_XXS; IQ2_XXS VNNI `<=3,67e-07`, soglia `1e-4`.
+- Dispatch default verificato; `DS4_QWEN4_IQ2XXS_VNNI=0` ripristina AVX2 e passa.
+- `make test-qwen4-cpu-dot`, build `ds4`/`ds4-server`, e `391` su ISTA+UD: verdi.

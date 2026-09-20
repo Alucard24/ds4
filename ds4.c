@@ -6062,8 +6062,8 @@ static DS4_MAYBE_UNUSED float qwen4_cpu_dot_iq2_xxs_q8k_maddubs(const void *row,
  * are built once per 64-value step and reused for every token; per token
  * only the q8 loads, sign flip, maddubs and madd remain.  Per-token
  * accumulation keeps the single-kernel order, so results are bit-identical. */
-static void qwen4_cpu_dot_iq2_xxs_q8k_batch(const void *row, const block_q8_K *const *ys,
-                                            float *out, uint32_t n, uint32_t k) {
+static void qwen4_cpu_dot_iq2_xxs_q8k_maddubs_batch(const void *row, const block_q8_K *const *ys,
+                                                    float *out, uint32_t n, uint32_t k) {
     const block_iq2_xxs *x = (const block_iq2_xxs *)row;
     const uint32_t nb = k / QK_K;
     if (n == 0u) return;
@@ -6120,6 +6120,82 @@ static void qwen4_cpu_dot_iq2_xxs_q8k_batch(const void *row, const block_q8_K *c
         }
     }
     for (uint32_t b = 0; b < n; b++) out[b] = 0.125f * qwen4_cpu_hsum256_ps(accumf[b]);
+}
+
+#if defined(DS4_CPU_IQ2S_Q8K_VNNI)
+/* AVX-512 VNNI twin of IQ2_XXS batch.  The 64-value step already contains
+ * eight 8-byte grid rows and eight 7-bit sign indices, so both AVX2 vectors
+ * become one zmm.  vpmaddubs creates i16 pairs and vpdpwssd applies the two
+ * 32-value scales in one i32 accumulator per token. */
+static void qwen4_cpu_dot_iq2_xxs_q8k_vnni_batch(const void *row, const block_q8_K *const *ys,
+                                                 float *out, uint32_t n, uint32_t k) {
+    const block_iq2_xxs *x = (const block_iq2_xxs *)row;
+    const uint32_t nb = k / QK_K;
+    if (n == 0u) return;
+    if (n > 8u) n = 8u;
+    pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
+    const __m512i zero = _mm512_setzero_si512();
+    uint32_t aux32[4];
+    const uint8_t *aux8 = (const uint8_t *)aux32;
+    __m512 accumf[8];
+    for (uint32_t b = 0; b < n; b++) accumf[b] = _mm512_setzero_ps();
+    for (uint32_t i = 0; i < nb; i++) {
+        const float dr = f16_to_f32(x[i].d);
+        const uint16_t *q2p = x[i].qs;
+        __m512i acc[8];
+        for (uint32_t b = 0; b < n; b++) acc[b] = zero;
+        for (uint32_t ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            memcpy(aux32, q2p, sizeof(aux32));
+            q2p += 8;
+            const __m512i q2 = _mm512_set_epi64(
+                (long long)iq2xxs_grid[aux8[11]], (long long)iq2xxs_grid[aux8[10]],
+                (long long)iq2xxs_grid[aux8[9]],  (long long)iq2xxs_grid[aux8[8]],
+                (long long)iq2xxs_grid[aux8[3]],  (long long)iq2xxs_grid[aux8[2]],
+                (long long)iq2xxs_grid[aux8[1]],  (long long)iq2xxs_grid[aux8[0]]);
+            const __m512i signs = _mm512_set_epi64(
+                (long long)qwen4_cpu_sign64((aux32[3] >> 21) & 127), (long long)qwen4_cpu_sign64((aux32[3] >> 14) & 127),
+                (long long)qwen4_cpu_sign64((aux32[3] >> 7) & 127),  (long long)qwen4_cpu_sign64(aux32[3] & 127),
+                (long long)qwen4_cpu_sign64((aux32[1] >> 21) & 127), (long long)qwen4_cpu_sign64((aux32[1] >> 14) & 127),
+                (long long)qwen4_cpu_sign64((aux32[1] >> 7) & 127),  (long long)qwen4_cpu_sign64(aux32[1] & 127));
+            const __mmask64 neg = _mm512_movepi8_mask(signs);
+            const __m256i sc_lo = _mm256_set1_epi16((short)(1 + 2 * (aux32[1] >> 28)));
+            const __m256i sc_hi = _mm256_set1_epi16((short)(1 + 2 * (aux32[3] >> 28)));
+            const __m512i scv = _mm512_inserti64x4(_mm512_castsi256_si512(sc_lo), sc_hi, 1);
+            for (uint32_t b = 0; b < n; b++) {
+                const __m512i q8 = _mm512_loadu_si512((const void *)(ys[b][i].qs + 32 * (int32_t)ib32));
+                const __m512i q8s = _mm512_mask_sub_epi8(q8, neg, zero, q8);
+                acc[b] = _mm512_dpwssd_epi32(acc[b], _mm512_maddubs_epi16(q2, q8s), scv);
+            }
+        }
+        for (uint32_t b = 0; b < n; b++) {
+            accumf[b] = _mm512_fmadd_ps(_mm512_set1_ps(dr * ys[b][i].d),
+                                        _mm512_cvtepi32_ps(acc[b]), accumf[b]);
+        }
+    }
+    for (uint32_t b = 0; b < n; b++) out[b] = 0.125f * _mm512_reduce_add_ps(accumf[b]);
+}
+
+/* Default VNNI on capable CPUs.  Keep AVX2 as a same-binary diagnostic
+ * fallback; DS4_QWEN4_IQ2XXS_VNNI=0 disables the new route. */
+static bool qwen4_cpu_iq2xxs_vnni_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("DS4_QWEN4_IQ2XXS_VNNI");
+        enabled = !(e && e[0] == '0');
+    }
+    return enabled != 0;
+}
+#endif
+
+static void qwen4_cpu_dot_iq2_xxs_q8k_batch(const void *row, const block_q8_K *const *ys,
+                                            float *out, uint32_t n, uint32_t k) {
+#if defined(DS4_CPU_IQ2S_Q8K_VNNI)
+    if (qwen4_cpu_iq2xxs_vnni_enabled()) {
+        qwen4_cpu_dot_iq2_xxs_q8k_vnni_batch(row, ys, out, n, k);
+        return;
+    }
+#endif
+    qwen4_cpu_dot_iq2_xxs_q8k_maddubs_batch(row, ys, out, n, k);
 }
 
 /* IQ2_XS: 256 values per 74-byte block, low 9 bits of each uint16 are the
@@ -7018,6 +7094,26 @@ void ds4_test_qwen4_cpu_dot_iq3_s_q8k_batch_vnni(const void *row, const void *co
     qwen4_cpu_dot_iq3_s_q8k_maddubs_batch(row, (const block_q8_K *const *)xq, out, n, k);
 #else
     qwen4_cpu_row_dot_q8k_batch(DS4_TENSOR_IQ3_S, row, (const block_q8_K *const *)xq, out, n, k);
+#endif
+}
+
+void ds4_test_qwen4_cpu_dot_iq2_xxs_q8k_batch_maddubs(const void *row, const void *const *xq,
+                                                       float *out, uint32_t n, uint32_t k) {
+#if defined(DS4_CPU_IQ2S_Q8K)
+    qwen4_cpu_dot_iq2_xxs_q8k_maddubs_batch(row, (const block_q8_K *const *)xq, out, n, k);
+#else
+    qwen4_cpu_row_dot_q8k_batch(DS4_TENSOR_IQ2_XXS, row, (const block_q8_K *const *)xq, out, n, k);
+#endif
+}
+
+void ds4_test_qwen4_cpu_dot_iq2_xxs_q8k_batch_vnni(const void *row, const void *const *xq,
+                                                    float *out, uint32_t n, uint32_t k) {
+#if defined(DS4_CPU_IQ2S_Q8K_VNNI)
+    qwen4_cpu_dot_iq2_xxs_q8k_vnni_batch(row, (const block_q8_K *const *)xq, out, n, k);
+#elif defined(DS4_CPU_IQ2S_Q8K)
+    qwen4_cpu_dot_iq2_xxs_q8k_maddubs_batch(row, (const block_q8_K *const *)xq, out, n, k);
+#else
+    qwen4_cpu_row_dot_q8k_batch(DS4_TENSOR_IQ2_XXS, row, (const block_q8_K *const *)xq, out, n, k);
 #endif
 }
 
