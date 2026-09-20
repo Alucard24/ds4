@@ -93,9 +93,11 @@ Carico **identico** a UD (T=1739, ne=512, ns=10, k_in=2560, k_ff=640, pairs=1739
 **8. Primo pass del mid CPU-MoE chiuso:** tutti e cinque i tipi q8k di ISTA
 (IQ2_S, IQ3_S, IQ2_XXS, IQ2_XS, IQ3_XXS) hanno ora il batch VNNI di default.
 Prossimo bersaglio, solo dopo un A/B equivalente: i due kernel fp32 del down
-(IQ4_NL/Q2_0), che occupano tutti i 48 layer. Qualunque nuovo tentativo deve
-prima battere il proprio A/B interno, poi `check_batch_any` e `391` su ISTA
-prima dell'integrazione.
+(IQ4_NL/Q2_0), che occupano tutti i 48 layer. Baseline isolata a 16 thread:
+IQ4_NL **163,5** e Q2_0 **177,8 GMAC/s** (a 8: 140,8 / 169,3); e' una misura
+di harness, non un risultato end-to-end. Qualunque nuovo tentativo deve prima
+battere il proprio A/B interno, poi `check_batch_any` e `391` su ISTA prima
+dell'integrazione.
 
 
 

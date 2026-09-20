@@ -221,7 +221,7 @@ static void *ml_mt_worker(void *arg) {
  * and rows inner - exactly the worker's structure.  Tells whether the down is
  * already at the machine's ceiling like the mid (142 vs 180 GMAC/s aggregate). */
 typedef struct {
-    uint32_t k_in, k_out, ntok;
+    uint32_t type, k_in, k_out, ntok;
     uint64_t rb;
     const uint8_t *w;
     float *mid;
@@ -246,7 +246,7 @@ static void *dl_mt_worker(void *arg) {
             }
             for (uint32_t r = 0; r < c->k_out; r++) {
                 for (uint32_t b = 0; b < m; b++) outs[b] = outs0[b] + r;
-                ds4_test_qwen4_cpu_dot_fp32_batch(IQ4_NL, c->w + (size_t)r * c->rb, xs, outs, m, c->k_in);
+                ds4_test_qwen4_cpu_dot_fp32_batch(c->type, c->w + (size_t)r * c->rb, xs, outs, m, c->k_in);
             }
         }
         for (uint32_t b = 0; b < c->ntok; b++) sink += c->part[(size_t)c->list[b] * c->k_out];
@@ -255,24 +255,24 @@ static void *dl_mt_worker(void *arg) {
     return NULL;
 }
 
-static void time_down_mt(uint32_t nthreads) {
+static void time_down_mt(uint32_t type, const char *type_name, uint32_t nthreads) {
     const uint32_t k_in = 640u, k_out = 2560u, ntok = 34u, pool = 64u;
     uint32_t per = 0;
-    const uint32_t bs = ds4_test_qwen4_block_bytes(IQ4_NL, &per);
+    const uint32_t bs = ds4_test_qwen4_block_bytes(type, &per);
     if (!bs || k_in % per || nthreads < 1 || nthreads > 32) return;
     const uint64_t rb = (uint64_t)(k_in / per) * bs;
     dl_mt_ctx *c = calloc(nthreads, sizeof(*c));
     pthread_t *th = calloc(nthreads, sizeof(*th));
     int ok = c && th;
     for (uint32_t t = 0; ok && t < nthreads; t++) {
-        c[t].k_in = k_in; c[t].k_out = k_out; c[t].ntok = ntok; c[t].rb = rb; c[t].reps = 120;
+        c[t].type = type; c[t].k_in = k_in; c[t].k_out = k_out; c[t].ntok = ntok; c[t].rb = rb; c[t].reps = 120;
         uint8_t *w = malloc((size_t)k_out * rb);
         float *mid = malloc((size_t)pool * k_in * sizeof(float));
         float *part = malloc((size_t)pool * k_out * sizeof(float));
         uint32_t *list = malloc((size_t)ntok * sizeof(*list));
         ok = w && mid && part && list;
         if (ok) {
-            for (uint32_t r = 0; r < k_out; r++) fill_row(IQ4_NL, w + (size_t)r * rb, k_in);
+            for (uint32_t r = 0; r < k_out; r++) fill_row(type, w + (size_t)r * rb, k_in);
             for (uint32_t i = 0; i < pool * k_in; i++) mid[i] = frnd();
             memset(part, 0, (size_t)pool * k_out * sizeof(float));
             for (uint32_t i = 0; i < ntok; i++) list[i] = (uint32_t)((uint64_t)i * pool / ntok);
@@ -293,8 +293,8 @@ static void time_down_mt(uint32_t nthreads) {
     const double dt = now_s() - t0;
     double sink = 0;
     for (uint32_t t = 0; t < nthreads; t++) sink += c[t].sink;
-    printf("  down IQ4_NL MT: %2u thread: %6.1f GMAC/s aggregati (%5.1f per thread, sink %g)\n",
-           nthreads, (double)k_in * k_out * ntok * c[0].reps * nthreads / dt / 1e9,
+    printf("  down %-6s MT: %2u thread: %6.1f GMAC/s aggregati (%5.1f per thread, sink %g)\n",
+           type_name, nthreads, (double)k_in * k_out * ntok * c[0].reps * nthreads / dt / 1e9,
            (double)k_in * k_out * ntok * c[0].reps / dt / 1e9, sink);
     for (uint32_t t = 0; t < nthreads; t++) { free((void *)c[t].w); free(c[t].mid); free(c[t].part); free(c[t].list); }
     free(c); free(th);
@@ -963,7 +963,10 @@ int main(void) {
         for (uint32_t nt = 1; nt <= 16u; nt <<= 1) time_model_like_mt(2560, 34, 640, nt, 0, 8);
         for (uint32_t nt = 1; nt <= 16u; nt <<= 1) time_model_like_mt(2560, 34, 640, nt, 0, 16);
         for (uint32_t nt = 1; nt <= 16u; nt <<= 1) time_model_like_mt(2560, 34, 640, nt, 1, 8);
-        for (uint32_t nt = 1; nt <= 16u; nt <<= 1) time_down_mt(nt);
+        for (uint32_t nt = 1; nt <= 16u; nt <<= 1) {
+            time_down_mt(IQ4_NL, "IQ4_NL", nt);
+            time_down_mt(Q2_0, "Q2_0", nt);
+        }
     }
     rc |= check_type(IQ4_NL, "IQ4_NL", 640);   /* down experts (ff -> embd) */
     rc |= check_fp32_batch(IQ4_NL, "IQ4_NL", 640);
