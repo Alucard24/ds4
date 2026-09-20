@@ -169,19 +169,20 @@ typedef struct {
     uint32_t *list;
     int reps;
     int tworow;
+    uint32_t chunk;
     double sink;
 } ml_mt_ctx;
 
 static void *ml_mt_worker(void *arg) {
     ml_mt_ctx *c = (ml_mt_ctx *)arg;
-    const void *ptrs[8];
-    float out[8], out2[8];
+    const void *ptrs[16];
+    float out[16], out2[16];
     double sink = 0;
     for (int rep = 0; rep < c->reps; rep++) {
         for (uint32_t row = 0; row < c->rows; row += (c->tworow ? 2u : 1u)) {
             const void *wr = (const void *)(c->w + (size_t)row * c->nb * c->bs);
-            for (uint32_t base = 0; base < c->ntok; base += 8) {
-                const uint32_t m = (c->ntok - base) < 8u ? (c->ntok - base) : 8u;
+            for (uint32_t base = 0; base < c->ntok; base += c->chunk) {
+                const uint32_t m = (c->ntok - base) < c->chunk ? (c->ntok - base) : c->chunk;
                 for (uint32_t b = 0; b < m; b++)
                     ptrs[b] = (const void *)(c->scratch + (size_t)c->list[base + b] * c->stride);
                 if (c->tworow) {
@@ -283,7 +284,8 @@ static void time_down_mt(uint32_t nthreads) {
     free(c); free(th);
 }
 
-static void time_model_like_mt(uint32_t k, uint32_t ntok, uint32_t rows, uint32_t nthreads, int tworow) {
+static void time_model_like_mt(uint32_t k, uint32_t ntok, uint32_t rows, uint32_t nthreads, int tworow,
+                               uint32_t chunk) {
     uint32_t per = 0;
     const uint32_t bs = ds4_test_qwen4_block_bytes(IQ2_S, &per);
     const uint32_t q8bs = ds4_test_qwen4_q8k_block_bytes();
@@ -296,7 +298,7 @@ static void time_model_like_mt(uint32_t k, uint32_t ntok, uint32_t rows, uint32_
     int ok = c && th && x;
     for (uint32_t t = 0; ok && t < nthreads; t++) {
         c[t].k = k; c[t].ntok = ntok; c[t].rows = rows; c[t].nb = nb; c[t].bs = bs;
-        c[t].stride = stride; c[t].reps = 120; c[t].tworow = tworow;
+        c[t].stride = stride; c[t].reps = 120; c[t].tworow = tworow; c[t].chunk = chunk;
         c[t].w = malloc((size_t)nb * bs * rows);
         c[t].scratch = malloc((size_t)scratch_tokens * stride);
         c[t].list = malloc((size_t)ntok * sizeof(*c[t].list));
@@ -324,7 +326,7 @@ static void time_model_like_mt(uint32_t k, uint32_t ntok, uint32_t rows, uint32_
     double sink = 0;
     for (uint32_t t = 0; t < nthreads; t++) sink += c[t].sink;
     printf("  IQ2_S model-like MT: %2u thread%-9s %u token sparso, riga nuova: %6.1f GMAC/s aggregati (%5.1f per thread, sink %g)\n",
-           nthreads, tworow ? " (2 righe)" : "", ntok,
+           nthreads, tworow ? " (2 righe)" : "", chunk, ntok,
            (double)k * ntok * rows * c[0].reps * nthreads / dt / 1e9,
            (double)k * ntok * rows * c[0].reps / dt / 1e9, sink);
     for (uint32_t t = 0; t < nthreads; t++) { free(c[t].w); free(c[t].scratch); free(c[t].list); }
@@ -724,8 +726,9 @@ int main(void) {
         time_model_like(2560, 34, 640, 1, 1, 0);
         time_model_like(2560, 34, 640, 0, 0, 1);
         time_model_like(2560, 34, 640, 1, 1, 1);
-        for (uint32_t nt = 1; nt <= 16u; nt <<= 1) time_model_like_mt(2560, 34, 640, nt, 0);
-        for (uint32_t nt = 1; nt <= 16u; nt <<= 1) time_model_like_mt(2560, 34, 640, nt, 1);
+        for (uint32_t nt = 1; nt <= 16u; nt <<= 1) time_model_like_mt(2560, 34, 640, nt, 0, 8);
+        for (uint32_t nt = 1; nt <= 16u; nt <<= 1) time_model_like_mt(2560, 34, 640, nt, 0, 16);
+        for (uint32_t nt = 1; nt <= 16u; nt <<= 1) time_model_like_mt(2560, 34, 640, nt, 1, 8);
         for (uint32_t nt = 1; nt <= 16u; nt <<= 1) time_down_mt(nt);
     }
     rc |= check_type(IQ4_NL, "IQ4_NL", 640);   /* down experts (ff -> embd) */
