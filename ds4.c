@@ -64328,6 +64328,9 @@ static void qwen4_cpu_moe_pf_down_rows(void *vjob, uint64_t r0, uint64_t r1) {
                     outs0[b] = s->part + ((uint64_t)t * j->ns + slot) * j->k_out + row0;
                 }
                 const char *dr = drow0;
+                /* 2 righe con load condivisi: provato, corretto (391 ok) e
+                 * MISURATO NEUTRO (down 198,4 vs 197,9 ms), quindi rimosso: il
+                 * costo di questa fase non e' il traffico di load del mid. */
                 for (uint32_t r = 0; r < nrows; r++) {
                     for (uint32_t b = 0; b < m; b++) outs[b] = outs0[b] + r;
                     qwen4_cpu_row_dot_fp32_batch_store(j->down_type, dr, xs, outs, m, j->k_ff);
