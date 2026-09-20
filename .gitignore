@@ -102,3 +102,10 @@ __pycache__/
 ds4-hub/
 /tests/test_qwen4_conv_parallel
 /tests/test_q8_prefill_variants
+
+# Eseguibili di test (output di build: non vanno tracciati)
+tests/test_cuda_tc23
+tests/test_moe_bench
+tests/test_prompt_prefix
+tests/test_qwen4_cpu_dot
+tests/test_qwen4_drafthead
