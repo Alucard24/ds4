@@ -555,6 +555,7 @@ static void time_fp32_batch_ab(uint32_t type, const char *type_name,
 static int check_fp32_batch_variants(uint32_t type, const char *type_name,
                                      const char *name0, fp32_batch_fn fn0,
                                      const char *name1, fp32_batch_fn fn1) {
+    const uint32_t rng_before = rng;
     const uint32_t k = 640u, ntok = 8u;
     uint32_t per = 0;
     const uint32_t bs = ds4_test_qwen4_block_bytes(type, &per);
@@ -571,6 +572,13 @@ static int check_fp32_batch_variants(uint32_t type, const char *type_name,
     double worst[2] = {0, 0}, worst_abs[2] = {0, 0};
     for (uint32_t sample = 0; sample < 16u; sample++) {
         fill_row(type, row, k);
+        /* Exercise normal, subnormal and signed finite f16 scales too; the
+         * usual synthetic row intentionally uses only 1.0. */
+        for (uint32_t i = 0; i < nb; i++) {
+            uint16_t h = (uint16_t)rnd();
+            if ((h & 0x7c00u) == 0x7c00u) h = (uint16_t)((h & 0x83ffu) | 0x7800u);
+            memcpy(row + (size_t)i * bs, &h, sizeof(h));
+        }
         for (uint32_t b = 0; b < ntok; b++) {
             for (uint32_t j = 0; j < k; j++) x[(size_t)b * k + j] = frnd();
             xs[b] = x + (size_t)b * k;
@@ -593,6 +601,7 @@ static int check_fp32_batch_variants(uint32_t type, const char *type_name,
         if (!(worst[v] < 1e-4)) rc = 1;
     }
     free(row); free(x);
+    rng = rng_before;  /* Keep later regression vectors independent of this check. */
     return rc;
 }
 

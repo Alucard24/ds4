@@ -101,8 +101,9 @@ Carico **identico** a UD (T=1739, ne=512, ns=10, k_in=2560, k_ff=640, pairs=1739
 
 **9. Mid chiuso, Q2_0 down chiuso:** tutti e cinque i tipi q8k di ISTA hanno
 il batch VNNI di default e Q2_0 down ha VBMI. Resta IQ4_NL (18 layer), ma il
-primo tentativo split-accumulator e' stato chiuso: 16 thread baseline `157/153`
-contro split `153/141 GMAC/s`, quindi non e' in albero. Baseline isolata a 16
+primi tentativi gia' chiusi: split-accumulator (16 thread baseline `157/153`
+contro split `153/141 GMAC/s`) e F16C scale conversion (`37,30 -> 37,42`
+hot, streamed negativo), quindi non sono in albero. Baseline isolata a 16
 thread: IQ4_NL **163,5** e Q2_0 **177,8 GMAC/s** (a 8: 140,8 / 169,3); e' una
 misura di harness, non end-to-end. Qualunque nuovo tentativo deve prima battere
 il proprio A/B interno, poi `check_batch_any` e `391` su ISTA prima
@@ -154,6 +155,7 @@ DS4_CUDA_WEIGHT_CACHE_LIMIT_GB=6 DS4_QWEN4_MOE_PROFILE=1 ./ds4 -m <gguf> \
 | chunk da 16 token | +6% di tetto nel bench, rompe la residenza L1 |
 | VNNI storico B=16 / accumulatore vettoriale | negativo; non e' il nuovo VNNI x8 di IQ3_S/IQ2_XXS |
 | IQ4_NL split-accumulator | 16 thread: baseline `157/153`, split `153/141` GMAC/s; rimosso |
+| IQ4_NL F16C scale conversion | hot `37,30 -> 37,42`, streamed `13,01 -> 12,94`; neutro/negativo, rimosso |
 
 **Dove siamo, quantificato**: mid e down stanno all'**86-92%** e **76%** dei tetti
 riprodotti nella loro stessa configurazione (bench `time_model_like_mt`,
@@ -1979,7 +1981,8 @@ e' il down coerente, non la singola punta di prefill.
 
 ### Correttezza e rollback
 
-- `check_fp32_batch_variants()` alterna unpack/VBMI su 16 righe+attivazioni:
-  entrambi `0.00e+00` contro il singolo.
+- `check_fp32_batch_variants()` alterna unpack/VBMI su 16 righe+attivazioni e
+  scale f16 finite (normali, subnormali, firmate): entrambi `0.00e+00` contro
+  il singolo.
 - Il dispatch default e `DS4_QWEN4_Q20_VBMI=0` sono entrambi verdi.
 - `make test-qwen4-cpu-dot`, build `ds4`/`ds4-server`, `391` ISTA+UD: verdi.
