@@ -22,6 +22,10 @@ void ds4_test_qwen4_dequant_row_q8k(const void *yq, float *out, uint32_t k);
 float ds4_test_qwen4_cpu_dot_q8k(uint32_t type, const void *row, const void *yq, uint32_t k);
 void ds4_test_qwen4_cpu_dot_q8k_batch(uint32_t type, const void *row, const void *const *xq,
                                       float *out, uint32_t n, uint32_t k);
+void ds4_test_qwen4_cpu_dot_iq3_s_q8k_batch_maddubs(const void *row, const void *const *xq,
+                                                     float *out, uint32_t n, uint32_t k);
+void ds4_test_qwen4_cpu_dot_iq3_s_q8k_batch_vnni(const void *row, const void *const *xq,
+                                                  float *out, uint32_t n, uint32_t k);
 void ds4_test_qwen4_cpu_dot_q8k_batch2(const void *row0, const void *row1, const void *const *xq,
                                        float *out0, float *out1, uint32_t n, uint32_t k);
 void ds4_test_qwen4_cpu_dot_fp32_batch(uint32_t type, const void *row, const float *const *xs,
@@ -325,7 +329,7 @@ static void time_model_like_mt(uint32_t k, uint32_t ntok, uint32_t rows, uint32_
     const double dt = now_s() - t0;
     double sink = 0;
     for (uint32_t t = 0; t < nthreads; t++) sink += c[t].sink;
-    printf("  IQ2_S model-like MT: %2u thread%-9s %u token sparso, riga nuova: %6.1f GMAC/s aggregati (%5.1f per thread, sink %g)\n",
+    printf("  IQ2_S model-like MT: %2u thread%-9s chunk %u, %u token sparsi, riga nuova: %6.1f GMAC/s aggregati (%5.1f per thread, sink %g)\n",
            nthreads, tworow ? " (2 righe)" : "", chunk, ntok,
            (double)k * ntok * rows * c[0].reps * nthreads / dt / 1e9,
            (double)k * ntok * rows * c[0].reps / dt / 1e9, sink);
@@ -418,6 +422,109 @@ static void time_batch_q8k(uint32_t type, const char *name, uint32_t k, uint32_t
            (double)k * ntokens * reps / dt / 1e9,
            (double)ntokens * (double)stride * reps / dt / 1e9, sink);
     free(row); free(x); free(xq); free(ptrs); free(out);
+}
+
+/* Direct IQ3_S A/B in one process and one allocation.  The generic timing
+ * harness normally dispatches just the default kernel; this alternates the
+ * explicit AVX2 and VNNI implementations so frequency/thermal drift cannot
+ * turn two separate runs into a false win. */
+typedef void (*iq3s_batch_fn)(const void *row, const void *const *xq, float *out,
+                              uint32_t n, uint32_t k);
+
+static void time_iq3s_batch_ab(uint32_t nbufs) {
+    const uint32_t k = 2560u, ntok = 8u;
+    uint32_t per = 0;
+    const uint32_t bs = ds4_test_qwen4_block_bytes(IQ3_S, &per);
+    const uint32_t q8bs = ds4_test_qwen4_q8k_block_bytes();
+    if (!bs || !q8bs || k % per || nbufs < ntok) return;
+    const uint32_t nb = k / per, nq = k / 256u;
+    const size_t stride = (size_t)nq * q8bs;
+    uint8_t *row = malloc((size_t)nb * bs);
+    float *x = malloc((size_t)k * sizeof(*x));
+    uint8_t *xq = malloc((size_t)nbufs * stride);
+    const void *ptrs[8];
+    float out[8];
+    if (!row || !x || !xq) { free(row); free(x); free(xq); return; }
+    fill_row(IQ3_S, row, k);
+    for (uint32_t v = 0; v < nbufs; v++) {
+        for (uint32_t j = 0; j < k; j++) x[j] = frnd();
+        ds4_test_qwen4_quantize_row_q8k(x, xq + (size_t)v * stride, k);
+    }
+    const struct { const char *name; iq3s_batch_fn fn; } variant[2] = {
+        {"maddubs", ds4_test_qwen4_cpu_dot_iq3_s_q8k_batch_maddubs},
+        {"vnni",    ds4_test_qwen4_cpu_dot_iq3_s_q8k_batch_vnni},
+    };
+    const uint32_t reps = nbufs == ntok ? 50000u : 30000u;
+    double best[2] = {1e30, 1e30};
+    double sink[2] = {0, 0};
+    /* Reverse the order on alternating passes. */
+    for (uint32_t pass = 0; pass < 6u; pass++) {
+        for (uint32_t order = 0; order < 2u; order++) {
+            const uint32_t v = (pass + order) & 1u;
+            const double t0 = now_s();
+            double local = 0;
+            for (uint32_t r = 0; r < reps; r++) {
+                const uint32_t base = nbufs == ntok ? 0u : (r * ntok) % nbufs;
+                for (uint32_t b = 0; b < ntok; b++)
+                    ptrs[b] = xq + (size_t)((base + b) % nbufs) * stride;
+                variant[v].fn(row, ptrs, out, ntok, k);
+                local += out[r & 7u];
+            }
+            const double dt = now_s() - t0;
+            if (dt < best[v]) best[v] = dt;
+            sink[v] += local;
+        }
+    }
+    for (uint32_t v = 0; v < 2u; v++) {
+        printf("  IQ3_S A/B %-7s x8 nbuf=%-4u %s: %.2f GMAC/s (sink %g)\n",
+               variant[v].name, nbufs, nbufs == ntok ? "L1-hot" : "streamed",
+               (double)k * ntok * reps / best[v] / 1e9, sink[v]);
+    }
+    free(row); free(x); free(xq);
+}
+
+/* Both explicit IQ3_S batch implementations must agree with the trusted
+ * single-token packed kernel.  The dispatch check below additionally covers
+ * the default/env selection. */
+static int check_iq3s_batch_variants(void) {
+    const uint32_t k = 2560u, ntok = 8u;
+    uint32_t per = 0;
+    const uint32_t bs = ds4_test_qwen4_block_bytes(IQ3_S, &per);
+    const uint32_t q8bs = ds4_test_qwen4_q8k_block_bytes();
+    if (!bs || !q8bs || k % per) return 1;
+    const uint32_t nb = k / per, nq = k / 256u;
+    const size_t stride = (size_t)nq * q8bs;
+    uint8_t *row = malloc((size_t)nb * bs);
+    float *x = malloc((size_t)k * sizeof(*x));
+    uint8_t *xq = malloc((size_t)ntok * stride);
+    const void *ptrs[8];
+    float got[8];
+    if (!row || !x || !xq) { free(row); free(x); free(xq); return 1; }
+    fill_row(IQ3_S, row, k);
+    for (uint32_t b = 0; b < ntok; b++) {
+        for (uint32_t j = 0; j < k; j++) x[j] = frnd();
+        ptrs[b] = xq + (size_t)b * stride;
+        ds4_test_qwen4_quantize_row_q8k(x, xq + (size_t)b * stride, k);
+    }
+    const struct { const char *name; iq3s_batch_fn fn; } variant[2] = {
+        {"maddubs", ds4_test_qwen4_cpu_dot_iq3_s_q8k_batch_maddubs},
+        {"vnni",    ds4_test_qwen4_cpu_dot_iq3_s_q8k_batch_vnni},
+    };
+    int rc = 0;
+    for (uint32_t v = 0; v < 2u; v++) {
+        double worst = 0;
+        variant[v].fn(row, ptrs, got, ntok, k);
+        for (uint32_t b = 0; b < ntok; b++) {
+            const double ref = ds4_test_qwen4_cpu_dot_q8k(IQ3_S, row, ptrs[b], k);
+            const double rel = fabs(got[b] - ref) / (fabs(ref) + 1e-6);
+            if (rel > worst) worst = rel;
+        }
+        printf("  IQ3_S %-7s batch x8 vs singolo: worst rel diff %.2e %s\n", variant[v].name,
+               worst, worst < 1e-4 ? "ok" : "**FAIL**");
+        if (!(worst < 1e-4)) rc = 1;
+    }
+    free(row); free(x); free(xq);
+    return rc;
 }
 
 /* Same activation-load count per call as time_batch_q8k with ntokens=8, but
@@ -798,6 +905,8 @@ int main(void) {
         time_batch_q8k(IQ2_S, "IQ2_S", 2560, 16, 4096);
         time_batch_q8k(IQ3_S, "IQ3_S", 2560, 8, 8);
         time_batch_q8k(IQ3_S, "IQ3_S", 2560, 8, 4096);
+        time_iq3s_batch_ab(8);
+        time_iq3s_batch_ab(4096);
         /* Tipi di ISTA: se il divario con UD e' la famiglia di kernel (maddubs vs
          * VNNI), questi due numeri lo dicono. */
         time_batch_q8k(IQ2_XXS, "IQ2_XXS", 2560, 8, 8);
@@ -840,6 +949,7 @@ int main(void) {
     rc |= check_batch_any(IQ2_XS, "IQ2_XS", 2560);
     rc |= check_batch_any(IQ3_XXS, "IQ3_XXS", 2560);
     rc |= check_batch_any(IQ3_S, "IQ3_S", 2560);
+    rc |= check_iq3s_batch_variants();
     rc |= check_batch_any(IQ2_S, "IQ2_S", 2560);
     rc |= check_batch2();
     if (rc) {
