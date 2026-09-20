@@ -6068,6 +6068,10 @@ static void qwen4_cpu_dot_iq2_xxs_q8k_batch(const void *row, const block_q8_K *c
     const uint32_t nb = k / QK_K;
     if (n == 0u) return;
     if (n > 8u) n = 8u;
+    /* Prefetch NTA provato anche qui e MISURATO NEGATIVO su ISTA (47,62 vs 49,43
+     * t/s, mid 533,4 vs 506,4 ms): questi kernel usano griglie a 4 valori in
+     * __m256 e righe piu' lunghe (~980 B), e il prefetch dell'intera riga non
+     * paga.  Resta solo nel kernel IQ2_S, dove il guadagno e' misurato. */
     pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
     uint32_t aux32[4];
     const uint8_t *aux8 = (const uint8_t *)aux32;
@@ -6219,6 +6223,7 @@ static void qwen4_cpu_dot_iq2_xs_q8k_batch(const void *row, const block_q8_K *co
     const uint32_t nb = k / QK_K;
     if (n == 0u) return;
     if (n > 8u) n = 8u;
+    (void)nb;   /* NTA rimosso: negativo su ISTA, vedi iq2_xxs */
     static const uint8_t block_sign_shuffle_mask_1[32] = {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
         0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06,
@@ -6364,6 +6369,7 @@ static void qwen4_cpu_dot_iq3_xxs_q8k_batch(const void *row, const block_q8_K *c
     const uint32_t nb = k / QK_K;
     if (n == 0u) return;
     if (n > 8u) n = 8u;
+    (void)nb;   /* NTA rimosso: negativo su ISTA, vedi iq2_xxs */
     pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
     __m256 accumf[8];
     for (uint32_t b = 0; b < n; b++) accumf[b] = _mm256_setzero_ps();
@@ -6522,6 +6528,7 @@ static void qwen4_cpu_dot_iq3_s_q8k_batch(const void *row, const block_q8_K *con
     const uint32_t nb = k / QK_K;
     if (n == 0u) return;
     if (n > 8u) n = 8u;
+    (void)nb;   /* NTA rimosso: negativo su ISTA, vedi iq2_xxs */
     static const uint8_t k_mask1[32] = {
         0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
         2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
