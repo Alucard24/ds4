@@ -64186,6 +64186,15 @@ static void qwen4_cpu_moe_pf_mid_rows(void *vjob, uint64_t r0, uint64_t r1) {
         const char *e = getenv("DS4_QWEN4_MID_ROWOUTER");
         outer = (e && e[0] && e[0] != '0') ? 0 : 1;
     }
+    static int stg = -1;
+    if (stg < 0) {
+        const char *e = getenv("DS4_QWEN4_MID_STAGE");
+        stg = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    /* 8 token x k_ff righe = 20 KB: staging in L1 del chunk, poi flush contiguo
+     * per token (vid. commento nel loop).  NULL se non serve o se lo stack non
+     * regge la taglia. */
+    float *st = (stg && j->k_ff <= 8192u) ? malloc((size_t)8u * j->k_ff * sizeof(float)) : NULL;
     if (outer) {
         /* Token-chunk outer, rows inner: the 8 activation vectors (23 KB) stay
          * in L1 for all k_ff rows instead of being re-walked per row (100 KB
@@ -64232,6 +64241,35 @@ static void qwen4_cpu_moe_pf_mid_rows(void *vjob, uint64_t r0, uint64_t r1) {
                  * raddoppia per token, mentre i byte di attivazioni risparmiati
                  * non erano il collo (coerente con tutti i test di oggi).
                  * Il kernel resta in albero e validato, usato dal bench. */
+                /* Store del mid.  MID_STAGE=1 mette il chunk intero (8 x k_ff =
+                 * 20 KB) in un buffer L1 e poi scrive per token un tratto
+                 * contiguo di righe (scritture a linea intera).  MISURATO:
+                 * +1,2% di t/s (55,86 vs 55,22) e mid -1,1%, cioe' dentro il
+                 * rumore - e si capisce perche': con l'ordine chunk-esterno,
+                 * per un token fisso le righe avanzano di 1 float per
+                 * iterazione, quindi 16 righe consecutive cadono nella stessa
+                 * linea e il RFO si paga 1 volta su 16 anche senza staging.
+                 * Tenuto (validato: 391 corretto anche con STAGE=1) come opzione,
+                 * default spento; candidato alla rimozione. */
+                if (st) {
+                    for (uint64_t R2 = R; R2 < rend; R2++) {
+                        const uint32_t row = (uint32_t)(R2 % j->k_ff);
+                        const char *gr = j->gate_base + ((uint64_t)e * j->k_ff + row) * j->gate_rb;
+                        const char *ur = j->up_base + ((uint64_t)e * j->k_ff + row) * j->up_rb;
+                        float va[8], vb[8];
+                        qwen4_cpu_row_dot_q8k_batch(j->gate_type, gr, xq, va, m, j->k_in);
+                        qwen4_cpu_row_dot_q8k_batch(j->up_type, ur, xq, vb, m, j->k_in);
+                        qwen4_cpu_silu8_mul(va, vb, va);
+                        for (uint32_t b = 0; b < m; b++) st[(size_t)b * j->k_ff + row] = va[b];
+                    }
+                    const uint32_t row0 = (uint32_t)(R % j->k_ff);
+                    const uint32_t nrows = (uint32_t)(rend - R);
+                    for (uint32_t b = 0; b < m; b++) {
+                        const uint32_t t = s->tok_idx[base + (int32_t)b], slot = s->slot_idx[base + (int32_t)b];
+                        float *dst = s->mid + ((uint64_t)t * j->ns + slot) * j->k_ff + row0;
+                        memcpy(dst, st + (size_t)b * j->k_ff + row0, (size_t)nrows * sizeof(float));
+                    }
+                } else {
                 uint64_t R2 = R;
                 for (; R2 < rend; R2++) {
                     const uint32_t row = (uint32_t)(R2 % j->k_ff);
@@ -64252,8 +64290,10 @@ static void qwen4_cpu_moe_pf_mid_rows(void *vjob, uint64_t r0, uint64_t r1) {
                     }
                 }
             }
+                }
             R = rend;
         }
+        free(st);
         return;
     }
     for (uint64_t R = r0; R < r1; R++) {
