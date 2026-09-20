@@ -64370,6 +64370,13 @@ static bool qwen4_graph_moe_cpu_prefill(ds4_qwen4_gpu_graph *g, const ds4_model 
     job.gate_base = (const char *)m->map + l->ffn_gate_exps->abs_offset;
     job.up_base = (const char *)m->map + l->ffn_up_exps->abs_offset;
     job.down_base = (const char *)m->map + l->ffn_down_exps->abs_offset;
+    /* Read-ahead hint (MADV_WILLNEED sui tre tensori degli esperti) MISURATO
+     * NEGATIVO e rimosso: ADVISE=1 dava 52,47 t/s e 50 GB letti dal disco contro
+     * 54,88 t/s e 37 GB senza.  Motivo: il working set di un pass (~48 GB)
+     * supera la cache disponibile (~40 GB con la VM accesa), quindi leggere in
+     * anticipo tutto il layer sfratta pagine che sarebbero state riusate.  Per
+     * nascondere quei ~24% di I/O serve piu' RAM per la cache (o meno byte), non
+     * una hint: vedi la sezione IO nel doc. */
     job.gate_rb = gate_rb;
     job.up_rb = up_rb;
     job.down_rb = down_rb;
