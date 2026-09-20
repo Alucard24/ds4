@@ -64194,7 +64194,30 @@ static void qwen4_cpu_moe_pf_mid_rows(void *vjob, uint64_t r0, uint64_t r1) {
                 const uint32_t m = (uint32_t)((hi - base) < 8 ? (hi - base) : 8);
                 const block_q8_K *xq[8];
                 for (uint32_t b = 0; b < m; b++) xq[b] = s->xq + (uint64_t)s->tok_idx[base + (int32_t)b] * j->nb_in;
-                for (uint64_t R2 = R; R2 < rend; R2++) {
+                /* 2 righe: rimosso.
+                 *
+                 * Il kernel e' in albero e validato bit-identico (check_batch2 nel
+                 * test), e nel bench MT alza il tetto del 6-18% a 16 thread.  La
+                 * versione integrata qui PERO' CRASHA (segfault deterministico,
+                 * anche con prompt minuscolo): analisi con gdb su
+                 * qwen4_cpu_dot_iq2_s_q8k_vnni_batch2 chiamata dalla coppia:
+                 *
+                 *   n = 1 (coda dispari: chunk di 1 token)
+                 *   ys[0] = 0x3786230d -> puntatore selvaggio alla lettura q8
+                 *   (dr e xa/xb leggono invece valori validi, quindi la riga di
+                 *    peso e' buona: e' l'xq del primo token a essere marcio)
+                 *
+                 * Da qui: o `xq` non e' quello che credo in questa posizione, o
+                 * c'e' una corruzione prima della chiamata.  Da riprendere con un
+                 * debug mirato (print di base/lo/hi/m/tok_idx prima della
+                 * chiamata e assert sulle lunghezze) PRIMA di riprovare: il bench
+                 * dice che vale la pena (tetto +11% a 16 thread, +18% a 8), ma
+                 * non a costo di introdurre un crash nel percorso di produzione.
+                 *
+                 * Il codice della variante e' in git: commit 640decf (bench) e il
+                 * kernel `qwen4_cpu_dot_iq2_s_q8k_vnni_batch2` (~ds4.c:6690). */
+                uint64_t R2 = R;
+                for (; R2 < rend; R2++) {
                     const uint32_t row = (uint32_t)(R2 % j->k_ff);
                     const char *gr = j->gate_base + ((uint64_t)e * j->k_ff + row) * j->gate_rb;
                     const char *ur = j->up_base + ((uint64_t)e * j->k_ff + row) * j->up_rb;
