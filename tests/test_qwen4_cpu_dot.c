@@ -507,6 +507,45 @@ static int check_batch_any(uint32_t type, const char *name, uint32_t k) {
     return worst < 1e-4 ? 0 : 1;
 }
 
+/* Percorso di produzione del down: i kernel fp32 batch (IQ4_NL/Q2_0) erano usati
+ * solo per il timing e non confrontati col kernel a token singolo.  E' la stessa
+ * lacuna che ha lasciato passare il bug di IQ2_XXS nel percorso q8k. */
+static int check_fp32_batch(uint32_t type, const char *name, uint32_t k) {
+    uint32_t per = 0;
+    const uint32_t bs = ds4_test_qwen4_block_bytes(type, &per);
+    if (!bs || k % per) {
+        fprintf(stderr, "%s fp32 batch: bad geometry\n", name);
+        return 1;
+    }
+    const uint32_t ntok = 8u;
+    uint8_t *row = malloc((size_t)(k / per) * bs);
+    float *x = malloc((size_t)k * ntok * sizeof(float));
+    const float *xs[8];
+    float *outs[8];
+    float got[8];
+    if (!row || !x) {
+        free(row); free(x);
+        return 1;
+    }
+    fill_row(type, row, k);
+    for (uint32_t v = 0; v < ntok; v++) {
+        for (uint32_t i = 0; i < k; i++) x[(size_t)v * k + i] = frnd();
+        xs[v] = x + (size_t)v * k;
+        outs[v] = &got[v];
+    }
+    ds4_test_qwen4_cpu_dot_fp32_batch(type, row, xs, outs, ntok, k);
+    double worst = 0;
+    for (uint32_t v = 0; v < ntok; v++) {
+        const double a = ds4_test_qwen4_cpu_dot(type, row, xs[v], k);
+        const double d = fabs(got[v] - a) / (fabs(a) + 1e-6);
+        if (d > worst) worst = d;
+    }
+    printf("  %-8s fp32 batch x%u vs singolo: worst rel diff %.2e %s\n", name, ntok, worst,
+           worst < 1e-4 ? "ok" : "**FAIL**");
+    free(row); free(x);
+    return worst < 1e-4 ? 0 : 1;
+}
+
 static int check_batch2(void) {
     const uint32_t k = 2560;
     uint32_t per = 0;
@@ -781,6 +820,10 @@ int main(void) {
         for (uint32_t nt = 1; nt <= 16u; nt <<= 1) time_down_mt(nt);
     }
     rc |= check_type(IQ4_NL, "IQ4_NL", 640);   /* down experts (ff -> embd) */
+    rc |= check_fp32_batch(IQ4_NL, "IQ4_NL", 640);
+    rc |= check_fp32_batch(Q2_0, "Q2_0", 640);
+    rc |= check_fp32_batch(IQ4_NL, "IQ4_NL", 2560);
+    rc |= check_fp32_batch(Q2_0, "Q2_0", 2560);
     rc |= check_type(IQ4_NL, "IQ4_NL", 2560);
     rc |= check_type(IQ2_S, "IQ2_S", 2560);    /* gate/up experts */
     rc |= check_type(IQ3_S, "IQ3_S", 2560);
