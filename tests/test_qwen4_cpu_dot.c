@@ -30,6 +30,10 @@ void ds4_test_qwen4_cpu_dot_iq2_xxs_q8k_batch_maddubs(const void *row, const voi
                                                        float *out, uint32_t n, uint32_t k);
 void ds4_test_qwen4_cpu_dot_iq2_xxs_q8k_batch_vnni(const void *row, const void *const *xq,
                                                     float *out, uint32_t n, uint32_t k);
+void ds4_test_qwen4_cpu_dot_iq2_xs_q8k_batch_maddubs(const void *row, const void *const *xq,
+                                                      float *out, uint32_t n, uint32_t k);
+void ds4_test_qwen4_cpu_dot_iq2_xs_q8k_batch_vnni(const void *row, const void *const *xq,
+                                                   float *out, uint32_t n, uint32_t k);
 void ds4_test_qwen4_cpu_dot_q8k_batch2(const void *row0, const void *row1, const void *const *xq,
                                        float *out0, float *out1, uint32_t n, uint32_t k);
 void ds4_test_qwen4_cpu_dot_fp32_batch(uint32_t type, const void *row, const float *const *xs,
@@ -507,26 +511,34 @@ static int check_q8k_batch_variants(uint32_t type, const char *type_name,
     const void *ptrs[8];
     float got[8];
     if (!row || !x || !xq) { free(row); free(x); free(xq); return 1; }
-    fill_row(type, row, k);
-    for (uint32_t b = 0; b < ntok; b++) {
-        for (uint32_t j = 0; j < k; j++) x[j] = frnd();
-        ptrs[b] = xq + (size_t)b * stride;
-        ds4_test_qwen4_quantize_row_q8k(x, xq + (size_t)b * stride, k);
-    }
     const char *name[2] = {name0, name1};
     const q8k_batch_fn fn[2] = {fn0, fn1};
+    double worst[2] = {0, 0}, worst_abs[2] = {0, 0};
     int rc = 0;
-    for (uint32_t v = 0; v < 2u; v++) {
-        double worst = 0;
-        fn[v](row, ptrs, got, ntok, k);
+    /* Vary both packed weights and q8 activations: a bit-order or scale
+     * mistake can accidentally cancel for one synthetic row. */
+    for (uint32_t sample = 0; sample < 16u; sample++) {
+        fill_row(type, row, k);
         for (uint32_t b = 0; b < ntok; b++) {
-            const double ref = ds4_test_qwen4_cpu_dot_q8k(type, row, ptrs[b], k);
-            const double rel = fabs(got[b] - ref) / (fabs(ref) + 1e-6);
-            if (rel > worst) worst = rel;
+            for (uint32_t j = 0; j < k; j++) x[j] = frnd();
+            ptrs[b] = xq + (size_t)b * stride;
+            ds4_test_qwen4_quantize_row_q8k(x, xq + (size_t)b * stride, k);
         }
-        printf("  %s %-7s batch x8 vs singolo: worst rel diff %.2e %s\n", type_name, name[v],
-               worst, worst < 1e-4 ? "ok" : "**FAIL**");
-        if (!(worst < 1e-4)) rc = 1;
+        for (uint32_t v = 0; v < 2u; v++) {
+            fn[v](row, ptrs, got, ntok, k);
+            for (uint32_t b = 0; b < ntok; b++) {
+                const double ref = ds4_test_qwen4_cpu_dot_q8k(type, row, ptrs[b], k);
+                const double abs = fabs(got[b] - ref);
+                const double rel = abs / (fabs(ref) + 1e-6);
+                if (rel > worst[v]) worst[v] = rel;
+                if (abs > worst_abs[v]) worst_abs[v] = abs;
+            }
+        }
+    }
+    for (uint32_t v = 0; v < 2u; v++) {
+        printf("  %s %-7s batch x8 vs singolo (16 casi): worst rel %.2e, abs %.2e %s\n",
+               type_name, name[v], worst[v], worst_abs[v], worst[v] < 1e-4 ? "ok" : "**FAIL**");
+        if (!(worst[v] < 1e-4)) rc = 1;
     }
     free(row); free(x); free(xq);
     return rc;
@@ -918,6 +930,10 @@ int main(void) {
                            "vnni", ds4_test_qwen4_cpu_dot_iq2_xxs_q8k_batch_vnni, 8);
         time_q8k_batch_ab(IQ2_XXS, "IQ2_XXS", "maddubs", ds4_test_qwen4_cpu_dot_iq2_xxs_q8k_batch_maddubs,
                            "vnni", ds4_test_qwen4_cpu_dot_iq2_xxs_q8k_batch_vnni, 4096);
+        time_q8k_batch_ab(IQ2_XS, "IQ2_XS", "maddubs", ds4_test_qwen4_cpu_dot_iq2_xs_q8k_batch_maddubs,
+                           "vnni", ds4_test_qwen4_cpu_dot_iq2_xs_q8k_batch_vnni, 8);
+        time_q8k_batch_ab(IQ2_XS, "IQ2_XS", "maddubs", ds4_test_qwen4_cpu_dot_iq2_xs_q8k_batch_maddubs,
+                           "vnni", ds4_test_qwen4_cpu_dot_iq2_xs_q8k_batch_vnni, 4096);
         /* Tipi di ISTA: se il divario con UD e' la famiglia di kernel (maddubs vs
          * VNNI), questi due numeri lo dicono. */
         time_batch_q8k(IQ2_XXS, "IQ2_XXS", 2560, 8, 8);
@@ -964,6 +980,8 @@ int main(void) {
                                    "vnni", ds4_test_qwen4_cpu_dot_iq3_s_q8k_batch_vnni);
     rc |= check_q8k_batch_variants(IQ2_XXS, "IQ2_XXS", "maddubs", ds4_test_qwen4_cpu_dot_iq2_xxs_q8k_batch_maddubs,
                                    "vnni", ds4_test_qwen4_cpu_dot_iq2_xxs_q8k_batch_vnni);
+    rc |= check_q8k_batch_variants(IQ2_XS, "IQ2_XS", "maddubs", ds4_test_qwen4_cpu_dot_iq2_xs_q8k_batch_maddubs,
+                                   "vnni", ds4_test_qwen4_cpu_dot_iq2_xs_q8k_batch_vnni);
     rc |= check_batch_any(IQ2_S, "IQ2_S", 2560);
     rc |= check_batch2();
     if (rc) {
