@@ -65046,6 +65046,16 @@ static bool qwen4_graph_moe_cpu_prefill(ds4_qwen4_gpu_graph *g, const ds4_model 
         }
         if (cnt) {
             const uint64_t pairs = (uint64_t)s->offsets[ne];
+            uint64_t chunks[9] = {0};
+            for (uint32_t e = 0; e < ne; e++) {
+                for (int32_t base = s->offsets[e]; base < s->offsets[e + 1]; base += 8) {
+                    const uint32_t n = (uint32_t)((s->offsets[e + 1] - base) < 8 ?
+                                                   (s->offsets[e + 1] - base) : 8);
+                    chunks[n]++;
+                }
+            }
+            uint64_t nchunks = 0;
+            for (uint32_t n = 1; n <= 8; n++) nchunks += chunks[n];
             /* Activations re-read: every one of the k_ff gate rows (and the k_ff
              * up rows) walks all of its expert's tokens at k_in*1.14 bytes each. */
             const double act_mb = 2.0 * (double)k_ff * (double)pairs * (double)DS4_N_EMBD * 1.14 / 1e6;
@@ -65061,6 +65071,13 @@ static bool qwen4_graph_moe_cpu_prefill(ds4_qwen4_gpu_graph *g, const ds4_model 
                     wm_mb, wd_mb, (unsigned long long)gate_rb, (unsigned long long)up_rb,
                     (unsigned long long)down_rb, l->ffn_gate_exps->type, l->ffn_up_exps->type,
                     l->ffn_down_exps->type);
+            fprintf(stderr,
+                    "ds4: MoE chunks m1=%llu m2=%llu m3=%llu m4=%llu m5=%llu m6=%llu m7=%llu m8=%llu full=%.1f%%\n",
+                    (unsigned long long)chunks[1], (unsigned long long)chunks[2],
+                    (unsigned long long)chunks[3], (unsigned long long)chunks[4],
+                    (unsigned long long)chunks[5], (unsigned long long)chunks[6],
+                    (unsigned long long)chunks[7], (unsigned long long)chunks[8],
+                    nchunks ? 100.0 * (double)chunks[8] / (double)nchunks : 0.0);
         }
     }
     qwen4_cpu_moe_pf_job job;

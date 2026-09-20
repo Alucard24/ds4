@@ -127,8 +127,11 @@ Restano chiusi i tentativi IQ4_NL split-accumulator (16 thread baseline
 37,42` hot, streamed negativo) e FMA per fasi (`34,60 -> 33,29` hot), quindi
 non sono in albero. Baseline storica isolata a 16 thread: IQ4_NL **163,5** e
 Q2_0 **177,8 GMAC/s** (a 8: 140,8 / 169,3); e' una misura di harness, non
-end-to-end. Qualunque nuovo tentativo deve prima battere il proprio A/B interno,
-poi i test batch e `391` su ISTA prima dell'integrazione.
+end-to-end. Il conteggio reale ISTA T=1746 ha `m=8` per **85,23%** delle
+chiamate batch e **92,87%** delle coppie token-esperto: le code `m<8` sono
+14,77% delle chiamate, quindi non giustificano ancora sette kernel specializzati.
+Qualunque nuovo tentativo deve prima battere il proprio A/B interno, poi i test
+batch e `391` su ISTA prima dell'integrazione.
 
 
 
@@ -210,7 +213,7 @@ echo "$((LAST/1000000000)) GB letti"
 
 | variabile | effetto |
 |---|---|
-| `DS4_QWEN4_MOE_COUNT=1` | stampa il carico reale per chunk (MAC, byte attivazioni, byte pesi) |
+| `DS4_QWEN4_MOE_COUNT=1` | stampa carico reale e istogramma chunk `m=1..8` |
 | `DS4_QWEN4_MID_DUP=1` | esegue i kernel del mid due volte: misura il peso sul cammino critico |
 | `DS4_QWEN4_MID_NOKERNEL=1` | salta i kernel del mid (output spazzatura, solo per profilo) |
 | `DS4_QWEN4_MID_ROWOUTER=1` | ripristina l'ordine riga-esterno (A/B del chunk-esterno) |
