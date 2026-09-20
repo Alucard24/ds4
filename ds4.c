@@ -64243,6 +64243,11 @@ static void qwen4_cpu_moe_pf_mid_rows(void *vjob, uint64_t r0, uint64_t r1) {
                     qwen4_cpu_silu8_mul(va, vb, va);
                     for (uint32_t b = 0; b < m; b++) {
                         const uint32_t t = s->tok_idx[base + (int32_t)b], slot = s->slot_idx[base + (int32_t)b];
+                        /* Store non temporali (NT=1) provate e MISURATE NEGATIVE:
+                         * 46,81 vs 50,57 t/s, mid 476,9 vs 434,0 ms.  Sono 4 byte
+                         * in linee diverse, il caso peggiore per i write-combining
+                         * buffer, e tolgono al down l'hit in L3 sul mid appena
+                         * scritto.  Rimosse. */
                         s->mid[((uint64_t)t * j->ns + slot) * j->k_ff + row] = va[b];
                     }
                 }
