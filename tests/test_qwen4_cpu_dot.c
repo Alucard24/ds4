@@ -464,6 +464,49 @@ static void time_batch2_q8k(uint32_t k, uint32_t ntokens, uint32_t nbufs) {
 }
 
 /* The 2-row kernel must agree with the single-token one on every element. */
+/* Il percorso batch (quello che il prefill usa davvero) non era coperto da
+ * nessun test di correttezza: solo IQ2_S aveva un controllo.  Qui ogni kernel
+ * batch della famiglia viene confrontato, token per token, col kernel a token
+ * singolo - che a sua volta e' validato contro il riferimento indipendente in
+ * check_q8k().  Se un batch legge gli offset sbagliati, questo lo scopre. */
+static int check_batch_any(uint32_t type, const char *name, uint32_t k) {
+    uint32_t per = 0;
+    const uint32_t bs = ds4_test_qwen4_block_bytes(type, &per);
+    const uint32_t q8bs = ds4_test_qwen4_q8k_block_bytes();
+    if (!bs || !q8bs || k % per || k % 256) {
+        fprintf(stderr, "%s batch: bad geometry\n", name);
+        return 1;
+    }
+    const uint32_t nb = k / per, nq = k / 256, ntok = 8u;
+    const size_t stride = (size_t)nq * q8bs;
+    uint8_t *row = malloc((size_t)nb * bs);
+    float *x = malloc((size_t)k * sizeof(float));
+    uint8_t *xq = malloc(stride * ntok);
+    const void *ptrs[8];
+    float got[8];
+    if (!row || !x || !xq) {
+        free(row); free(x); free(xq);
+        return 1;
+    }
+    fill_row(type, row, k);
+    for (uint32_t v = 0; v < ntok; v++) {
+        for (uint32_t i = 0; i < k; i++) x[i] = frnd();
+        ds4_test_qwen4_quantize_row_q8k(x, xq + (size_t)v * stride, k);
+        ptrs[v] = xq + (size_t)v * stride;
+    }
+    ds4_test_qwen4_cpu_dot_q8k_batch(type, row, ptrs, got, ntok, k);
+    double worst = 0;
+    for (uint32_t v = 0; v < ntok; v++) {
+        const double a = ds4_test_qwen4_cpu_dot_q8k(type, row, ptrs[v], k);
+        const double d = fabs(got[v] - a) / (fabs(a) + 1e-6);
+        if (d > worst) worst = d;
+    }
+    printf("  %-8s batch x%u vs singolo: worst rel diff %.2e %s\n", name, ntok, worst,
+           worst < 1e-4 ? "ok" : "**FAIL**");
+    free(row); free(x); free(xq);
+    return worst < 1e-4 ? 0 : 1;
+}
+
 static int check_batch2(void) {
     const uint32_t k = 2560;
     uint32_t per = 0;
@@ -748,6 +791,11 @@ int main(void) {
     rc |= check_q8k(IQ2_XS, "IQ2_XS", 2560);
     rc |= check_q8k(IQ3_XXS, "IQ3_XXS", 2560);
     rc |= check_q8k(IQ3_S, "IQ3_S", 2560);
+    rc |= check_batch_any(IQ2_XXS, "IQ2_XXS", 2560);
+    rc |= check_batch_any(IQ2_XS, "IQ2_XS", 2560);
+    rc |= check_batch_any(IQ3_XXS, "IQ3_XXS", 2560);
+    rc |= check_batch_any(IQ3_S, "IQ3_S", 2560);
+    rc |= check_batch_any(IQ2_S, "IQ2_S", 2560);
     rc |= check_batch2();
     if (rc) {
         printf("test_qwen4_cpu_dot: FAIL\n");

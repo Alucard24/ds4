@@ -6099,7 +6099,13 @@ static void qwen4_cpu_dot_iq2_xxs_q8k_batch(const void *row, const block_q8_K *c
             const __m256i sc1 = _mm256_set1_epi16((short)(2 * (aux32[1] >> 28) + 1));
             const __m256i sc2 = _mm256_set1_epi16((short)(2 * (aux32[3] >> 28) + 1));
             for (uint32_t b = 0; b < n; b++) {
-                const int8_t *q8 = ys[b][i].qs;
+                /* BUG CORRETTO: manca l'offset di ib32.  Ogni iterazione consuma 16
+                 * byte di pesi = 64 valori, quindi le attivazioni vanno lette da
+                 * ib32*32 (32 valori per sottoblocco).  Senza offset il kernel
+                 * rileggeva i primi 64 valori per tutti e 4 i passi del blocco:
+                 * errore relativo misurato 1,11e+01 (test check_batch_any).  Era il
+                 * percorso di produzione di 9 dei 48 layer MoE del modello ISTA. */
+                const int8_t *q8 = ys[b][i].qs + 32 * (int32_t)ib32;
                 const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8);
                 const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)(q8 + 32));
                 const __m256i q8s_1 = _mm256_sign_epi8(q8_1, s2_1);
