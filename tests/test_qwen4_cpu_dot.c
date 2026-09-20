@@ -716,6 +716,12 @@ int main(void) {
         time_batch_q8k(IQ2_S, "IQ2_S", 2560, 16, 4096);
         time_batch_q8k(IQ3_S, "IQ3_S", 2560, 8, 8);
         time_batch_q8k(IQ3_S, "IQ3_S", 2560, 8, 4096);
+        /* Tipi di ISTA: se il divario con UD e' la famiglia di kernel (maddubs vs
+         * VNNI), questi due numeri lo dicono. */
+        time_batch_q8k(IQ2_XXS, "IQ2_XXS", 2560, 8, 8);
+        time_batch_q8k(IQ2_XXS, "IQ2_XXS", 2560, 8, 4096);
+        time_batch_q8k(IQ2_XS, "IQ2_XS", 2560, 8, 8);
+        time_batch_q8k(IQ2_XS, "IQ2_XS", 2560, 8, 4096);
         /* 2 rows x 4 tokens = same 8 MAC-vectors per call as batch x8. */
         time_batch2_q8k(2560, 4, 4);
         time_batch2_q8k(2560, 8, 8);

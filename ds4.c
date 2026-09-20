@@ -64393,12 +64393,18 @@ static bool qwen4_graph_moe_cpu_prefill(ds4_qwen4_gpu_graph *g, const ds4_model 
             /* Activations re-read: every one of the k_ff gate rows (and the k_ff
              * up rows) walks all of its expert's tokens at k_in*1.14 bytes each. */
             const double act_mb = 2.0 * (double)k_ff * (double)pairs * (double)DS4_N_EMBD * 1.14 / 1e6;
-            /* Weights read once per layer: gate+up rows of every expert. */
-            const double w_mb = (double)ne * (double)k_ff * (double)DS4_N_EMBD * 2.0 * 0.2575 / 1e6;
+            /* Pesi letti una volta per layer, calcolati con i byte-riga VERI del
+             * tipo (il vecchio w=432 MB assumeva il bitrate di IQ2_S ed era falso
+             * per ISTA). */
+            const double wm_mb = (double)ne * (double)k_ff * (double)(gate_rb + up_rb) / 1e6;
+            const double wd_mb = (double)ne * (double)DS4_N_EMBD * (double)down_rb / 1e6;
             const double gmac = 2.0 * (double)DS4_N_EMBD * (double)k_ff * (double)pairs / 1e9;
             fprintf(stderr,
-                    "ds4: MoE count T=%u ne=%u ns=%u k_in=%u k_ff=%u pairs=%llu MACs=%.2f GMAC act=%.0f MB w=%.0f MB\n",
-                    T, ne, ns, (unsigned)DS4_N_EMBD, k_ff, (unsigned long long)pairs, gmac, act_mb, w_mb);
+                    "ds4: MoE count T=%u ne=%u ns=%u k_in=%u k_ff=%u pairs=%llu MACs=%.2f GMAC act=%.0f MB wmid=%.0f MB wdown=%.0f MB rb=%llu/%llu/%llu types gate=%u up=%u down=%u\n",
+                    T, ne, ns, (unsigned)DS4_N_EMBD, k_ff, (unsigned long long)pairs, gmac, act_mb,
+                    wm_mb, wd_mb, (unsigned long long)gate_rb, (unsigned long long)up_rb,
+                    (unsigned long long)down_rb, l->ffn_gate_exps->type, l->ffn_up_exps->type,
+                    l->ffn_down_exps->type);
         }
     }
     qwen4_cpu_moe_pf_job job;
