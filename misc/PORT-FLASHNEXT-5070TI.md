@@ -19,7 +19,7 @@ l'ordine della riduzione fp32 (entro `1e-4`, verificato sotto).
 `check_batch_any()` (5 tipi q8k) e `check_fp32_batch()` (down IQ4_NL/Q2_0, k=640 e
 2560): **tutti e 7 i kernel batch sono verificati** contro il percorso a token
 singolo, che e' validato contro un riferimento indipendente in doppia precisione.
-I fallback AVX2/fp32 sono `0.00e+00`; IQ3_S/IQ2_XXS/IQ2_XS VNNI sono entro `1e-4`.
+I fallback AVX2/fp32 sono `0.00e+00`; IQ3_S/IQ2_XXS/IQ2_XS/IQ3_XXS VNNI sono entro `1e-4`.
 Da eseguire **sempre** dopo ogni modifica:
 
 ```sh
@@ -65,7 +65,16 @@ alternati danno mid medio **426,4 -> 411,4 ms/layer (-3,5%)** e prefill medio
 **55,92 -> 56,90 t/s (+1,7%)**; il singolo run resta molto sensibile al warm-up.
 Fallback: `DS4_QWEN4_IQ2XS_VNNI=0`.
 
-**6. Mappa aggiornata del modello ISTA** (i confronti VNNI qui sotto sono A/B
+**6. IQ3_XXS riscritto e tenuto: AVX-512 VNNI batch.** IQ3_XXS e' il tipo di
+**6/48 layer** ISTA. Il suo passo da 64 valori contiene 16 griglie da 4 byte,
+8 pattern di segno e due scale da 32: entra esattamente in uno zmm, poi
+`vpmaddubs + vpdpwssd` sostituisce due catene AVX2. Due A/B nello stesso
+processo danno media **23,06 -> 32,95 GMAC/s L1-hot (+43%)**, **19,12 ->
+24,56 streamed (+29%)**. Nel modello, dopo il warm-up, VNNI `c1` contro AVX2
+`d0`: mid **391,4 vs 435,8 ms/layer (-10,2%)**, prefill **58,62 vs 54,65 t/s
+(+7,3%)**. Fallback: `DS4_QWEN4_IQ3XXS_VNNI=0`.
+
+**7. Mappa aggiornata del modello ISTA** (i confronti VNNI qui sotto sono A/B
 diretti; gli altri rate storici non vanno confrontati fra run):
 
 | tipo | kernel | layer | L1-hot | streamed |
@@ -74,18 +83,19 @@ diretti; gli altri rate storici non vanno confrontati fra run):
 | **IQ3_S** | **VNNI gather + dpwssd** | **13** | **35,22** | **31,43** |
 | IQ2_XXS | **VNNI + dpwssd** | 9 | **47,91** | **30,24** |
 | IQ2_XS | **VNNI + dpwssd** | 10 | **36,09** | **25,34** |
-| IQ3_XXS | maddubs | 6 | 21,4 | 10,0 |
+| IQ3_XXS | **VNNI + dpwssd** | 6 | **32,95** | **24,56** |
 | IQ4_NL / Q2_0 | fp32 (down) | 18 / 30 | — | — |
 
 Carico **identico** a UD (T=1739, ne=512, ns=10, k_in=2560, k_ff=640, pairs=17390,
 56,98 GMAC/chunk): il divario di velocita' e' tutto nel **tipo**, non nel carico
 (UD usa IQ2_S con VNNI; ISTA ha formati con piu' lookup e catene piu' lunghe).
 
-**7. Prossimo bersaglio:** IQ3_XXS (6 layer). IQ3_S, IQ2_XXS e IQ2_XS sono ora
-chiusi: il test verifica sia VNNI sia AVX2 contro il kernel singolo, e il bench
-A/B vive nel medesimo binario. Qualunque nuovo tentativo deve prima battere il
-proprio A/B interno, poi `check_batch_any` e `391` su ISTA prima
-dell'integrazione.
+**8. Primo pass del mid CPU-MoE chiuso:** tutti e cinque i tipi q8k di ISTA
+(IQ2_S, IQ3_S, IQ2_XXS, IQ2_XS, IQ3_XXS) hanno ora il batch VNNI di default.
+Prossimo bersaglio, solo dopo un A/B equivalente: i due kernel fp32 del down
+(IQ4_NL/Q2_0), che occupano tutti i 48 layer. Qualunque nuovo tentativo deve
+prima battere il proprio A/B interno, poi `check_batch_any` e `391` su ISTA
+prima dell'integrazione.
 
 
 
@@ -98,11 +108,11 @@ dell'integrazione.
 | | prefill | note |
 |---|---|---|
 | UD-IQ3_XXS | **55-56,6 t/s** | da **5,5 t/s** a inizio campagna |
-| ISTA GSQ-RCO IQ3_XXS | **53-60 t/s** | IQ3_S + IQ2_XXS + IQ2_XS VNNI; forte dipendenza dal warm-up |
+| ISTA GSQ-RCO IQ3_XXS | **54-60 t/s** | tutti i cinque tipi mid q8k VNNI; forte dipendenza dal warm-up |
 
 `391` corretto su **entrambi** i modelli, `ds4`/`ds4-server` compilati,
 `test_qwen4_cpu_dot` verde; il test verifica esplicitamente VNNI e fallback AVX2
-di IQ3_S, IQ2_XXS e IQ2_XS.
+di IQ3_S, IQ2_XXS, IQ2_XS e IQ3_XXS.
 
 **Comando canonico per misurare** (UD; per ISTA cambia solo `-m`):
 
@@ -1695,7 +1705,7 @@ precisione; AVX2/fp32 esatti, VNNI entro `1e-4`):
 | `iq2_xs_q8k_vnni_batch` | IQ2_XS | 10 | ok (16 casi `<1e-4`; AVX2 fallback esatto) |
 | `iq2_xxs_q8k_vnni_batch` | IQ2_XXS | 9 | ok (16 casi `<1e-4`; AVX2 era **rotto**, corretto) |
 | `iq2_s_q8k_vnni_batch` | IQ2_S | 10 | ok |
-| `iq3_xxs_q8k_batch` | IQ3_XXS | 6 | ok |
+| `iq3_xxs_q8k_vnni_batch` | IQ3_XXS | 6 | ok (16 casi `<1e-4`; AVX2 fallback esatto) |
 | `iq4_nl_batch` (fp32) | IQ4_NL | down di 18 layer | ok |
 | `q2_0_batch` (fp32) | Q2_0 | down di 30 layer | ok |
 
@@ -1827,7 +1837,8 @@ solo gli estremi: VNNI batte l'AVX2 adiacente in entrambi i lati della sequenza
 ### Correttezza
 
 - `check_q8k_batch_variants()` verifica sia `maddubs` sia VNNI per IQ3_S,
-  IQ2_XXS e IQ2_XS su 16 casi; VNNI resta `<1e-4` e AVX2 e' `0.00e+00`.
+  IQ2_XXS, IQ2_XS e IQ3_XXS su 16 casi; VNNI resta `<1e-4` e AVX2 e'
+  `0.00e+00`.
 - Dispatch default verificato; `DS4_QWEN4_IQ2XXS_VNNI=0` e
   `DS4_QWEN4_IQ2XS_VNNI=0` ripristinano AVX2 e passano.
 - `make test-qwen4-cpu-dot`, build `ds4`/`ds4-server`, e `391` su ISTA+UD: verdi.
@@ -1874,6 +1885,45 @@ microkernel e' molto piu' stabile; il prefill medio e' **55,92 -> 56,90 t/s
 ### Correttezza
 
 - `check_q8k_batch_variants()` ora varia 16 volte **sia** pesi sia attivazioni,
-  e confronta VNNI/maddubs con il singolo: IQ2_XS VNNI `<1e-4`, AVX2 `0.00e+00`.
+  e confronta VNNI/maddubs con il singolo per tutti e quattro i nuovi tipi;
+  VNNI `<1e-4`, AVX2 `0.00e+00`.
 - Dispatch default e fallback `DS4_QWEN4_IQ2XS_VNNI=0` sono entrambi verdi.
+- `make test-qwen4-cpu-dot`, build `ds4`/`ds4-server`, e `391` su ISTA+UD: verdi.
+
+## IQ3_XXS: riscrittura VNNI batch, vincente e integrata
+
+Per ogni passo IQ3_XXS da 64 valori ci sono 16 griglie da 4 byte, otto pattern
+di segno da 8 byte e due scale dispari da 32 valori. Il percorso VNNI li fonde
+in uno zmm: i 16 `uint32` della griglia formano le lane, gli otto pattern
+formano una mask byte e `vpmaddubs -> vpdpwssd` riduce direttamente in 16 lane
+int32 per token. Il fattore finale resta `0.25`, come il gemello AVX2.
+
+### A/B del kernel (due run, stesso processo per ciascun A/B)
+
+```
+run 1 hot:      23.78 -> 34.94 GMAC/s  (+47%)
+run 1 streamed: 19.39 -> 25.85 GMAC/s  (+33%)
+run 2 hot:      22.33 -> 30.95 GMAC/s  (+39%)
+run 2 streamed: 18.84 -> 23.26 GMAC/s  (+23%)
+media: hot 23.06 -> 32.95 (+43%), streamed 19.12 -> 24.56 (+29%)
+```
+
+### Campagna modello ISTA (T=1739; gli altri quattro tipi q8k gia' VNNI)
+
+| run | IQ3_XXS VNNI | mid ms/layer | down ms/layer | totale ms/layer | prefill |
+|---|---:|---:|---:|---:|---:|
+| a0 | 0 | 488,0 | 211,0 | 715,8 | 48,61 t/s |
+| b1 | 1 | 398,1 | 183,7 | 598,3 | 57,96 t/s |
+| c1 | 1 | 391,4 | 183,2 | 591,1 | 58,62 t/s |
+| d0 | 0 | 435,8 | 184,5 | 636,7 | 54,65 t/s |
+
+Il primo AVX2 e' freddo, quindi il confronto piu' utile e' `c1 -> d0`: anche
+dopo il warm-up spegnere solo IQ3_XXS VNNI peggiora il **mid del 10,2%** e il
+prefill del **7,3%**. Il segno coincide con entrambi gli A/B interni.
+
+### Correttezza
+
+- `check_q8k_batch_variants()` su 16 pesi/attivazioni: IQ3_XXS VNNI `<1e-4`,
+  fallback AVX2 `0.00e+00`.
+- Dispatch default e `DS4_QWEN4_IQ3XXS_VNNI=0` sono entrambi verdi.
 - `make test-qwen4-cpu-dot`, build `ds4`/`ds4-server`, e `391` su ISTA+UD: verdi.

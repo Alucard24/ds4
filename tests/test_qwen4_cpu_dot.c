@@ -34,6 +34,10 @@ void ds4_test_qwen4_cpu_dot_iq2_xs_q8k_batch_maddubs(const void *row, const void
                                                       float *out, uint32_t n, uint32_t k);
 void ds4_test_qwen4_cpu_dot_iq2_xs_q8k_batch_vnni(const void *row, const void *const *xq,
                                                    float *out, uint32_t n, uint32_t k);
+void ds4_test_qwen4_cpu_dot_iq3_xxs_q8k_batch_maddubs(const void *row, const void *const *xq,
+                                                       float *out, uint32_t n, uint32_t k);
+void ds4_test_qwen4_cpu_dot_iq3_xxs_q8k_batch_vnni(const void *row, const void *const *xq,
+                                                    float *out, uint32_t n, uint32_t k);
 void ds4_test_qwen4_cpu_dot_q8k_batch2(const void *row0, const void *row1, const void *const *xq,
                                        float *out0, float *out1, uint32_t n, uint32_t k);
 void ds4_test_qwen4_cpu_dot_fp32_batch(uint32_t type, const void *row, const float *const *xs,
@@ -934,6 +938,10 @@ int main(void) {
                            "vnni", ds4_test_qwen4_cpu_dot_iq2_xs_q8k_batch_vnni, 8);
         time_q8k_batch_ab(IQ2_XS, "IQ2_XS", "maddubs", ds4_test_qwen4_cpu_dot_iq2_xs_q8k_batch_maddubs,
                            "vnni", ds4_test_qwen4_cpu_dot_iq2_xs_q8k_batch_vnni, 4096);
+        time_q8k_batch_ab(IQ3_XXS, "IQ3_XXS", "maddubs", ds4_test_qwen4_cpu_dot_iq3_xxs_q8k_batch_maddubs,
+                           "vnni", ds4_test_qwen4_cpu_dot_iq3_xxs_q8k_batch_vnni, 8);
+        time_q8k_batch_ab(IQ3_XXS, "IQ3_XXS", "maddubs", ds4_test_qwen4_cpu_dot_iq3_xxs_q8k_batch_maddubs,
+                           "vnni", ds4_test_qwen4_cpu_dot_iq3_xxs_q8k_batch_vnni, 4096);
         /* Tipi di ISTA: se il divario con UD e' la famiglia di kernel (maddubs vs
          * VNNI), questi due numeri lo dicono. */
         time_batch_q8k(IQ2_XXS, "IQ2_XXS", 2560, 8, 8);
@@ -982,6 +990,8 @@ int main(void) {
                                    "vnni", ds4_test_qwen4_cpu_dot_iq2_xxs_q8k_batch_vnni);
     rc |= check_q8k_batch_variants(IQ2_XS, "IQ2_XS", "maddubs", ds4_test_qwen4_cpu_dot_iq2_xs_q8k_batch_maddubs,
                                    "vnni", ds4_test_qwen4_cpu_dot_iq2_xs_q8k_batch_vnni);
+    rc |= check_q8k_batch_variants(IQ3_XXS, "IQ3_XXS", "maddubs", ds4_test_qwen4_cpu_dot_iq3_xxs_q8k_batch_maddubs,
+                                   "vnni", ds4_test_qwen4_cpu_dot_iq3_xxs_q8k_batch_vnni);
     rc |= check_batch_any(IQ2_S, "IQ2_S", 2560);
     rc |= check_batch2();
     if (rc) {
