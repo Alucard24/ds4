@@ -5495,8 +5495,8 @@ static void qwen4_cpu_dot_iq4_nl_batch(const void *row, const float *const *xs, 
     for (uint32_t b = 0; b < n; b++) *outs[b] = _mm512_reduce_add_ps(acc[b]);
 }
 
-static void qwen4_cpu_dot_q2_0_batch(const void *row, const float *const *xs, float *const *outs,
-                                     uint32_t n, uint32_t k) {
+static void qwen4_cpu_dot_q2_0_unpack_batch(const void *row, const float *const *xs, float *const *outs,
+                                            uint32_t n, uint32_t k) {
     const block_q2_0 *blk = (const block_q2_0 *)row;
     const __m128i m3 = _mm_set1_epi8(3);
     if (n == 0u) return;
@@ -5531,6 +5531,75 @@ static void qwen4_cpu_dot_q2_0_batch(const void *row, const float *const *xs, fl
         }
     }
     for (uint32_t b = 0; b < n; b++) *outs[b] = _mm512_reduce_add_ps(acc[b]);
+}
+
+#if defined(__AVX512VBMI__)
+/* AVX-512 VBMI Q2_0 down route. vpmultishiftqb extracts the four 2-bit fields
+ * of each packed byte directly into value order. Four copies of q[0..7] feed
+ * the low 32 values and four copies of q[8..15] the high 32; this replaces the
+ * shift/mask/unpack transpose before the shared batch FMAs. */
+static void qwen4_cpu_dot_q2_0_vbmi_batch(const void *row, const float *const *xs, float *const *outs,
+                                          uint32_t n, uint32_t k) {
+    static const uint8_t k_shift2[64] = {
+        0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30,
+        32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62,
+        0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30,
+        32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62,
+    };
+    const block_q2_0 *blk = (const block_q2_0 *)row;
+    const __m512i shift = _mm512_loadu_si512((const void *)k_shift2);
+    const __m512i repl_idx = _mm512_set_epi64(1, 1, 1, 1, 0, 0, 0, 0);
+    const __m512i m3 = _mm512_set1_epi8(3);
+    if (n == 0u) return;
+    if (n > 8u) n = 8u;
+    __m512 acc[8];
+    for (uint32_t b = 0; b < n; b++) acc[b] = _mm512_setzero_ps();
+    for (uint32_t i = 0; i < k / 64u; i++) {
+        const __m128i q = _mm_loadu_si128((const __m128i *)blk[i].qs);
+        const __m512i qcopy = _mm512_broadcast_i32x4(q);
+        const __m512i qrep = _mm512_permutexvar_epi64(repl_idx, qcopy);
+        const __m512i vals = _mm512_and_si512(_mm512_multishift_epi64_epi8(shift, qrep), m3);
+        const __m512 d = _mm512_set1_ps(f16_to_f32(blk[i].d));
+        const __m128i v0 = _mm512_castsi512_si128(vals);
+        const __m128i v1 = _mm512_extracti32x4_epi32(vals, 1);
+        const __m128i v2 = _mm512_extracti32x4_epi32(vals, 2);
+        const __m128i v3 = _mm512_extracti32x4_epi32(vals, 3);
+        const __m512 g0 = _mm512_fmsub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v0)), d, d);
+        const __m512 g1 = _mm512_fmsub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v1)), d, d);
+        const __m512 g2 = _mm512_fmsub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v2)), d, d);
+        const __m512 g3 = _mm512_fmsub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v3)), d, d);
+        for (uint32_t b = 0; b < n; b++) {
+            const float *y = xs[b] + (uint64_t)i * 64u;
+            acc[b] = _mm512_fmadd_ps(g0, _mm512_loadu_ps(y + 0), acc[b]);
+            acc[b] = _mm512_fmadd_ps(g1, _mm512_loadu_ps(y + 16), acc[b]);
+            acc[b] = _mm512_fmadd_ps(g2, _mm512_loadu_ps(y + 32), acc[b]);
+            acc[b] = _mm512_fmadd_ps(g3, _mm512_loadu_ps(y + 48), acc[b]);
+        }
+    }
+    for (uint32_t b = 0; b < n; b++) *outs[b] = _mm512_reduce_add_ps(acc[b]);
+}
+
+/* Default VBMI on capable builds. Keep the older unpack route for same-binary
+ * diagnosis; DS4_QWEN4_Q20_VBMI=0 disables this route. */
+static bool qwen4_cpu_q2_0_vbmi_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("DS4_QWEN4_Q20_VBMI");
+        enabled = !(e && e[0] == '0');
+    }
+    return enabled != 0;
+}
+#endif
+
+static void qwen4_cpu_dot_q2_0_batch(const void *row, const float *const *xs, float *const *outs,
+                                     uint32_t n, uint32_t k) {
+#if defined(__AVX512VBMI__)
+    if (qwen4_cpu_q2_0_vbmi_enabled()) {
+        qwen4_cpu_dot_q2_0_vbmi_batch(row, xs, outs, n, k);
+        return;
+    }
+#endif
+    qwen4_cpu_dot_q2_0_unpack_batch(row, xs, outs, n, k);
 }
 
 /* Grid rows and sign patterns as fp32: unpacking a grid row to floats costs
@@ -7236,6 +7305,28 @@ void ds4_test_qwen4_cpu_dot_q8k_batch2(const void *row0, const void *row1, const
                                        float *out0, float *out1, uint32_t n, uint32_t k) {
     qwen4_cpu_dot_iq2_s_q8k_vnni_batch2(row0, row1, (const block_q8_K *const *)xq,
                                         out0, out1, n, k);
+}
+
+/* Explicit Q2_0 twins let the test alternate them in the same process;
+ * the normal hook below intentionally continues to test production dispatch. */
+void ds4_test_qwen4_cpu_dot_q2_0_batch_unpack(const void *row, const float *const *xs,
+                                               float *const *outs, uint32_t n, uint32_t k) {
+#if defined(DS4_CPU_AVX512)
+    qwen4_cpu_dot_q2_0_unpack_batch(row, xs, outs, n, k);
+#else
+    qwen4_cpu_row_dot_fp32_batch_store(DS4_TENSOR_Q2_0, row, xs, outs, n, k);
+#endif
+}
+
+void ds4_test_qwen4_cpu_dot_q2_0_batch_vbmi(const void *row, const float *const *xs,
+                                             float *const *outs, uint32_t n, uint32_t k) {
+#if defined(__AVX512VBMI__)
+    qwen4_cpu_dot_q2_0_vbmi_batch(row, xs, outs, n, k);
+#elif defined(DS4_CPU_AVX512)
+    qwen4_cpu_dot_q2_0_unpack_batch(row, xs, outs, n, k);
+#else
+    qwen4_cpu_row_dot_fp32_batch_store(DS4_TENSOR_Q2_0, row, xs, outs, n, k);
+#endif
 }
 
 /* Down phase in isolation: fp32 activations against one weight row, n tokens. */

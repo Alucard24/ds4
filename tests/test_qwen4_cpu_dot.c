@@ -42,6 +42,10 @@ void ds4_test_qwen4_cpu_dot_q8k_batch2(const void *row0, const void *row1, const
                                        float *out0, float *out1, uint32_t n, uint32_t k);
 void ds4_test_qwen4_cpu_dot_fp32_batch(uint32_t type, const void *row, const float *const *xs,
                                        float *const *outs, uint32_t n, uint32_t k);
+void ds4_test_qwen4_cpu_dot_q2_0_batch_unpack(const void *row, const float *const *xs,
+                                               float *const *outs, uint32_t n, uint32_t k);
+void ds4_test_qwen4_cpu_dot_q2_0_batch_vbmi(const void *row, const float *const *xs,
+                                             float *const *outs, uint32_t n, uint32_t k);
 float ds4_test_qwen4_ref_dot_q8k(uint32_t type, const void *row, const void *yq, uint32_t k);
 float ds4_test_qwen4_cpu_dot_q8k_maddubs(uint32_t type, const void *row, const void *yq, uint32_t k);
 float ds4_test_qwen4_cpu_dot_q8k_vnni(uint32_t type, const void *row, const void *yq, uint32_t k);
@@ -496,6 +500,102 @@ static void time_q8k_batch_ab(uint32_t type, const char *type_name,
     free(row); free(x); free(xq);
 }
 
+/* Direct fp32-down A/B. The down phase reuses one quantized weight row over
+ * eight mid vectors, so this isolates exactly the production inner call. */
+typedef void (*fp32_batch_fn)(const void *row, const float *const *xs, float *const *outs,
+                              uint32_t n, uint32_t k);
+
+static void time_fp32_batch_ab(uint32_t type, const char *type_name,
+                               const char *name0, fp32_batch_fn fn0,
+                               const char *name1, fp32_batch_fn fn1,
+                               uint32_t nbufs) {
+    const uint32_t k = 640u, ntok = 8u;
+    uint32_t per = 0;
+    const uint32_t bs = ds4_test_qwen4_block_bytes(type, &per);
+    if (!bs || k % per || nbufs < ntok) return;
+    const uint32_t nb = k / per;
+    uint8_t *row = malloc((size_t)nb * bs);
+    float *x = malloc((size_t)nbufs * k * sizeof(*x));
+    const float *xs[8];
+    float out[8], *outs[8];
+    if (!row || !x) { free(row); free(x); return; }
+    fill_row(type, row, k);
+    for (uint32_t v = 0; v < nbufs; v++)
+        for (uint32_t j = 0; j < k; j++) x[(size_t)v * k + j] = frnd();
+    for (uint32_t b = 0; b < ntok; b++) outs[b] = &out[b];
+    const char *name[2] = {name0, name1};
+    const fp32_batch_fn fn[2] = {fn0, fn1};
+    const uint32_t reps = nbufs == ntok ? 1500000u : 800000u;
+    double best[2] = {1e30, 1e30}, sink[2] = {0, 0};
+    for (uint32_t pass = 0; pass < 6u; pass++) {
+        for (uint32_t order = 0; order < 2u; order++) {
+            const uint32_t v = (pass + order) & 1u;
+            const double t0 = now_s();
+            double local = 0;
+            for (uint32_t r = 0; r < reps; r++) {
+                const uint32_t base = nbufs == ntok ? 0u : (r * ntok) % nbufs;
+                for (uint32_t b = 0; b < ntok; b++)
+                    xs[b] = x + (size_t)((base + b) % nbufs) * k;
+                fn[v](row, xs, outs, ntok, k);
+                local += out[r & 7u];
+            }
+            const double dt = now_s() - t0;
+            if (dt < best[v]) best[v] = dt;
+            sink[v] += local;
+        }
+    }
+    for (uint32_t v = 0; v < 2u; v++) {
+        printf("  %s fp32 A/B %-7s x8 nbuf=%-4u %s: %.2f GMAC/s (sink %g)\n",
+               type_name, name[v], nbufs, nbufs == ntok ? "L1-hot" : "streamed",
+               (double)k * ntok * reps / best[v] / 1e9, sink[v]);
+    }
+    free(row); free(x);
+}
+
+static int check_fp32_batch_variants(uint32_t type, const char *type_name,
+                                     const char *name0, fp32_batch_fn fn0,
+                                     const char *name1, fp32_batch_fn fn1) {
+    const uint32_t k = 640u, ntok = 8u;
+    uint32_t per = 0;
+    const uint32_t bs = ds4_test_qwen4_block_bytes(type, &per);
+    if (!bs || k % per) return 1;
+    const uint32_t nb = k / per;
+    uint8_t *row = malloc((size_t)nb * bs);
+    float *x = malloc((size_t)ntok * k * sizeof(*x));
+    const float *xs[8];
+    float got[8], *outs[8];
+    if (!row || !x) { free(row); free(x); return 1; }
+    for (uint32_t b = 0; b < ntok; b++) outs[b] = &got[b];
+    const char *name[2] = {name0, name1};
+    const fp32_batch_fn fn[2] = {fn0, fn1};
+    double worst[2] = {0, 0}, worst_abs[2] = {0, 0};
+    for (uint32_t sample = 0; sample < 16u; sample++) {
+        fill_row(type, row, k);
+        for (uint32_t b = 0; b < ntok; b++) {
+            for (uint32_t j = 0; j < k; j++) x[(size_t)b * k + j] = frnd();
+            xs[b] = x + (size_t)b * k;
+        }
+        for (uint32_t v = 0; v < 2u; v++) {
+            fn[v](row, xs, outs, ntok, k);
+            for (uint32_t b = 0; b < ntok; b++) {
+                const double ref = ds4_test_qwen4_cpu_dot(type, row, xs[b], k);
+                const double abs = fabs(got[b] - ref);
+                const double rel = abs / (fabs(ref) + 1e-6);
+                if (rel > worst[v]) worst[v] = rel;
+                if (abs > worst_abs[v]) worst_abs[v] = abs;
+            }
+        }
+    }
+    int rc = 0;
+    for (uint32_t v = 0; v < 2u; v++) {
+        printf("  %s fp32 %-7s batch x8 vs singolo (16 casi): worst rel %.2e, abs %.2e %s\n",
+               type_name, name[v], worst[v], worst_abs[v], worst[v] < 1e-4 ? "ok" : "**FAIL**");
+        if (!(worst[v] < 1e-4)) rc = 1;
+    }
+    free(row); free(x);
+    return rc;
+}
+
 /* Both explicit batch implementations must agree with the trusted
  * single-token packed kernel.  check_batch_any() additionally covers the
  * default/env dispatch. */
@@ -915,6 +1015,10 @@ int main(void) {
         time_type_q8k(IQ3_S, "IQ3_S", 2560);
         time_type(IQ4_NL, "IQ4_NL", 640);
         time_type(Q2_0, "Q2_0", 640);
+        time_fp32_batch_ab(Q2_0, "Q2_0", "unpack", ds4_test_qwen4_cpu_dot_q2_0_batch_unpack,
+                            "vbmi", ds4_test_qwen4_cpu_dot_q2_0_batch_vbmi, 8);
+        time_fp32_batch_ab(Q2_0, "Q2_0", "unpack", ds4_test_qwen4_cpu_dot_q2_0_batch_unpack,
+                            "vbmi", ds4_test_qwen4_cpu_dot_q2_0_batch_vbmi, 4096);
         time_type(IQ3_S, "IQ3_S", 2560);
         /* Batched mid path: hot vs streamed activation set. */
         time_batch_q8k(IQ2_S, "IQ2_S", 2560, 8, 8);
@@ -971,6 +1075,8 @@ int main(void) {
     rc |= check_type(IQ4_NL, "IQ4_NL", 640);   /* down experts (ff -> embd) */
     rc |= check_fp32_batch(IQ4_NL, "IQ4_NL", 640);
     rc |= check_fp32_batch(Q2_0, "Q2_0", 640);
+    rc |= check_fp32_batch_variants(Q2_0, "Q2_0", "unpack", ds4_test_qwen4_cpu_dot_q2_0_batch_unpack,
+                                    "vbmi", ds4_test_qwen4_cpu_dot_q2_0_batch_vbmi);
     rc |= check_fp32_batch(IQ4_NL, "IQ4_NL", 2560);
     rc |= check_fp32_batch(Q2_0, "Q2_0", 2560);
     rc |= check_type(IQ4_NL, "IQ4_NL", 2560);

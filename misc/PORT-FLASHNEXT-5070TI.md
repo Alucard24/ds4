@@ -19,7 +19,8 @@ l'ordine della riduzione fp32 (entro `1e-4`, verificato sotto).
 `check_batch_any()` (5 tipi q8k) e `check_fp32_batch()` (down IQ4_NL/Q2_0, k=640 e
 2560): **tutti e 7 i kernel batch sono verificati** contro il percorso a token
 singolo, che e' validato contro un riferimento indipendente in doppia precisione.
-I fallback AVX2/fp32 sono `0.00e+00`; IQ3_S/IQ2_XXS/IQ2_XS/IQ3_XXS VNNI sono entro `1e-4`.
+I fallback AVX2/fp32 e Q2_0 VBMI sono `0.00e+00`; IQ3_S/IQ2_XXS/IQ2_XS/IQ3_XXS
+VNNI sono entro `1e-4`.
 Da eseguire **sempre** dopo ogni modifica:
 
 ```sh
@@ -74,7 +75,15 @@ processo danno media **23,06 -> 32,95 GMAC/s L1-hot (+43%)**, **19,12 ->
 `d0`: mid **391,4 vs 435,8 ms/layer (-10,2%)**, prefill **58,62 vs 54,65 t/s
 (+7,3%)**. Fallback: `DS4_QWEN4_IQ3XXS_VNNI=0`.
 
-**7. Mappa aggiornata del modello ISTA** (i confronti VNNI qui sotto sono A/B
+**7. Q2_0 down riscritto e tenuto: AVX-512 VBMI.** Q2_0 e' il down di
+**30/48 layer** ISTA. `vpmultishiftqb` estrae direttamente i 64 campi a 2 bit
+nell'ordine dei valori, eliminando shift/mask/unpack prima delle FMA batch.
+A/B ripetuto nello stesso processo: hot medio **34,82 -> 37,42 GMAC/s (+7,5%)**;
+streamed neutro (**11,78 -> 11,81**), come atteso fuori cache. Nel modello,
+sequenza AVX2 -> VBMI -> VBMI -> AVX2: down medio **186,5 -> 173,6 ms/layer
+(-6,9%)**. Fallback: `DS4_QWEN4_Q20_VBMI=0`.
+
+**8. Mappa aggiornata del modello ISTA** (i confronti VNNI qui sotto sono A/B
 diretti; gli altri rate storici non vanno confrontati fra run):
 
 | tipo | kernel | layer | L1-hot | streamed |
@@ -84,19 +93,19 @@ diretti; gli altri rate storici non vanno confrontati fra run):
 | IQ2_XXS | **VNNI + dpwssd** | 9 | **47,91** | **30,24** |
 | IQ2_XS | **VNNI + dpwssd** | 10 | **36,09** | **25,34** |
 | IQ3_XXS | **VNNI + dpwssd** | 6 | **32,95** | **24,56** |
-| IQ4_NL / Q2_0 | fp32 (down) | 18 / 30 | — | — |
+| IQ4_NL / Q2_0 | fp32 / **VBMI** (down) | 18 / 30 | — / **37,42** | — / **11,81** |
 
 Carico **identico** a UD (T=1739, ne=512, ns=10, k_in=2560, k_ff=640, pairs=17390,
 56,98 GMAC/chunk): il divario di velocita' e' tutto nel **tipo**, non nel carico
 (UD usa IQ2_S con VNNI; ISTA ha formati con piu' lookup e catene piu' lunghe).
 
-**8. Primo pass del mid CPU-MoE chiuso:** tutti e cinque i tipi q8k di ISTA
-(IQ2_S, IQ3_S, IQ2_XXS, IQ2_XS, IQ3_XXS) hanno ora il batch VNNI di default.
-Prossimo bersaglio, solo dopo un A/B equivalente: i due kernel fp32 del down
-(IQ4_NL/Q2_0), che occupano tutti i 48 layer. Baseline isolata a 16 thread:
-IQ4_NL **163,5** e Q2_0 **177,8 GMAC/s** (a 8: 140,8 / 169,3); e' una misura
-di harness, non un risultato end-to-end. Qualunque nuovo tentativo deve prima
-battere il proprio A/B interno, poi `check_batch_any` e `391` su ISTA prima
+**9. Mid chiuso, Q2_0 down chiuso:** tutti e cinque i tipi q8k di ISTA hanno
+il batch VNNI di default e Q2_0 down ha VBMI. Resta IQ4_NL (18 layer), ma il
+primo tentativo split-accumulator e' stato chiuso: 16 thread baseline `157/153`
+contro split `153/141 GMAC/s`, quindi non e' in albero. Baseline isolata a 16
+thread: IQ4_NL **163,5** e Q2_0 **177,8 GMAC/s** (a 8: 140,8 / 169,3); e' una
+misura di harness, non end-to-end. Qualunque nuovo tentativo deve prima battere
+il proprio A/B interno, poi `check_batch_any` e `391` su ISTA prima
 dell'integrazione.
 
 
@@ -110,11 +119,11 @@ dell'integrazione.
 | | prefill | note |
 |---|---|---|
 | UD-IQ3_XXS | **55-56,6 t/s** | da **5,5 t/s** a inizio campagna |
-| ISTA GSQ-RCO IQ3_XXS | **54-60 t/s** | tutti i cinque tipi mid q8k VNNI; forte dipendenza dal warm-up |
+| ISTA GSQ-RCO IQ3_XXS | **54-62 t/s** | mid VNNI + Q2_0 down VBMI; forte dipendenza dal warm-up |
 
 `391` corretto su **entrambi** i modelli, `ds4`/`ds4-server` compilati,
 `test_qwen4_cpu_dot` verde; il test verifica esplicitamente VNNI e fallback AVX2
-di IQ3_S, IQ2_XXS, IQ2_XS e IQ3_XXS.
+di IQ3_S, IQ2_XXS, IQ2_XS, IQ3_XXS e Q2_0.
 
 **Comando canonico per misurare** (UD; per ISTA cambia solo `-m`):
 
@@ -144,6 +153,7 @@ DS4_CUDA_WEIGHT_CACHE_LIMIT_GB=6 DS4_QWEN4_MOE_PROFILE=1 ./ds4 -m <gguf> \
 | staging L1 + flush contiguo | +1,2% = rumore |
 | chunk da 16 token | +6% di tetto nel bench, rompe la residenza L1 |
 | VNNI storico B=16 / accumulatore vettoriale | negativo; non e' il nuovo VNNI x8 di IQ3_S/IQ2_XXS |
+| IQ4_NL split-accumulator | 16 thread: baseline `157/153`, split `153/141` GMAC/s; rimosso |
 
 **Dove siamo, quantificato**: mid e down stanno all'**86-92%** e **76%** dei tetti
 riprodotti nella loro stessa configurazione (bench `time_model_like_mt`,
@@ -1709,7 +1719,7 @@ precisione; AVX2/fp32 esatti, VNNI entro `1e-4`):
 | `iq2_s_q8k_vnni_batch` | IQ2_S | 10 | ok |
 | `iq3_xxs_q8k_vnni_batch` | IQ3_XXS | 6 | ok (16 casi `<1e-4`; AVX2 fallback esatto) |
 | `iq4_nl_batch` (fp32) | IQ4_NL | down di 18 layer | ok |
-| `q2_0_batch` (fp32) | Q2_0 | down di 30 layer | ok |
+| `q2_0_vbmi_batch` (fp32) | Q2_0 | down di 30 layer | ok (VBMI/unpack esatti) |
 
 Da eseguire **sempre** dopo ogni modifica a questi kernel:
 ```sh
@@ -1929,3 +1939,47 @@ prefill del **7,3%**. Il segno coincide con entrambi gli A/B interni.
   fallback AVX2 `0.00e+00`.
 - Dispatch default e `DS4_QWEN4_IQ3XXS_VNNI=0` sono entrambi verdi.
 - `make test-qwen4-cpu-dot`, build `ds4`/`ds4-server`, e `391` su ISTA+UD: verdi.
+
+## Q2_0 down: unpack VBMI, vincente e integrato
+
+Q2_0 memorizza quattro valori a 2 bit in ogni byte. Il vecchio batch crea
+quattro stream con shift/mask e poi li trasponde con otto unpack SSE. Il nuovo
+percorso, disponibile su compilazioni AVX-512VBMI, replica q[0..7] in quattro
+lane a 64 bit e q[8..15] nelle altre quattro; `vpmultishiftqb` con shift
+`0,2,...,62` produce gia' i 64 valori in ordine. Il resto (conversione fp32,
+`(q-1)*d`, FMA e riduzione) resta identico, perciò il risultato e' bit-esatto.
+
+### A/B diretto fp32 (stesso processo, stessa riga e mid)
+
+```
+run 1 hot:      34.15 -> 36.37 GMAC/s  (+6.5%)
+run 1 streamed: 11.76 -> 11.74 GMAC/s  (neutro)
+run 2 hot:      35.48 -> 38.46 GMAC/s  (+8.4%)
+run 2 streamed: 11.80 -> 11.87 GMAC/s  (neutro)
+media: hot 34.82 -> 37.42 (+7.5%), streamed 11.78 -> 11.81
+```
+
+Il down reale riusa i vettori `mid` di 8 token attraverso le righe dell'esperto,
+quindi il caso hot e' il predittore utile; lo streamed non e' un criterio di
+accettazione per questo route.
+
+### Campagna modello ISTA (T=1739; tutti i mid VNNI)
+
+| run | Q2_0 VBMI | mid ms/layer | down ms/layer | totale ms/layer | prefill |
+|---|---:|---:|---:|---:|---:|
+| a0 | 0 | 421,9 | 194,4 | 634,4 | 54,03 t/s |
+| b1 | 1 | 422,8 | 182,0 | 623,5 | 54,93 t/s |
+| c1 | 1 | 366,0 | 165,1 | 548,4 | 62,48 t/s |
+| d0 | 0 | 380,3 | 178,5 | 577,1 | 59,05 t/s |
+
+In entrambe le transizioni la sola attivazione VBMI riduce il down: **−6,4%**
+(a0->b1) e **−7,5%** (d0 rispetto a c1). Media: **186,5 -> 173,6 ms/layer
+(−6,9%)**. Il resto del sistema ha warm-up/varianza, quindi il dato conservato
+e' il down coerente, non la singola punta di prefill.
+
+### Correttezza e rollback
+
+- `check_fp32_batch_variants()` alterna unpack/VBMI su 16 righe+attivazioni:
+  entrambi `0.00e+00` contro il singolo.
+- Il dispatch default e `DS4_QWEN4_Q20_VBMI=0` sono entrambi verdi.
+- `make test-qwen4-cpu-dot`, build `ds4`/`ds4-server`, `391` ISTA+UD: verdi.
