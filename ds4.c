@@ -64144,12 +64144,20 @@ static void qwen4_cpu_silu8_mul(const float *a, const float *y, float *out) {
         return;
     }
 #if defined(__AVX512F__)
-    const __m512 x = _mm512_loadu_ps(a);
-    const __m512 yy = _mm512_loadu_ps(y);
+    /* Solo 8 lane sono significative: leggi e scrivi 32 byte.  Prima faceva
+     * load/store a 512 bit (64 byte) su array dichiarati float[8] dai
+     * chiamanti: leggeva oltre e scriveva oltre.  Nel percorso a riga singola
+     * i 32 byte in piu' finivano nell'array adiacente (morto) e non si vedeva;
+     * nel percorso a 2 righe del mid l'oggetto adiacente e' l'array dei
+     * puntatori q8, che veniva corrotto -> segfault con xq[0] = 0x3786230d.
+     * La maschera non cambia i risultati delle 8 lane valide. */
+    const __mmask16 m8 = (__mmask16)0x00FF;
+    const __m512 x = _mm512_maskz_loadu_ps(m8, a);
+    const __m512 yy = _mm512_maskz_loadu_ps(m8, y);
     const __m512 one = _mm512_set1_ps(1.0f);
     const __m512 e = qwen4_cpu_exp512(_mm512_sub_ps(_mm512_setzero_ps(), x));
     const __m512 sig = _mm512_div_ps(one, _mm512_add_ps(one, e));
-    _mm512_storeu_ps(out, _mm512_mul_ps(_mm512_mul_ps(x, sig), yy));
+    _mm512_mask_storeu_ps(out, m8, _mm512_mul_ps(_mm512_mul_ps(x, sig), yy));
 #else
     for (int i = 0; i < 8; i++) out[i] = silu(a[i]) * y[i];
 #endif
@@ -64216,6 +64224,14 @@ static void qwen4_cpu_moe_pf_mid_rows(void *vjob, uint64_t r0, uint64_t r1) {
                  *
                  * Il codice della variante e' in git: commit 640decf (bench) e il
                  * kernel `qwen4_cpu_dot_iq2_s_q8k_vnni_batch2` (~ds4.c:6690). */
+/* 2 righe: provate di nuovo DOPO aver corretto il bug di silu8 (che
+                 * faceva store a 512 bit su array float[8] e corrompeva l'xq
+                 * adiacente: era quella la causa del segfault).  Senza crash la
+                 * misura in-modello e' NEGATIVA: 51,09 t/s contro 56,09, mid
+                 * 438,8 vs 389,7 ms (+12,6%), perche' l'assembly e' per riga e
+                 * raddoppia per token, mentre i byte di attivazioni risparmiati
+                 * non erano il collo (coerente con tutti i test di oggi).
+                 * Il kernel resta in albero e validato, usato dal bench. */
                 uint64_t R2 = R;
                 for (; R2 < rend; R2++) {
                     const uint32_t row = (uint32_t)(R2 % j->k_ff);
