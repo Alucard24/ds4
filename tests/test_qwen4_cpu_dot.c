@@ -50,6 +50,8 @@ void ds4_test_qwen4_cpu_dot_q2_0_batch_unpack(const void *row, const float *cons
                                                float *const *outs, uint32_t n, uint32_t k);
 void ds4_test_qwen4_cpu_dot_q2_0_batch_vbmi(const void *row, const float *const *xs,
                                              float *const *outs, uint32_t n, uint32_t k);
+void ds4_test_qwen4_cpu_dot_q2_0_batch_vbmi8(const void *row, const float *const *xs,
+                                              float *const *outs, uint32_t n, uint32_t k);
 float ds4_test_qwen4_ref_dot_q8k(uint32_t type, const void *row, const void *yq, uint32_t k);
 float ds4_test_qwen4_cpu_dot_q8k_maddubs(uint32_t type, const void *row, const void *yq, uint32_t k);
 float ds4_test_qwen4_cpu_dot_q8k_vnni(uint32_t type, const void *row, const void *yq, uint32_t k);
@@ -1017,6 +1019,7 @@ int main(void) {
         for (int t = 1; t <= 16; t *= (t == 1 ? 8 : 2)) bench_parallel(256, t);
     }
     if (getenv("DS4_BENCH_DOT")) {
+        const uint32_t rng_before_bench = rng;
         g_bench_mid = calloc((size_t)16u * 2560u, sizeof(float));
         /* Mixed shapes as they appear in a layer: gate+up (IQ2_S x2) and
          * down (IQ4_NL).  Timing only; values are not checked here. */
@@ -1036,6 +1039,10 @@ int main(void) {
                             "vbmi", ds4_test_qwen4_cpu_dot_q2_0_batch_vbmi, 8);
         time_fp32_batch_ab(Q2_0, "Q2_0", "unpack", ds4_test_qwen4_cpu_dot_q2_0_batch_unpack,
                             "vbmi", ds4_test_qwen4_cpu_dot_q2_0_batch_vbmi, 4096);
+        time_fp32_batch_ab(Q2_0, "Q2_0", "vbmi", ds4_test_qwen4_cpu_dot_q2_0_batch_vbmi,
+                            "vbmi8", ds4_test_qwen4_cpu_dot_q2_0_batch_vbmi8, 8);
+        time_fp32_batch_ab(Q2_0, "Q2_0", "vbmi", ds4_test_qwen4_cpu_dot_q2_0_batch_vbmi,
+                            "vbmi8", ds4_test_qwen4_cpu_dot_q2_0_batch_vbmi8, 4096);
         time_type(IQ3_S, "IQ3_S", 2560);
         /* Batched mid path: hot vs streamed activation set. */
         time_batch_q8k(IQ2_S, "IQ2_S", 2560, 8, 8);
@@ -1088,6 +1095,7 @@ int main(void) {
             time_down_mt(IQ4_NL, "IQ4_NL", nt);
             time_down_mt(Q2_0, "Q2_0", nt);
         }
+        rng = rng_before_bench;  /* Bench data must not alter regression vectors. */
     }
     rc |= check_type(IQ4_NL, "IQ4_NL", 640);   /* down experts (ff -> embd) */
     rc |= check_fp32_batch(IQ4_NL, "IQ4_NL", 640);
@@ -1096,6 +1104,8 @@ int main(void) {
     rc |= check_fp32_batch(Q2_0, "Q2_0", 640);
     rc |= check_fp32_batch_variants(Q2_0, "Q2_0", "unpack", ds4_test_qwen4_cpu_dot_q2_0_batch_unpack,
                                     "vbmi", ds4_test_qwen4_cpu_dot_q2_0_batch_vbmi);
+    rc |= check_fp32_batch_variants(Q2_0, "Q2_0", "vbmi", ds4_test_qwen4_cpu_dot_q2_0_batch_vbmi,
+                                    "vbmi8", ds4_test_qwen4_cpu_dot_q2_0_batch_vbmi8);
     rc |= check_fp32_batch(IQ4_NL, "IQ4_NL", 2560);
     rc |= check_fp32_batch(Q2_0, "Q2_0", 2560);
     rc |= check_type(IQ4_NL, "IQ4_NL", 2560);

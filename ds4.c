@@ -5634,6 +5634,56 @@ static void qwen4_cpu_dot_q2_0_vbmi_batch(const void *row, const float *const *x
     for (uint32_t b = 0; b < n; b++) *outs[b] = _mm512_reduce_add_ps(acc[b]);
 }
 
+/* Full-chunk twin of the VBMI route.  As in IQ4_NL batch8, compile-time m=8
+ * removes the generic tail checks and keeps all activation bases in registers. */
+static void qwen4_cpu_dot_q2_0_vbmi_batch8(const void *row, const float *const *xs, float *const *outs,
+                                           uint32_t k) {
+    static const uint8_t k_shift2[64] = {
+        0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30,
+        32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62,
+        0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30,
+        32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62,
+    };
+    const block_q2_0 *blk = (const block_q2_0 *)row;
+    const __m512i shift = _mm512_loadu_si512((const void *)k_shift2);
+    const __m512i repl_idx = _mm512_set_epi64(1, 1, 1, 1, 0, 0, 0, 0);
+    const __m512i m3 = _mm512_set1_epi8(3);
+    const float *x0 = xs[0], *x1 = xs[1], *x2 = xs[2], *x3 = xs[3];
+    const float *x4 = xs[4], *x5 = xs[5], *x6 = xs[6], *x7 = xs[7];
+    __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
+    __m512 a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
+    __m512 a4 = _mm512_setzero_ps(), a5 = _mm512_setzero_ps();
+    __m512 a6 = _mm512_setzero_ps(), a7 = _mm512_setzero_ps();
+    for (uint32_t i = 0; i < k / 64u; i++) {
+        const __m128i q = _mm_loadu_si128((const __m128i *)blk[i].qs);
+        const __m512i qcopy = _mm512_broadcast_i32x4(q);
+        const __m512i qrep = _mm512_permutexvar_epi64(repl_idx, qcopy);
+        const __m512i vals = _mm512_and_si512(_mm512_multishift_epi64_epi8(shift, qrep), m3);
+        const __m512 d = _mm512_set1_ps(f16_to_f32(blk[i].d));
+        const __m128i v0 = _mm512_castsi512_si128(vals);
+        const __m128i v1 = _mm512_extracti32x4_epi32(vals, 1);
+        const __m128i v2 = _mm512_extracti32x4_epi32(vals, 2);
+        const __m128i v3 = _mm512_extracti32x4_epi32(vals, 3);
+        const __m512 g0 = _mm512_fmsub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v0)), d, d);
+        const __m512 g1 = _mm512_fmsub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v1)), d, d);
+        const __m512 g2 = _mm512_fmsub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v2)), d, d);
+        const __m512 g3 = _mm512_fmsub_ps(_mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v3)), d, d);
+#define Q20_FMA8(a, x) do { \
+        (a) = _mm512_fmadd_ps(g0, _mm512_loadu_ps((x) + (uint64_t)i * 64u + 0u), (a)); \
+        (a) = _mm512_fmadd_ps(g1, _mm512_loadu_ps((x) + (uint64_t)i * 64u + 16u), (a)); \
+        (a) = _mm512_fmadd_ps(g2, _mm512_loadu_ps((x) + (uint64_t)i * 64u + 32u), (a)); \
+        (a) = _mm512_fmadd_ps(g3, _mm512_loadu_ps((x) + (uint64_t)i * 64u + 48u), (a)); \
+    } while (0)
+        Q20_FMA8(a0, x0); Q20_FMA8(a1, x1); Q20_FMA8(a2, x2); Q20_FMA8(a3, x3);
+        Q20_FMA8(a4, x4); Q20_FMA8(a5, x5); Q20_FMA8(a6, x6); Q20_FMA8(a7, x7);
+#undef Q20_FMA8
+    }
+    *outs[0] = _mm512_reduce_add_ps(a0); *outs[1] = _mm512_reduce_add_ps(a1);
+    *outs[2] = _mm512_reduce_add_ps(a2); *outs[3] = _mm512_reduce_add_ps(a3);
+    *outs[4] = _mm512_reduce_add_ps(a4); *outs[5] = _mm512_reduce_add_ps(a5);
+    *outs[6] = _mm512_reduce_add_ps(a6); *outs[7] = _mm512_reduce_add_ps(a7);
+}
+
 /* Default VBMI on capable builds. Keep the older unpack route for same-binary
  * diagnosis; DS4_QWEN4_Q20_VBMI=0 disables this route. */
 static bool qwen4_cpu_q2_0_vbmi_enabled(void) {
@@ -5650,7 +5700,8 @@ static void qwen4_cpu_dot_q2_0_batch(const void *row, const float *const *xs, fl
                                      uint32_t n, uint32_t k) {
 #if defined(__AVX512VBMI__)
     if (qwen4_cpu_q2_0_vbmi_enabled()) {
-        qwen4_cpu_dot_q2_0_vbmi_batch(row, xs, outs, n, k);
+        if (n == 8u) qwen4_cpu_dot_q2_0_vbmi_batch8(row, xs, outs, k);
+        else qwen4_cpu_dot_q2_0_vbmi_batch(row, xs, outs, n, k);
         return;
     }
 #endif
@@ -7397,6 +7448,18 @@ void ds4_test_qwen4_cpu_dot_q2_0_batch_vbmi(const void *row, const float *const 
                                              float *const *outs, uint32_t n, uint32_t k) {
 #if defined(__AVX512VBMI__)
     qwen4_cpu_dot_q2_0_vbmi_batch(row, xs, outs, n, k);
+#elif defined(DS4_CPU_AVX512)
+    qwen4_cpu_dot_q2_0_unpack_batch(row, xs, outs, n, k);
+#else
+    qwen4_cpu_row_dot_fp32_batch_store(DS4_TENSOR_Q2_0, row, xs, outs, n, k);
+#endif
+}
+
+void ds4_test_qwen4_cpu_dot_q2_0_batch_vbmi8(const void *row, const float *const *xs,
+                                              float *const *outs, uint32_t n, uint32_t k) {
+#if defined(__AVX512VBMI__)
+    if (n == 8u) qwen4_cpu_dot_q2_0_vbmi_batch8(row, xs, outs, k);
+    else qwen4_cpu_dot_q2_0_vbmi_batch(row, xs, outs, n, k);
 #elif defined(DS4_CPU_AVX512)
     qwen4_cpu_dot_q2_0_unpack_batch(row, xs, outs, n, k);
 #else
