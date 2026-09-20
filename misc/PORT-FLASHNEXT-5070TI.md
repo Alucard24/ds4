@@ -123,8 +123,8 @@ Carico **identico** a UD (T=1739, ne=512, ns=10, k_in=2560, k_ff=640, pairs=1739
 **10. Mid e down chiusi:** tutti e cinque i tipi q8k di ISTA hanno il batch
 VNNI di default; Q2_0 down ha VBMI batch8 e IQ4_NL usa batch8 per i chunk pieni.
 Restano chiusi i tentativi IQ4_NL split-accumulator (16 thread baseline
-`157/153` contro split `153/141` GMAC/s), F16C scale conversion (`37,30 ->
-37,42` hot, streamed negativo) e FMA per fasi (`34,60 -> 33,29` hot), quindi
+`157/153` contro split `153/141` GMAC/s), F16C scale conversion (batch8
+ordine-dipendente in modello) e FMA per fasi (`34,60 -> 33,29` hot), quindi
 non sono in albero. Baseline storica isolata a 16 thread: IQ4_NL **163,5** e
 Q2_0 **177,8 GMAC/s** (a 8: 140,8 / 169,3); e' una misura di harness, non
 end-to-end. Il conteggio reale ISTA T=1746 ha `m=8` per **85,23%** delle
@@ -179,7 +179,7 @@ DS4_CUDA_WEIGHT_CACHE_LIMIT_GB=6 DS4_QWEN4_MOE_PROFILE=1 ./ds4 -m <gguf> \
 | chunk da 16 token | +6% di tetto nel bench, rompe la residenza L1 |
 | VNNI storico B=16 / accumulatore vettoriale | negativo; non e' il nuovo VNNI x8 di IQ3_S/IQ2_XXS |
 | IQ4_NL split-accumulator | 16 thread: baseline `157/153`, split `153/141` GMAC/s; rimosso |
-| IQ4_NL F16C scale conversion | hot `37,30 -> 37,42`, streamed `13,01 -> 12,94`; neutro/negativo, rimosso |
+| IQ4_NL F16C scale conversion | batch8 isolato positivo, ma in modello vince solo da secondo pass e perde da primo; rimosso |
 | IQ4_NL FMA per fasi | hot `34,60 -> 33,29`, streamed `11,92 -> 11,71`; negativo, rimosso |
 
 **Dove siamo, quantificato**: mid e down stanno all'**86-92%** e **76%** dei tetti
