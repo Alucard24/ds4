@@ -5470,8 +5470,8 @@ static float qwen4_cpu_dot_q2_0_simd(const void *row, const float *x, uint32_t k
  * only on the row, so it is built once per block and reused for every token;
  * per token only the x loads and FMAs remain.  Per-token accumulation order
  * is that of the single-token kernel, so results are bit-identical. */
-static void qwen4_cpu_dot_iq4_nl_batch(const void *row, const float *const *xs, float *const *outs,
-                                       uint32_t n, uint32_t k) {
+static void qwen4_cpu_dot_iq4_nl_generic_batch(const void *row, const float *const *xs, float *const *outs,
+                                               uint32_t n, uint32_t k) {
     const block_iq4_nl *blk = (const block_iq4_nl *)row;
     const __m128i lut = _mm_loadu_si128((const __m128i *)kvalues_iq4nl);
     const __m128i nib = _mm_set1_epi8(0x0f);
@@ -5493,6 +5493,61 @@ static void qwen4_cpu_dot_iq4_nl_batch(const void *row, const float *const *xs, 
         }
     }
     for (uint32_t b = 0; b < n; b++) *outs[b] = _mm512_reduce_add_ps(acc[b]);
+}
+
+/* Full chunks dominate routed prefill.  This twin makes m=8 compile-time
+ * constant, removing the seven per-block tail branches in the generic route.
+ * Each token keeps the identical f0/f1 FMA sequence. */
+static void qwen4_cpu_dot_iq4_nl_batch8(const void *row, const float *const *xs, float *const *outs,
+                                        uint32_t k) {
+    const block_iq4_nl *blk = (const block_iq4_nl *)row;
+    const __m128i lut = _mm_loadu_si128((const __m128i *)kvalues_iq4nl);
+    const __m128i nib = _mm_set1_epi8(0x0f);
+    const float *x0 = xs[0], *x1 = xs[1], *x2 = xs[2], *x3 = xs[3];
+    const float *x4 = xs[4], *x5 = xs[5], *x6 = xs[6], *x7 = xs[7];
+    __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
+    __m512 a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
+    __m512 a4 = _mm512_setzero_ps(), a5 = _mm512_setzero_ps();
+    __m512 a6 = _mm512_setzero_ps(), a7 = _mm512_setzero_ps();
+    for (uint32_t i = 0; i < k / 32u; i++) {
+        const __m128i q = _mm_loadu_si128((const __m128i *)blk[i].qs);
+        const __m128i vlo = _mm_shuffle_epi8(lut, _mm_and_si128(q, nib));
+        const __m128i vhi = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(q, 4), nib));
+        const __m512 d = _mm512_set1_ps(f16_to_f32(blk[i].d));
+        const __m512 f0 = _mm512_mul_ps(qwen4_cpu_cvt_i8_16(&vlo), d);
+        const __m512 f1 = _mm512_mul_ps(qwen4_cpu_cvt_i8_16(&vhi), d);
+#define IQ4NL_FMA8(a, x) do { \
+        (a) = _mm512_fmadd_ps(f0, _mm512_loadu_ps((x) + (uint64_t)i * 32u), (a)); \
+        (a) = _mm512_fmadd_ps(f1, _mm512_loadu_ps((x) + (uint64_t)i * 32u + 16u), (a)); \
+    } while (0)
+        IQ4NL_FMA8(a0, x0); IQ4NL_FMA8(a1, x1); IQ4NL_FMA8(a2, x2); IQ4NL_FMA8(a3, x3);
+        IQ4NL_FMA8(a4, x4); IQ4NL_FMA8(a5, x5); IQ4NL_FMA8(a6, x6); IQ4NL_FMA8(a7, x7);
+#undef IQ4NL_FMA8
+    }
+    *outs[0] = _mm512_reduce_add_ps(a0); *outs[1] = _mm512_reduce_add_ps(a1);
+    *outs[2] = _mm512_reduce_add_ps(a2); *outs[3] = _mm512_reduce_add_ps(a3);
+    *outs[4] = _mm512_reduce_add_ps(a4); *outs[5] = _mm512_reduce_add_ps(a5);
+    *outs[6] = _mm512_reduce_add_ps(a6); *outs[7] = _mm512_reduce_add_ps(a7);
+}
+
+/* m=8 is the normal routed chunk; set to 0 only to diagnose the generic
+ * route.  Keep tails m<8 on the compact generic kernel. */
+static bool qwen4_cpu_iq4nl_batch8_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("DS4_QWEN4_IQ4NL_BATCH8");
+        enabled = !(e && e[0] == '0');
+    }
+    return enabled != 0;
+}
+
+static void qwen4_cpu_dot_iq4_nl_batch(const void *row, const float *const *xs, float *const *outs,
+                                       uint32_t n, uint32_t k) {
+    if (n == 8u && qwen4_cpu_iq4nl_batch8_enabled()) {
+        qwen4_cpu_dot_iq4_nl_batch8(row, xs, outs, k);
+        return;
+    }
+    qwen4_cpu_dot_iq4_nl_generic_batch(row, xs, outs, n, k);
 }
 
 static void qwen4_cpu_dot_q2_0_unpack_batch(const void *row, const float *const *xs, float *const *outs,
@@ -7305,6 +7360,26 @@ void ds4_test_qwen4_cpu_dot_q8k_batch2(const void *row0, const void *row1, const
                                        float *out0, float *out1, uint32_t n, uint32_t k) {
     qwen4_cpu_dot_iq2_s_q8k_vnni_batch2(row0, row1, (const block_q8_K *const *)xq,
                                         out0, out1, n, k);
+}
+
+/* Explicit IQ4_NL m=8 twin for same-process A/B. */
+void ds4_test_qwen4_cpu_dot_iq4_nl_batch_generic(const void *row, const float *const *xs,
+                                                  float *const *outs, uint32_t n, uint32_t k) {
+#if defined(DS4_CPU_AVX512)
+    qwen4_cpu_dot_iq4_nl_generic_batch(row, xs, outs, n, k);
+#else
+    qwen4_cpu_row_dot_fp32_batch_store(DS4_TENSOR_IQ4_NL, row, xs, outs, n, k);
+#endif
+}
+
+void ds4_test_qwen4_cpu_dot_iq4_nl_batch8(const void *row, const float *const *xs,
+                                          float *const *outs, uint32_t n, uint32_t k) {
+#if defined(DS4_CPU_AVX512)
+    if (n == 8u) qwen4_cpu_dot_iq4_nl_batch8(row, xs, outs, k);
+    else qwen4_cpu_dot_iq4_nl_batch(row, xs, outs, n, k);
+#else
+    qwen4_cpu_row_dot_fp32_batch_store(DS4_TENSOR_IQ4_NL, row, xs, outs, n, k);
+#endif
 }
 
 /* Explicit Q2_0 twins let the test alternate them in the same process;

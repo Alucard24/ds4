@@ -42,6 +42,10 @@ void ds4_test_qwen4_cpu_dot_q8k_batch2(const void *row0, const void *row1, const
                                        float *out0, float *out1, uint32_t n, uint32_t k);
 void ds4_test_qwen4_cpu_dot_fp32_batch(uint32_t type, const void *row, const float *const *xs,
                                        float *const *outs, uint32_t n, uint32_t k);
+void ds4_test_qwen4_cpu_dot_iq4_nl_batch_generic(const void *row, const float *const *xs,
+                                                  float *const *outs, uint32_t n, uint32_t k);
+void ds4_test_qwen4_cpu_dot_iq4_nl_batch8(const void *row, const float *const *xs,
+                                          float *const *outs, uint32_t n, uint32_t k);
 void ds4_test_qwen4_cpu_dot_q2_0_batch_unpack(const void *row, const float *const *xs,
                                                float *const *outs, uint32_t n, uint32_t k);
 void ds4_test_qwen4_cpu_dot_q2_0_batch_vbmi(const void *row, const float *const *xs,
@@ -1023,6 +1027,10 @@ int main(void) {
         time_type_q8k(IQ3_XXS, "IQ3_XXS", 2560);
         time_type_q8k(IQ3_S, "IQ3_S", 2560);
         time_type(IQ4_NL, "IQ4_NL", 640);
+        time_fp32_batch_ab(IQ4_NL, "IQ4_NL", "generic", ds4_test_qwen4_cpu_dot_iq4_nl_batch_generic,
+                            "batch8", ds4_test_qwen4_cpu_dot_iq4_nl_batch8, 8);
+        time_fp32_batch_ab(IQ4_NL, "IQ4_NL", "generic", ds4_test_qwen4_cpu_dot_iq4_nl_batch_generic,
+                            "batch8", ds4_test_qwen4_cpu_dot_iq4_nl_batch8, 4096);
         time_type(Q2_0, "Q2_0", 640);
         time_fp32_batch_ab(Q2_0, "Q2_0", "unpack", ds4_test_qwen4_cpu_dot_q2_0_batch_unpack,
                             "vbmi", ds4_test_qwen4_cpu_dot_q2_0_batch_vbmi, 8);
@@ -1083,6 +1091,8 @@ int main(void) {
     }
     rc |= check_type(IQ4_NL, "IQ4_NL", 640);   /* down experts (ff -> embd) */
     rc |= check_fp32_batch(IQ4_NL, "IQ4_NL", 640);
+    rc |= check_fp32_batch_variants(IQ4_NL, "IQ4_NL", "generic", ds4_test_qwen4_cpu_dot_iq4_nl_batch_generic,
+                                    "batch8", ds4_test_qwen4_cpu_dot_iq4_nl_batch8);
     rc |= check_fp32_batch(Q2_0, "Q2_0", 640);
     rc |= check_fp32_batch_variants(Q2_0, "Q2_0", "unpack", ds4_test_qwen4_cpu_dot_q2_0_batch_unpack,
                                     "vbmi", ds4_test_qwen4_cpu_dot_q2_0_batch_vbmi);

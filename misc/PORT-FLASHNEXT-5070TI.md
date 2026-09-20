@@ -17,10 +17,10 @@ l'ordine della riduzione fp32 (entro `1e-4`, verificato sotto).
 
 **2. Copertura dei kernel di produzione CHIUSA.**  Aggiunti
 `check_batch_any()` (5 tipi q8k) e `check_fp32_batch()` (down IQ4_NL/Q2_0, k=640 e
-2560): **tutti e 7 i kernel batch sono verificati** contro il percorso a token
-singolo, che e' validato contro un riferimento indipendente in doppia precisione.
-I fallback AVX2/fp32 e Q2_0 VBMI sono `0.00e+00`; IQ3_S/IQ2_XXS/IQ2_XS/IQ3_XXS
-VNNI sono entro `1e-4`.
+2560): **tutti i percorsi batch di produzione sono verificati** contro il
+percorso a token singolo, validato contro un riferimento indipendente in doppia
+precisione. I fallback AVX2/fp32, IQ4_NL batch8 e Q2_0 VBMI sono `0.00e+00`;
+IQ3_S/IQ2_XXS/IQ2_XS/IQ3_XXS VNNI sono entro `1e-4`.
 Da eseguire **sempre** dopo ogni modifica:
 
 ```sh
@@ -83,7 +83,23 @@ streamed neutro (**11,78 -> 11,81**), come atteso fuori cache. Nel modello,
 sequenza AVX2 -> VBMI -> VBMI -> AVX2: down medio **186,5 -> 173,6 ms/layer
 (-6,9%)**. Fallback: `DS4_QWEN4_Q20_VBMI=0`.
 
-**8. Mappa aggiornata del modello ISTA** (i confronti VNNI qui sotto sono A/B
+**8. IQ4_NL down batch8 tenuto: specializzazione AVX-512 fp32.** IQ4_NL e' il
+down di **18/48 layer** ISTA. Per il chunk pieno `m=8` (il caso normale) il
+kernel rende costanti gli otto puntatori e gli otto accumulatori, eliminando le
+sette code condizionali per blocco della variante `m=1..8`; ordine di FMA e
+riduzione per token restano identici. Due A/B fp32 nello stesso processo danno
+media hot **35,96 -> 39,56 GMAC/s (+10,0%)** e streamed **11,93 -> 12,11
+(+1,5%)**. Verifica in modello piu' forte: sulle 18 layer IQ4_NL dello stesso
+prefill T=1739 ogni percorso e' stato eseguito sullo stesso mid/selezione,
+con ordine alternato; il test batch e' bit-identico. Generic **191,26 ms** contro
+**172,59 ms batch8 (-9,76%)**. Batch8 vince in entrambi gli ordini
+(generic-prima `185,73 -> 163,76`; batch8-prima `196,79 -> 181,42`). Il
+strumento A/B temporaneo e' stato rimosso. Fallback: `DS4_QWEN4_IQ4NL_BATCH8=0`.
+Validazione finale: test batch default e fallback verdi, build `ds4`/`ds4-server`
+verde, probe breve `17*23=?` a **391** su ISTA e UD, e probe ISTA lungo
+T=1746 (che esercita batch8) ancora a **391**.
+
+**9. Mappa aggiornata del modello ISTA** (i confronti VNNI qui sotto sono A/B
 diretti; gli altri rate storici non vanno confrontati fra run):
 
 | tipo | kernel | layer | L1-hot | streamed |
@@ -93,21 +109,21 @@ diretti; gli altri rate storici non vanno confrontati fra run):
 | IQ2_XXS | **VNNI + dpwssd** | 9 | **47,91** | **30,24** |
 | IQ2_XS | **VNNI + dpwssd** | 10 | **36,09** | **25,34** |
 | IQ3_XXS | **VNNI + dpwssd** | 6 | **32,95** | **24,56** |
-| IQ4_NL / Q2_0 | fp32 / **VBMI** (down) | 18 / 30 | — / **37,42** | — / **11,81** |
+| IQ4_NL / Q2_0 | **fp32 batch8** / **VBMI** (down) | 18 / 30 | **39,56** / **37,42** | **12,11** / **11,81** |
 
 Carico **identico** a UD (T=1739, ne=512, ns=10, k_in=2560, k_ff=640, pairs=17390,
 56,98 GMAC/chunk): il divario di velocita' e' tutto nel **tipo**, non nel carico
 (UD usa IQ2_S con VNNI; ISTA ha formati con piu' lookup e catene piu' lunghe).
 
-**9. Mid chiuso, Q2_0 down chiuso:** tutti e cinque i tipi q8k di ISTA hanno
-il batch VNNI di default e Q2_0 down ha VBMI. Resta IQ4_NL (18 layer), ma il
-primi tentativi gia' chiusi: split-accumulator (16 thread baseline `157/153`
-contro split `153/141 GMAC/s`) e F16C scale conversion (`37,30 -> 37,42`
-hot, streamed negativo), quindi non sono in albero. Baseline isolata a 16
-thread: IQ4_NL **163,5** e Q2_0 **177,8 GMAC/s** (a 8: 140,8 / 169,3); e' una
-misura di harness, non end-to-end. Qualunque nuovo tentativo deve prima battere
-il proprio A/B interno, poi `check_batch_any` e `391` su ISTA prima
-dell'integrazione.
+**10. Mid e down chiusi:** tutti e cinque i tipi q8k di ISTA hanno il batch
+VNNI di default; Q2_0 down ha VBMI e IQ4_NL usa batch8 per i chunk pieni.
+Restano chiusi i tentativi IQ4_NL split-accumulator (16 thread baseline
+`157/153` contro split `153/141` GMAC/s), F16C scale conversion (`37,30 ->
+37,42` hot, streamed negativo) e FMA per fasi (`34,60 -> 33,29` hot), quindi
+non sono in albero. Baseline storica isolata a 16 thread: IQ4_NL **163,5** e
+Q2_0 **177,8 GMAC/s** (a 8: 140,8 / 169,3); e' una misura di harness, non
+end-to-end. Qualunque nuovo tentativo deve prima battere il proprio A/B interno,
+poi i test batch e `391` su ISTA prima dell'integrazione.
 
 
 
@@ -124,7 +140,7 @@ dell'integrazione.
 
 `391` corretto su **entrambi** i modelli, `ds4`/`ds4-server` compilati,
 `test_qwen4_cpu_dot` verde; il test verifica esplicitamente VNNI e fallback AVX2
-di IQ3_S, IQ2_XXS, IQ2_XS, IQ3_XXS e Q2_0.
+di IQ3_S, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ4_NL batch8 e Q2_0.
 
 **Comando canonico per misurare** (UD; per ISTA cambia solo `-m`):
 
@@ -156,6 +172,7 @@ DS4_CUDA_WEIGHT_CACHE_LIMIT_GB=6 DS4_QWEN4_MOE_PROFILE=1 ./ds4 -m <gguf> \
 | VNNI storico B=16 / accumulatore vettoriale | negativo; non e' il nuovo VNNI x8 di IQ3_S/IQ2_XXS |
 | IQ4_NL split-accumulator | 16 thread: baseline `157/153`, split `153/141` GMAC/s; rimosso |
 | IQ4_NL F16C scale conversion | hot `37,30 -> 37,42`, streamed `13,01 -> 12,94`; neutro/negativo, rimosso |
+| IQ4_NL FMA per fasi | hot `34,60 -> 33,29`, streamed `11,92 -> 11,71`; negativo, rimosso |
 
 **Dove siamo, quantificato**: mid e down stanno all'**86-92%** e **76%** dei tetti
 riprodotti nella loro stessa configurazione (bench `time_model_like_mt`,
@@ -193,6 +210,7 @@ echo "$((LAST/1000000000)) GB letti"
 | `DS4_QWEN4_MID_NOKERNEL=1` | salta i kernel del mid (output spazzatura, solo per profilo) |
 | `DS4_QWEN4_MID_ROWOUTER=1` | ripristina l'ordine riga-esterno (A/B del chunk-esterno) |
 | `DS4_QWEN4_MID_NTA=0` | spegne il prefetch NTA (solo kernel IQ2_S) |
+| `DS4_QWEN4_IQ4NL_BATCH8=0` | ripristina il batch IQ4_NL generico per diagnosi |
 | `DS4_QWEN4_MID_SILU=0|1|2` | silu scalare / vettoriale / prodotto secco (riferimento) |
 | `DS4_QWEN4_MID_STAGE=1` | staging L1 + flush contiguo (misurato = rumore, default spento) |
 | `DS4_QWEN4_CPU_MOE_PREFILL=0` | prefill sulla GPU (misurato 5,4 t/s, solo per A/B) |
