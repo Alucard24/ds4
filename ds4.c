@@ -5763,9 +5763,16 @@ static void qwen4_cpu_dot_iq2_s_q8k_vnni_batch(const void *row, const block_q8_K
     /* The row is streamed once per call and is the thing that evicts the
      * activations from the shared L2 (measured wall: ~165 GMAC/s aggregate, L3
      * bandwidth).  NTA prefetch marks its lines evict-first in L2/L3, so the
-     * activations - re-read for every one of the k_ff rows - keep residency. */
-    for (uint32_t off = 0; off < nb * (uint32_t)sizeof(block_iq2_s); off += 64u)
-        _mm_prefetch((const char *)row + off, _MM_HINT_NTA);
+     * activations - re-read for every one of the k_ff rows - keep residency.
+     * DS4_QWEN4_MID_NTA=0 disables it for a same-binary A/B. */
+    static int nta = -1;
+    if (nta < 0) {
+        const char *e = getenv("DS4_QWEN4_MID_NTA");
+        nta = (e && e[0] == '0') ? 0 : 1;
+    }
+    if (nta)
+        for (uint32_t off = 0; off < nb * (uint32_t)sizeof(block_iq2_s); off += 64u)
+            _mm_prefetch((const char *)row + off, _MM_HINT_NTA);
     __m512i acc[16];
     float sumf[16];
     for (uint32_t b = 0; b < n; b++) { acc[b] = _mm512_setzero_si512(); sumf[b] = 0.0f; }
@@ -6877,6 +6884,12 @@ void ds4_test_qwen4_cpu_dot_q8k_batch2(const void *row0, const void *row1, const
                                        float *out0, float *out1, uint32_t n, uint32_t k) {
     qwen4_cpu_dot_iq2_s_q8k_vnni_batch2(row0, row1, (const block_q8_K *const *)xq,
                                         out0, out1, n, k);
+}
+
+/* Down phase in isolation: fp32 activations against one weight row, n tokens. */
+void ds4_test_qwen4_cpu_dot_fp32_batch(uint32_t type, const void *row, const float *const *xs,
+                                       float *const *outs, uint32_t n, uint32_t k) {
+    qwen4_cpu_row_dot_fp32_batch_store(type, row, xs, outs, n, k);
 }
 
 void ds4_test_qwen4_cpu_dot_q8k_batch(uint32_t type, const void *row, const void *const *xq,
