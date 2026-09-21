@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static void die(const char *msg) {
     fprintf(stderr, "%s\n", msg);
@@ -1164,5 +1165,8 @@ int main(int argc, char **argv) {
         ds4_tokens_free(&companion_prompt[i]);
     }
     close_engine(engine);
-    return 0;
+    /* All scorer-owned resources are explicitly closed above.  Like the
+     * batch CLI and server, avoid libc's post-main CUDA driver race. */
+    fflush(NULL);
+    _exit(0);
 }

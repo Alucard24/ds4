@@ -1109,7 +1109,11 @@ int main(void) {
     rc |= check_fp32_batch(IQ4_NL, "IQ4_NL", 2560);
     rc |= check_fp32_batch(Q2_0, "Q2_0", 2560);
     rc |= check_type(IQ4_NL, "IQ4_NL", 2560);
-    rc |= check_type(IQ2_S, "IQ2_S", 2560);    /* gate/up experts */
+    /* Gate/up fp32 fallback, including CPU_MOE_FP32 and non-Q8_K builds. */
+    rc |= check_type(IQ2_S, "IQ2_S", 2560);
+    rc |= check_type(IQ2_XXS, "IQ2_XXS", 2560);
+    rc |= check_type(IQ2_XS, "IQ2_XS", 2560);
+    rc |= check_type(IQ3_XXS, "IQ3_XXS", 2560);
     rc |= check_type(IQ3_S, "IQ3_S", 2560);
     rc |= check_type(Q2_0, "Q2_0", 640);       /* ISTA down experts */
     rc |= check_type(Q2_0, "Q2_0", 2560);

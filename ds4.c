@@ -7166,6 +7166,12 @@ static float qwen4_cpu_row_dot(uint32_t type, const void *row, const float *x, u
 #else
         return ds4_vec_dot_iq2_s_f32((int)k, (const block_iq2_s *)row, x);
 #endif
+    case DS4_TENSOR_IQ2_XXS:
+        return ds4_vec_dot_iq2_xxs_f32((int)k, (const block_iq2_xxs *)row, x);
+    case DS4_TENSOR_IQ2_XS:
+        return ds4_vec_dot_iq2_xs_f32((int)k, (const block_iq2_xs *)row, x);
+    case DS4_TENSOR_IQ3_XXS:
+        return ds4_vec_dot_iq3_xxs_f32((int)k, (const block_iq3_xxs *)row, x);
     case DS4_TENSOR_IQ3_S:
 #ifdef DS4_CPU_AVX512
         return qwen4_cpu_dot_iq3_s_simd(row, x, k);
@@ -7340,6 +7346,9 @@ float ds4_test_qwen4_ref_dot(uint32_t type, const void *row, const float *x, uin
     switch (type) {
     case DS4_TENSOR_IQ4_NL: return ds4_vec_dot_iq4_nl_f32((int)k, (const block_iq4_nl *)row, x);
     case DS4_TENSOR_IQ2_S: return ds4_vec_dot_iq2_s_f32((int)k, (const block_iq2_s *)row, x);
+    case DS4_TENSOR_IQ2_XXS: return ds4_vec_dot_iq2_xxs_f32((int)k, (const block_iq2_xxs *)row, x);
+    case DS4_TENSOR_IQ2_XS: return ds4_vec_dot_iq2_xs_f32((int)k, (const block_iq2_xs *)row, x);
+    case DS4_TENSOR_IQ3_XXS: return ds4_vec_dot_iq3_xxs_f32((int)k, (const block_iq3_xxs *)row, x);
     case DS4_TENSOR_IQ3_S: return ds4_vec_dot_iq3_s_f32((int)k, (const block_iq3_s *)row, x);
     case DS4_TENSOR_Q2_0: return ds4_vec_dot_q2_0_f32((int)k, (const block_q2_0 *)row, x);
     default: return 0.0f;
@@ -83737,21 +83746,23 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     if (ds4_session_is_qwen4(s)) {
         ds4_engine *e = s->engine;
         int start = 0;
+        const bool trace_sync = getenv("DS4_QWEN4_TRACE_SYNC") != NULL;
         s->glm_mtp_have = 0;
         s->glm_mtp_have2 = false;
-        /* TEMP-DEBUG (request-2 corruption): remove after diagnosis. */
-        fprintf(stderr, "ds4: [tmp-trace] sync session=%p pos=%u ckpt_len=%d valid=%d prompt_len=%d\n",
-                (const void *)s, s->qwen4_graph.pos, s->checkpoint.len,
-                s->checkpoint_valid ? 1 : 0, prompt ? prompt->len : -1);
+        if (trace_sync) {
+            fprintf(stderr, "ds4: [tmp-trace] sync session=%p pos=%u ckpt_len=%d valid=%d prompt_len=%d\n",
+                    (const void *)s, s->qwen4_graph.pos, s->checkpoint.len,
+                    s->checkpoint_valid ? 1 : 0, prompt ? prompt->len : -1);
+        }
         if (s->checkpoint_valid &&
             s->qwen4_graph.pos == (uint32_t)s->checkpoint.len &&
             (!s->qwen4_rewound || prompt->len > s->checkpoint.len) &&
             prompt->len >= s->checkpoint.len &&
             ds4_tokens_starts_with(prompt, &s->checkpoint)) {
             start = s->checkpoint.len;
-            fprintf(stderr, "ds4: [tmp-trace] sync REUSE start=%d\n", start);
+            if (trace_sync) fprintf(stderr, "ds4: [tmp-trace] sync REUSE start=%d\n", start);
         } else {
-            fprintf(stderr, "ds4: [tmp-trace] sync RESET\n");
+            if (trace_sync) fprintf(stderr, "ds4: [tmp-trace] sync RESET\n");
             qwen4_graph_reset(&s->qwen4_graph);
             if (getenv("DS4_QWEN4_STATE_SCAN")) qwen4_tmp_state_scan_once(&s->qwen4_graph, "post-reset", false);
             s->checkpoint.len = 0;
@@ -83763,8 +83774,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 return 1;
             }
         }
-        /* TEMP-DEBUG: prompt ids per request. */
-        {
+        if (trace_sync) {
             fprintf(stderr, "ds4: [tmp-trace] prompt ids:");
             for (int i = 0; i < prompt->len; i++) fprintf(stderr, " %d", prompt->v[i]);
             fprintf(stderr, "\n");

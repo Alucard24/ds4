@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 static double now(void) {
     struct timespec t;
@@ -48,8 +49,10 @@ int main(int argc, char **argv) {
     char *text = calloc((size_t)bytes + 1, 1);
     assert(text && fread(text, 1, bytes, fp) == (size_t)bytes);
     fclose(fp);
+    /* This test checks ordinary mixed prefill/decode replay.  Do not request
+     * MTP: standard Flash-Next GGUFs intentionally have no embedded draft head. */
     ds4_engine_options opt = {.model_path = argv[1], .context_size = (int)max+8,
-        .prefill_chunk = 1024, .glm_mtp = true, .dspark_exact_sampling = true,
+        .prefill_chunk = 1024, .dspark_exact_sampling = true,
 #ifdef __APPLE__
         .backend = DS4_BACKEND_METAL
 #else
@@ -147,5 +150,8 @@ int main(int argc, char **argv) {
     ds4_tokens_free(&tokens);
     ds4_engine_close(engine);
     puts("Qwen mixed prefill replay and progress: OK (serial differences reported above)");
-    return 0;
+    /* All test-owned resources are explicitly closed.  Like the CUDA batch
+     * CLI, bypass libc's post-main driver-destructor race. */
+    fflush(NULL);
+    _exit(0);
 }

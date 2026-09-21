@@ -133,7 +133,34 @@ chiamate batch e **92,87%** delle coppie token-esperto: le code `m<8` sono
 Qualunque nuovo tentativo deve prima battere il proprio A/B interno, poi i test
 batch e `391` su ISTA prima dell'integrazione.
 
+**11. Regressione pratica post-batch8:** `test_qwen4_prefill` a 4K e' verde
+su ISTA e UD: replay chunked esatto (`0`) e top-1 uguale a ogni frontiera;
+le differenze dal decode seriale restano solo diagnostiche. Il test ora usa il
+prefill ordinario (i GGUF standard non hanno una testa MTP) e, dopo aver chiuso
+esplicitamente tutte le risorse, usa la stessa uscita rapida CUDA di CLI/server
+per evitare la race post-main del driver. Il probe no-think lungo da **1729**
+token risponde `391` ed esce pulito su entrambi. Il set Alibaba corto
+completo (100 casi, 5.696 target token) da' NLL medio **0,336587** ISTA e
+**0,314220** UD; top-1 API rispettivamente **89,73%** (4.996/5.568) e
+**90,05%** (5.014/5.568). I due casi con metadati emoji danneggiati non hanno
+allineamento API, ma contribuiscono comunque alla NLL di tutti i 5.696 token.
 
+**12. Fallback fp32 riparato e confrontato:** l'A/B `CPU_MOE_FP32=1` ha
+scoperto che IQ2_XXS, IQ2_XS e IQ3_XXS cadevano nel `default` fp32 a zero;
+il q8k di default non era coinvolto. I tre vecdot fp32 scalari ora coprono
+anche il fallback/non-AVX e `test_qwen4_cpu_dot` li confronta al riferimento
+indipendente. Sui primi 8 casi Alibaba (512 token) q8k -> fp32 e' NLL
+**0,342032 -> 0,342837** ISTA (+0,235%) e **0,310341 -> 0,310643** UD
+(+0,097%): campione piccolo, ma senza la precedente degradazione catastrofica.
+Il probe lungo fp32 produce ancora `391` con exit pulito su entrambi.
+
+**13. Qualita' sparse/deep-context:** il caso Alibaba long `case_005` (23.983
+prompt token, 63 target, `--continued-prefill 256`, ctx 32K) completa con NLL
+**0,186352** e top-1 API **61/63** su ISTA; UD produce **0,188790** e **59/63**.
+L'inferenza UD e il TSV erano completi prima del race post-main del vecchio
+scorer; `score_official` ora usa l'uscita rapida dopo cleanup e il sentinella
+UD a ctx 32K esce 0. Il caso long UD non e' stato rieseguito dopo la sola
+correzione dell'exit (run originale ~67 minuti).
 
 ---
 
@@ -629,7 +656,8 @@ Obiettivo ds4: sopra (quanto sopra lo dice la misura, non l'assunto).
   DS4_CUDA_WEIGHT_CACHE_LIMIT_GB=6 ./ds4-server -m <UD-IQ3_XXS-shard0> \
   -c 16384/32768 -ctk q8_0 -ctv q8_0 --cuda --port 8892 --prefill-chunk 1024
   Diagnostica: DS4_QWEN4_MOE_PROFILE=1 (tempi per fase), DS4_QWEN4_TIMING=1
-  (forward), DS4_QWEN4_STATE_SCAN=1 (stato post-reset), trap [tmp-flat]/
+  (forward), DS4_QWEN4_STATE_SCAN=1 (stato post-reset),
+  DS4_QWEN4_TRACE_SYNC=1 (checkpoint/prompt della richiesta), trap [tmp-flat]/
   [tmp-state] sempre attivi. Test: make test-qwen4-config test-qwen4-cpu-dot
   test-qwen4-dequant test-qwen4-split test-qwen4-ngrams test-qwen4-drafthead
   test-cuda-tc23 CUDA_ARCH=sm_120.

@@ -226,11 +226,12 @@ prefill with teacher-forced decode across a chunk boundary. For official
 continuation scoring, use `--rendered-prompt`
 when a fixture already contains the complete model chat template.
 
-`tests/test_qwen4_prefill MODEL PROMPT 8192` checks mixed prefill sizes,
-progress callbacks and exact replay through the sparse-attention boundary.
-It also reports differences against a fresh prefill followed by individual
-decodes. Those schedules can round differently and exchange nearly tied
-experts; their full logits need not match. Use model-quality checks as well,
+`tests/test_qwen4_prefill MODEL PROMPT 8192` checks ordinary (non-MTP) mixed
+prefill sizes, progress callbacks and exact replay through the sparse-attention
+boundary, so it also applies to standard Flash-Next GGUFs without an embedded
+draft head. It also reports differences against a fresh prefill followed by
+individual decodes. Those schedules can round differently and exchange nearly
+tied experts; their full logits need not match. Use model-quality checks as well,
 not only state replay:
 
 ```sh
