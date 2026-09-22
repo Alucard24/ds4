@@ -172,9 +172,31 @@ python3 -m unittest discover -s gguf-tools/tests -p test_qwen4_pack.py
 python3 -m unittest discover -s gguf-tools/tests -p test_qwen4_native_ngrams.py
 ```
 
-On CUDA, use `make test-qwen4-cuda` for the kernel tests. They compare the
-active kernels with independent CPU references, without model weights.
-Vision and end-to-end checks additionally require the checkpoints above.
+On CUDA, use `make test-qwen4-cuda` for the implemented CUDA kernel tests.
+They compare local CUDA kernels with independent CPU references, without model
+weights. Its Q4_K reference case disables MMVQ because MMVQ deliberately
+quantizes activations to Q8_1; `make test-qwen38-cuda` is the separate
+ggml-backed MMVQ oracle and remains required CUDA coverage. The kernel test
+leaves the Metal-only native decode-batch launchers (row-staged attention,
+grouped MoE, and Q8 batch GEMM) to the Metal suite; CUDA uses ordered
+per-session counterparts instead. To exercise CUDA context teardown with the
+real Flash-Next GGUF on the local 16 GiB card, run:
+
+```sh
+make test-qwen4-cuda-reopen-16gb CUDA_ARCH=sm_120 \
+  DS4_TEST_QWEN4_MODEL=/path/to/Qwen3.8-Flash-Next.gguf
+```
+
+It runs a baseline prefill/decode followed by three same-process
+close → CUDA reset → reopen cycles. Set
+`DS4_TEST_QWEN4_MTP_MODEL=/path/to/sidecar.gguf` to include external-sidecar
+absorption, active MTP draft decoding, and teardown in the same cycles. CUDA
+supports the Q4_K_M sidecar's Q4_K down/inject and Q5_0 HC-up projections;
+the Q5_0 variant is rejected on non-CUDA backends rather than being accepted
+without a decode reader. The test-only 6 GiB cache, 512 MiB reserve, and
+`DS4_QWEN4_PREFILL_CHUNK=512` are scoped to that target; they are not server
+defaults. Vision and
+end-to-end checks additionally require the checkpoints above.
 Run `tests/test_qwen4_ngram_state MODEL.gguf` on either backend to check
 failed disk reads during prefill, decode and MTP, then exact recovery.
 
@@ -193,6 +215,26 @@ Repeat with `--quality` and, for the long set, `--continued-prefill 1` and
 `--continued-prefill 256`. These fixtures match the no-thinking template;
 no rendered-prompt flag is needed. See [quality testing](../gguf-tools/quality-testing/README.md)
 for collection settings, measurements and the hosted-checkpoint limitations.
+
+### Local 16 GiB CUDA long-quality acceptance
+
+For the split `UD-IQ3_XXS` model on the local 16 GiB CUDA profile, compare each
+candidate only with a same-run default control: same model, manifest, scorer,
+backend, CPU-MoE/streaming settings, cache/reserve limits, and prefill chunk.
+Validate both TSVs with `validate_scores.py`. A candidate passes this narrow
+no-regression gate only when all 12 cases / 766 target tokens and API coverage
+validate, average NLL is at most 1.00% above the control, and total
+first-token matches, greedy-LCP tokens, and API top-1 matches do not decrease.
+This is a local functional gate, not a substitute for the matching release
+artifact's full quality pass.
+
+The recorded 512-token-chunk CUDA control has average NLL `0.128754283`,
+7 first-token matches, 135 greedy-LCP tokens, and 737/766 API top-1 matches.
+The `--quality`, continued-prefill 1, and continued-prefill 256 variants are
+`+0.666860%`, `+0.785585%`, and `+0.308945%` NLL respectively; each retains
+those three discrete metrics. They therefore pass this local gate. This result
+is not directly comparable to the historical DGX Spark Q2/Q4, 8192-token-cap
+references.
 
 [Checkpoint-fix benchmark charts and measurements](../speed-bench/qwen38-checkpoints/README.md)
 compare prefill, ordinary decode, and MTP decode against the preceding PR head.

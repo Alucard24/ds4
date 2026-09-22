@@ -35,6 +35,9 @@ int ds4_mmq_init(int device);
 // Release MMQ-owned pools and persistent device allocations before the host
 // backend resets its CUDA context. Safe to call when MMQ was never used.
 void ds4_mmq_cleanup(void);
+/* Changes whenever ds4 tears down the CUDA context, so launchers with
+ * context-local kernel attributes can reapply them after reopen. */
+uint64_t ds4_mmq_cuda_context_epoch(void);
 void ds4_mmq_set_aligned_q81_scratch(void *ptr, size_t bytes);
 
 // Query whether ds4_mmq is willing to handle a given matmul. Returns

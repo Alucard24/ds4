@@ -279,7 +279,7 @@ test-metal-dense-mpp: tests/test_metal_dense_mpp
 
 cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_eval_cases.o ds4_agent_cpu.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_prompt_prefix.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o ds4_help.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o ds4_eval_cases.o ds4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
@@ -301,6 +301,7 @@ help:
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test                Build and run tests"
 	@echo "  make test-cuda-streaming-16gb  Run the full SSD-streaming test profile for the local 16 GiB CUDA GPU"
+	@echo "  make test-qwen4-cuda-reopen-16gb  Check Qwen Flash-Next CUDA close/reset/reopen on a local 16 GiB GPU"
 	@echo "  make dspark-verify-depth Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth    Run legacy MTP speculative verification smoke if MTP GGUF is present"
 	@echo "  make clean               Remove build outputs"
@@ -500,7 +501,7 @@ test-cuda-dspark-moe: tests/test_cuda_dspark_moe
 
 cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_eval_cases.o ds4_agent_cpu.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o ds4 ds4_cli_cpu.o ds4_help.o ds4_prompt_prefix.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
-	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
+	$(CC) $(CFLAGS) -o ds4-server ds4_server_cpu.o ds4_prompt_prefix.o ds4_help.o ds4_kvstore.o rax.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-bench ds4_bench_cpu.o ds4_help.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o ds4_eval_cases.o ds4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_help.o ds4_prompt_prefix.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
@@ -532,7 +533,9 @@ tests/test_qwen4_cuda: tests/test_qwen4_cuda.o ds4_cuda.o ds4_image.o $(MMQ_OBJS
 
 .PHONY: test-qwen4-cuda
 test-qwen4-cuda: tests/test_qwen4_cuda
-	./tests/test_qwen4_cuda
+	# This suite's CPU references use unquantized activations. MMVQ's Q8_1
+	# activation path has its own ggml-backed oracle in test-qwen38-cuda.
+	DS4_QWEN4_NO_MMVQ=1 ./tests/test_qwen4_cuda
 tests/test_qwen38_cuda: tests/test_qwen38_cuda.cu cuda/mmq/ds4_ggml_stubs.o \
 	cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/quantize.o \
 	cuda/mmq/mmid.o cuda/mmq/mmvq.o
@@ -559,6 +562,36 @@ test-qwen38-cuda-session: tests/test_qwen38_session_cuda
 	DS4_TEST_QWEN38_CUDA=1 ./tests/test_qwen38_session_cuda \
 		"$(DS4_TEST_QWEN38_MODEL)" \
 		'The capital of France is Paris. The largest ocean on Earth is the Pacific Ocean.'
+
+tests/test_qwen4_engine_reopen.o: tests/test_qwen4_engine_reopen.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_qwen4_engine_reopen: tests/test_qwen4_engine_reopen.o $(CORE_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+# Test-only Qwen Flash-Next profile: keep the local 16 GiB cache/reserve
+# overrides out of normal engine/server defaults. Qwen explicitly rejects the
+# generic SSD-streaming flag, so this retains its native CUDA expert streaming.
+QWEN4_REOPEN_TEST_CACHE_GB ?= 6
+QWEN4_REOPEN_TEST_RESERVE_MB ?= 512
+QWEN4_REOPEN_TEST_PREFILL_CHUNK ?= 512
+
+.PHONY: test-qwen4-cuda-reopen-16gb
+test-qwen4-cuda-reopen-16gb: tests/test_qwen4_engine_reopen
+	@if [ ! -f "$(DS4_TEST_QWEN4_MODEL)" ]; then \
+		echo "error: set DS4_TEST_QWEN4_MODEL=/path/to/Qwen3.8-Flash-Next.gguf"; exit 2; \
+	fi
+	@if [ -n "$(DS4_TEST_QWEN4_MTP_MODEL)" ] && [ ! -f "$(DS4_TEST_QWEN4_MTP_MODEL)" ]; then \
+		echo "error: DS4_TEST_QWEN4_MTP_MODEL is not a readable MTP sidecar"; exit 2; \
+	fi
+	DS4_QWEN4_CPU_MOE=1 \
+	DS4_QWEN4_CUDA_STREAM_EXPERTS=1 \
+	DS4_CUDA_WEIGHT_CACHE_LIMIT_GB="$(QWEN4_REOPEN_TEST_CACHE_GB)" \
+	DS4_CUDA_NO_Q8_F16_CACHE=1 \
+	DS4_CUDA_STREAM_EXPERT_CACHE_RESERVE_MB="$(QWEN4_REOPEN_TEST_RESERVE_MB)" \
+	DS4_QWEN4_PREFILL_CHUNK="$(QWEN4_REOPEN_TEST_PREFILL_CHUNK)" \
+	sh -c 'if [ -n "$$1" ]; then exec "$$2" "$$3" "$$1"; else exec "$$2" "$$3"; fi' \
+		_ "$(DS4_TEST_QWEN4_MTP_MODEL)" ./tests/test_qwen4_engine_reopen "$(DS4_TEST_QWEN4_MODEL)"
 
 tests/test_qwen38_steering.o: tests/test_qwen38_steering.c ds4.h ds4_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
@@ -1302,7 +1335,7 @@ clean:
 	rm -f tests/test_tp_rdma tests/test_tp_link tests/test_tp_tcp
 	rm -f tests/test_metal_tp_spec
 	rm -f tests/test_metal_tp_cancel
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_qwen38_cuda tests/test_qwen38_session_cuda tests/test_qwen38_steering tests/test_qwen38_steering_cpu tests/test_qwen38_cuda_perf tests/test_qwen3vl_video tests/test_qwen3vl_vision tests/test_qwen3vl_session tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_qwen4_moe_mm_specialize tests/test_qwen4_conv_parallel tests/test_q8_prefill_variants tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_qwen38_cuda tests/test_qwen38_session_cuda tests/test_qwen38_steering tests/test_qwen38_steering_cpu tests/test_qwen38_cuda_perf tests/test_qwen3vl_video tests/test_qwen3vl_vision tests/test_qwen3vl_session tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_qwen4_engine_reopen tests/test_qwen4_moe_mm_specialize tests/test_qwen4_conv_parallel tests/test_q8_prefill_variants tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
 	rm -f tests/test_qwen4_kernels tests/test_qwen4_cuda tests/test_qwen4_vision tests/test_qwen4_prefill
 	rm -f speed-bench/session_concurrency_bench
 

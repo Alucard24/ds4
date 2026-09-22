@@ -2467,6 +2467,7 @@ enum {
     DS4_TENSOR_F16      = 1,
     DS4_TENSOR_Q4_0     = 2,
     DS4_TENSOR_Q4_1     = 3,
+    DS4_TENSOR_Q5_0     = 6,
     DS4_TENSOR_Q8_0     = 8,
     DS4_TENSOR_Q2_K     = 10,
     DS4_TENSOR_Q4_K     = 12,
@@ -2531,6 +2532,7 @@ typedef struct ds4_model {
     int fd;
     const uint8_t *map;
     uint64_t size;       /* Addressable weights, excluding disk-only n-grams. */
+    uint64_t map_size;   /* Full mapping lifetime; may include a protected n-gram span. */
     uint64_t file_size;
 
     uint32_t version;
@@ -2548,7 +2550,7 @@ typedef struct ds4_model {
     uint32_t n_shards;
     ds4_shard shards[DS4_MAX_SHARDS];
     void *reserve_base;
-    uint64_t reserve_size;
+    uint64_t reserve_size; /* Full virtual-reservation lifetime, including tail slack. */
 
     int ngram_fd;
     const ds4_tensor *ngram_tensor;
@@ -2843,7 +2845,8 @@ static void model_close(ds4_model *m) {
     if (m->reserve_base) {
         munmap(m->reserve_base, (size_t)m->reserve_size);
     } else if (m->map) {
-        munmap((void *)m->map, (size_t)m->size);
+        const uint64_t mapped = m->map_size ? m->map_size : m->size;
+        munmap((void *)m->map, (size_t)mapped);
     }
     memset(m, 0, sizeof(*m));
     m->fd = -1;
@@ -2854,6 +2857,20 @@ static void model_close(ds4_model *m) {
 /* Advise one address range, tolerating kernels without the hint. The start
  * rounds down to a page: madvise rejects unaligned addresses while an
  * unaligned length is fine, and over-advising a few bytes is harmless. */
+/* Keep a disk-only range inaccessible without punching a virtual-address hole.
+ * On Linux, CUDA primary-context recreation after cudaDeviceReset can fault in
+ * the NVIDIA driver when a very large split-GGUF mapping contains such a hole.
+ * Retain the file mapping and change its protection instead, so accidental
+ * accesses still fault but the reserved address range remains mapped. */
+static bool model_make_range_inaccessible(void *addr, uint64_t len) {
+    if (!addr || len == 0 || len > SIZE_MAX) return len == 0;
+#if defined(__linux__)
+    return mprotect(addr, (size_t)len, PROT_NONE) == 0;
+#else
+    return munmap(addr, (size_t)len) == 0;
+#endif
+}
+
 static void model_prefetch_range(const void *addr, uint64_t len) {
     if (len == 0) return;
     const long page = sysconf(_SC_PAGESIZE);
@@ -3244,7 +3261,8 @@ static void model_absorb_sidecar(ds4_model *m, ds4_model *sidecar,
     }
     m->n_tensors = total;
     m->size = tail;
-    m->reserve_size = new_span;
+    /* Keep reserve_size as the full original reservation lifetime. The sidecar
+     * consumes only its prefix; model_close() must still unmap trailing slack. */
     m->file_size += sidecar->file_size;
     if (draft_dense_out) *draft_dense_out = draft_dense;
     /* The merge above may have moved the tensor array: re-resolve the
@@ -3353,6 +3371,7 @@ static void model_open_split(ds4_model *m, const char *path, bool metal_mapping,
     m->fd = fds[0];
     m->map = reserve;
     m->size = end;
+    m->map_size = span;
     m->file_size = file_total;
     m->reserve_base = reserve;
     m->reserve_size = reserve_span;
@@ -3439,19 +3458,22 @@ static void model_unmap_qwen_ngrams(ds4_model *m, const char *path) {
 #endif
 #endif
     if (resident_end <= table->abs_offset && table->abs_offset % upage == 0) {
-        /* Trailing page-aligned table: legacy behavior, unmap to the end. */
+        /* Trailing page-aligned table: keep it inaccessible to tensor users.
+         * map_size still owns the protected tail for model_close(). */
         if (table->abs_offset > m->size ||
-            munmap((void *)(m->map + table->abs_offset),
-                   (size_t)(m->size - table->abs_offset)))
-            ds4_die_errno("cannot unmap disk-only n-grams", table_path);
+            !model_make_range_inaccessible((void *)(m->map + table->abs_offset),
+                                           m->size - table->abs_offset))
+            ds4_die_errno("cannot protect disk-only n-grams", table_path);
         m->size = table->abs_offset;
     } else {
-        /* Mid-file table: drop whole pages only, neighbors stay mapped. */
+        /* Mid-file table: protect whole pages only; neighbors stay mapped.
+         * Do not munmap this large split-GGUF hole: CUDA context recreation
+         * requires the model VA reservation to remain contiguous. */
         const uint64_t hole0 = align_up(table->abs_offset, upage);
         const uint64_t hole1 = (table->abs_offset + table->bytes) & ~(upage - 1);
         if (hole1 > hole0 &&
-            munmap((void *)(m->map + hole0), (size_t)(hole1 - hole0)))
-            ds4_die_errno("cannot unmap disk-only n-grams", table_path);
+            !model_make_range_inaccessible((void *)(m->map + hole0), hole1 - hole0))
+            ds4_die_errno("cannot protect disk-only n-grams", table_path);
         /* m->size keeps spanning the later shards; prefetch and warming
          * skip the table range explicitly. */
     }
@@ -3496,6 +3518,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     m->fd = fd;
     m->map = map;
     m->size = (uint64_t)st.st_size;
+    m->map_size = m->size;
     m->file_size = m->size;
     m->n_shards = 1;
     m->shards[0].fd = fd;
@@ -8773,21 +8796,23 @@ static bool weights_qwen4_layer_has_required(const ds4_layer_weights *l, uint32_
 }
 
 /* Dense Qwen projections: Q8_0, F16 or F32, plus BF16 and Q4_0 from the recipe GGUF,
- * Q6_K from Unsloth UD packs, Q5_K (output) and IQ3_S (embeddings) from ISTA GSQ,
- * plus ISTA's Q4_K, IQ4_NL/IQ4_XS and Q2_0 dense projections (all have
- * CPU-ref rows, layout entries and CUDA readers). */
+ * Q5_0 from the Q4 MTP sidecar, Q6_K from Unsloth UD packs, Q5_K (output)
+ * and IQ3_S (embeddings) from ISTA GSQ, plus ISTA's Q4_K, IQ4_NL/IQ4_XS
+ * and Q2_0 dense projections (all have CPU-ref rows, layout entries and
+ * CUDA readers where the graph permits them). */
 static bool tensor_type_is_qwen4_dense(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_F16 || type == DS4_TENSOR_F32 ||
-           type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q4_0 || type == DS4_TENSOR_Q6_K ||
-           type == DS4_TENSOR_Q5_K || type == DS4_TENSOR_IQ3_S || type == DS4_TENSOR_Q4_K ||
-           type == DS4_TENSOR_IQ4_NL || type == DS4_TENSOR_IQ4_XS || type == DS4_TENSOR_Q2_0;
+           type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q4_0 || type == DS4_TENSOR_Q5_0 ||
+           type == DS4_TENSOR_Q6_K || type == DS4_TENSOR_Q5_K || type == DS4_TENSOR_IQ3_S ||
+           type == DS4_TENSOR_Q4_K || type == DS4_TENSOR_IQ4_NL ||
+           type == DS4_TENSOR_IQ4_XS || type == DS4_TENSOR_Q2_0;
 }
 
 static void tensor_expect_qwen4_dense_layout(
         const ds4_tensor *t, uint32_t ndim, uint64_t d0, uint64_t d1, uint64_t d2) {
     if (!t) ds4_die("internal error: missing tensor while validating layout");
     if (!tensor_type_is_qwen4_dense(t->type)) {
-        fprintf(stderr, "ds4: tensor %.*s has type %u, expected a dense type (Q8_0/Q4_0/F16/BF16/F32/Q6_K/Q5_K/IQ3_S/Q4_K/IQ4_NL/IQ4_XS/Q2_0)\n",
+        fprintf(stderr, "ds4: tensor %.*s has type %u, expected a dense type (Q8_0/Q5_0/Q4_0/F16/BF16/F32/Q6_K/Q5_K/IQ3_S/Q4_K/IQ4_NL/IQ4_XS/Q2_0)\n",
                 (int)t->name.len, t->name.ptr, t->type);
         exit(1);
     }
@@ -63458,6 +63483,10 @@ static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
     case DS4_TENSOR_BF16:
     case DS4_TENSOR_Q4_0:
         return true;
+#if defined(DS4_HAS_QWEN4_GPU) && !defined(DS4_HAS_QWEN4_METAL)
+    case DS4_TENSOR_Q5_0:
+        return true;
+#endif
 #ifdef DS4_HAS_QWEN4_GPU
     case DS4_TENSOR_Q6_K:
     case DS4_TENSOR_Q5_K:
@@ -63525,7 +63554,9 @@ static bool qwen4_graph_expert_ok(const ds4_tensor *t) {
 static bool qwen4_graph_weights_supported(const ds4_weights *w) {
     if (!qwen4_graph_dense_ok(w->token_embd) || !qwen4_graph_dense_ok(w->output) ||
         !qwen4_graph_dense_ok(w->output_hc_down) || !qwen4_graph_dense_ok(w->output_hc_up)) {
-#ifdef DS4_HAS_QWEN4_GPU
+#if defined(DS4_HAS_QWEN4_GPU) && !defined(DS4_HAS_QWEN4_METAL)
+        fprintf(stderr, "ds4: Qwen3.8 CUDA graph needs Q8_0/Q5_0/Q4_0/Q6_K/Q5_K/IQ3_S/IQ4_XS/Q2_0/F16/BF16/F32 dense weights\n");
+#elif defined(DS4_HAS_QWEN4_GPU)
         fprintf(stderr, "ds4: Qwen3.8 GPU graph needs Q8_0/Q4_0/Q6_K/Q5_K/IQ3_S/IQ4_XS/Q2_0/F16/BF16/F32 dense weights\n");
 #else
         fprintf(stderr, "ds4: Qwen3.8 GPU graph needs Q8_0/Q4_0/F16/BF16/F32 dense weights\n");
@@ -63548,7 +63579,11 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
         const bool head_ok = l->nextn_hc_head_down && l->nextn_hc_head_up &&
             qwen4_graph_dense_ok(l->nextn_hc_head_down) &&
             (l->nextn_hc_head_up->type == DS4_TENSOR_F16 || l->nextn_hc_head_up->type == DS4_TENSOR_F32 ||
-             l->nextn_hc_head_up->type == DS4_TENSOR_Q8_0);
+             l->nextn_hc_head_up->type == DS4_TENSOR_Q8_0
+#if defined(DS4_HAS_QWEN4_GPU) && !defined(DS4_HAS_QWEN4_METAL)
+             || l->nextn_hc_head_up->type == DS4_TENSOR_Q5_0
+#endif
+            );
         if (!qwen4_graph_dense_ok(l->nextn_eh_proj) || !head_ok) {
             fprintf(stderr, "ds4: Qwen3.8 GPU graph: unsupported nextn weight types\n");
             return false;
@@ -63558,14 +63593,18 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
         const ds4_layer_weights *l = &w->layer[il];
         const ds4_tensor *hc[4] = { l->hc_attn_up, l->hc_attn_inject, l->hc_ffn_up, l->hc_ffn_inject };
         for (int i = 0; i < 4; i++) {
-            const bool hc_up_ok = hc[i]->type == DS4_TENSOR_F16 || hc[i]->type == DS4_TENSOR_F32 ||
-                                  hc[i]->type == DS4_TENSOR_Q8_0
+            const bool hc_up_or_inject_ok =
+                hc[i]->type == DS4_TENSOR_F16 || hc[i]->type == DS4_TENSOR_F32 ||
+                hc[i]->type == DS4_TENSOR_Q8_0
 #if defined(DS4_HAS_QWEN4_GPU) && !defined(DS4_HAS_QWEN4_METAL)
-                                  || hc[i]->type == DS4_TENSOR_BF16
+                || hc[i]->type == DS4_TENSOR_BF16
+                || ((i == 0 || i == 2) && hc[i]->type == DS4_TENSOR_Q5_0)
+                || ((i == 1 || i == 3) && hc[i]->type == DS4_TENSOR_Q4_K)
 #endif
                 ;
-            if (!hc_up_ok) {
-                fprintf(stderr, "ds4: Qwen3.8 GPU graph needs F16/F32/Q8_0 hc up/inject weights (layer %u)\n", il);
+            if (!hc_up_or_inject_ok) {
+                fprintf(stderr, "ds4: Qwen3.8 GPU graph needs F16/F32/Q8_0 hc weights"
+                                " (CUDA also supports Q5_0 up and Q4_K inject; layer %u)\n", il);
                 return false;
             }
         }
@@ -64550,17 +64589,21 @@ typedef struct {
 } qwen4_cpu_moe_scratch;
 static qwen4_cpu_moe_scratch g_qwen4_cpu_moe;
 
-static bool qwen4_cpu_moe_scratch_ready(uint32_t ns) {
-    if (g_qwen4_cpu_moe.cap_ns >= ns && g_qwen4_cpu_moe.x && g_qwen4_cpu_moe.xq && g_qwen4_cpu_moe.ids &&
-        g_qwen4_cpu_moe.mid && g_qwen4_cpu_moe.part) {
-        return true;
-    }
+static void qwen4_cpu_moe_release(void) {
     ds4_gpu_host_free(g_qwen4_cpu_moe.x);
     ds4_gpu_host_free(g_qwen4_cpu_moe.xq);
     ds4_gpu_host_free(g_qwen4_cpu_moe.ids);
     ds4_gpu_host_free(g_qwen4_cpu_moe.mid);
     ds4_gpu_host_free(g_qwen4_cpu_moe.part);
     memset(&g_qwen4_cpu_moe, 0, sizeof(g_qwen4_cpu_moe));
+}
+
+static bool qwen4_cpu_moe_scratch_ready(uint32_t ns) {
+    if (g_qwen4_cpu_moe.cap_ns >= ns && g_qwen4_cpu_moe.x && g_qwen4_cpu_moe.xq && g_qwen4_cpu_moe.ids &&
+        g_qwen4_cpu_moe.mid && g_qwen4_cpu_moe.part) {
+        return true;
+    }
+    qwen4_cpu_moe_release();
     const uint32_t cap = ns > 0 ? ns : 1u;
     /* Pinned: these buffers cross the bus once per layer, and the driver's
      * pageable staging dominates a 10 KB transfer. */
@@ -64570,12 +64613,7 @@ static bool qwen4_cpu_moe_scratch_ready(uint32_t ns) {
     g_qwen4_cpu_moe.mid = (float *)ds4_gpu_host_alloc((uint64_t)cap * DS4_N_FF_EXP * sizeof(float));
     g_qwen4_cpu_moe.part = (float *)ds4_gpu_host_alloc((uint64_t)cap * DS4_N_EMBD * sizeof(float));
     if (!g_qwen4_cpu_moe.x || !g_qwen4_cpu_moe.xq || !g_qwen4_cpu_moe.ids || !g_qwen4_cpu_moe.mid || !g_qwen4_cpu_moe.part) {
-        ds4_gpu_host_free(g_qwen4_cpu_moe.x);
-        ds4_gpu_host_free(g_qwen4_cpu_moe.xq);
-        ds4_gpu_host_free(g_qwen4_cpu_moe.ids);
-        ds4_gpu_host_free(g_qwen4_cpu_moe.mid);
-        ds4_gpu_host_free(g_qwen4_cpu_moe.part);
-        memset(&g_qwen4_cpu_moe, 0, sizeof(g_qwen4_cpu_moe));
+        qwen4_cpu_moe_release();
         return false;
     }
     g_qwen4_cpu_moe.cap_ns = cap;
@@ -74449,6 +74487,24 @@ static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row,
         }
         break;
     }
+    case DS4_TENSOR_Q5_0: {
+        const uint64_t blocks = n / 32u;
+        const uint8_t *p = (const uint8_t *)tensor_data(m, t) + row * blocks * 22u;
+        for (uint64_t b = 0; b < blocks; b++, p += 22u) {
+            uint16_t dh;
+            uint32_t qh;
+            memcpy(&dh, p, sizeof(dh));
+            memcpy(&qh, p + 2, sizeof(qh));
+            const float d = f16_to_f32(dh);
+            for (uint32_t j = 0; j < 16u; j++) {
+                const uint32_t hi0 = ((qh >> j) << 4) & 0x10u;
+                const uint32_t hi1 = (qh >> (j + 12u)) & 0x10u;
+                out[b * 32u + j] = d * ((float)((p[6 + j] & 0x0fu) | hi0) - 16.0f);
+                out[b * 32u + 16u + j] = d * ((float)((p[6 + j] >> 4) | hi1) - 16.0f);
+            }
+        }
+        break;
+    }
     case DS4_TENSOR_Q4_K: {
         const uint64_t blocks = n / 256u;
         const uint8_t *p = (const uint8_t *)tensor_data(m, t) + row * blocks * 144u;
@@ -78283,9 +78339,29 @@ static int ds4_engine_open_internal(ds4_engine **out,
         const bool has_block =
             model_find_tensor(&sidecar, "blk.48.nextn.eh_proj.weight") != NULL &&
             model_find_tensor(&sidecar, "blk.48.attn_q.weight") != NULL;
+        bool sidecar_uses_q5_0 = false;
+        for (uint64_t i = 0; i < sidecar.n_tensors; i++) {
+            const ds4_tensor *t = &sidecar.tensors[i];
+            if (t->type == DS4_TENSOR_Q5_0 && t->name.len > 7 &&
+                memcmp(t->name.ptr, "blk.48.", 7) == 0) {
+                sidecar_uses_q5_0 = true;
+                break;
+            }
+        }
         if (!arch_ok || !has_block) {
             fprintf(stderr, "ds4: --mtp-model %s is not a Qwen3.8-Flash MTP sidecar "
                             "(need qwen4exp blk.48 with a nextn head)\n", opt->mtp_path);
+            model_close(&sidecar);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        /* Q5_0 HC projections have CUDA readers only. Do not absorb a
+         * sidecar on a backend that would merely validate then fail to decode.
+         * Q8/F16 sidecars keep their existing Metal support. */
+        if (sidecar_uses_q5_0 && e->backend != DS4_BACKEND_CUDA) {
+            fprintf(stderr,
+                    "ds4: Qwen3.8 Q5_0 MTP sidecar requires the CUDA backend\n");
             model_close(&sidecar);
             ds4_engine_close(e);
             *out = NULL;
@@ -80885,6 +80961,11 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_threads_shutdown();
 #ifndef DS4_NO_GPU
 #ifdef DS4_HAS_QWEN4_GPU
+    /* CUDA reset releases page-locked allocations. Do this while the current
+     * context is still alive so a later engine cannot reuse stale CPU-MoE
+     * scratch addresses (including the prefill counting-sort arrays). */
+    qwen4_cpu_moe_release();
+    qwen4_cpu_moe_pf_release();
     qwen4_state_pool_free(e);
     if (e->qwen4_shared_workspace) {
         qwen4_graph_free(e->qwen4_shared_workspace);

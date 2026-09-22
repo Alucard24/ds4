@@ -2028,6 +2028,14 @@ only aggregate top-token counts. Fresh and continued schedules can differ
 slightly; require exact same-schedule replay and independent task quality.
 Do not change kernel tolerances merely to accept a faster implementation.
 
+For the local 16 GiB split-`UD-IQ3_XXS` CUDA control, a same-run default TSV is
+the only acceptance baseline; do not compare it directly with the historical
+DGX Spark Q2/Q4, 8192-token-cap references. Run `validate_scores.py` on each
+complete paired long TSV. Accept a candidate only if its average NLL is at
+most 1.00% above that control and its total first-token matches, greedy-LCP
+tokens, and API top-1 matches do not decrease. This bounded local gate does
+not replace full release-artifact quality validation.
+
 Single-Spark Q2/Q4, resident weights and disk-only BF16 n-grams, Promessi Sposi,
 8192-token chunks and 128 teacher-forced decode tokens. These are two-run
 means; use the section 16 procedure for release medians:

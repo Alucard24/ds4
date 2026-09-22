@@ -3339,8 +3339,18 @@ int ds4_mmq_q8_0_dense_d2r_launch(
         fprintf(stderr, "ds4_mmq_q8_0_dense_d2r_launch: bad args M=%d N=%d K=%d\n", M, N, K);
         return -1;
     }
-    static int smem_opted = 0;
-    if (!smem_opted) {
+    /* Function attributes belong to each device context, not merely the
+     * process. Track the teardown epoch per device so a second GPU cannot
+     * inherit device 0's opt-in, and each reset reapplies its own attribute. */
+    static uint64_t smem_opted_epoch[GGML_CUDA_MAX_DEVICES] = {};
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
+        (void)cudaGetLastError();
+        return -2;
+    }
+    const uint64_t context_epoch = ds4_mmq_cuda_context_epoch();
+    if (smem_opted_epoch[device] != context_epoch) {
         const cudaError_t aerr = cudaFuncSetAttribute(
             dense_q8_d2r_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
             (int)kDqSmemTotalBytes);
@@ -3349,7 +3359,7 @@ int ds4_mmq_q8_0_dense_d2r_launch(
                     cudaGetErrorString(aerr));
             return -2;
         }
-        smem_opted = 1;
+        smem_opted_epoch[device] = context_epoch;
     }
     const uint64_t nblk = (uint64_t)M * (uint64_t)(K / 32);
     const uint64_t dq_bytes = (nblk * 2u + 63u) & ~63ull;

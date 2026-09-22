@@ -205,6 +205,13 @@ static int g_cuda_exact_score_split_fuse_inv_rope;
  * cleared by ds4_gpu_cleanup(), which cudaDeviceReset()s that context. */
 static int g_cuda_score_tile_shmem_ready[DS4_MAX_GPUS];
 static int g_cuda_score_tile_rows_shmem_ready[DS4_MAX_GPUS];
+static int g_cuda_q8_mma_attr_ready[DS4_MAX_GPUS][4];
+static int g_cuda_q4_mma_tile16_attr_ready[DS4_MAX_GPUS][2];
+static int g_cuda_q4_mma_tile16_attr_failed;
+static int g_cuda_tokentile_union_smem_ready[DS4_MAX_GPUS];
+static int g_qwen38_gdn_state_shared_ready[DS4_MAX_GPUS];
+/* Fenced cross-device handoff events are also context-owned. */
+static cudaEvent_t g_cuda_fence_events[DS4_MAX_GPUS];
 static int g_cuda_moe_decode_graph;
 static int g_current_logical_tier = -1;
 static int g_ssd_streaming_mode;
@@ -563,6 +570,9 @@ static cudaStream_t g_stream_selected_upload_stream;
 
 static int cuda_ok(cudaError_t err, const char *what);
 extern "C" void ds4_gpu_decode_graphs_invalidate(void);
+static void qwen38_split_scratch_release(void);
+static void cuda_profile_events_release(void);
+static void cuda_phase_events_release(void);
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
@@ -1133,10 +1143,10 @@ static inline cudaStream_t cuda_decode_stream(void) {
 }
 
 static void cuda_dsv41_shared_free(void) {
-    if (g_dsv41_shared.stream) (void)cudaStreamDestroy(g_dsv41_shared.stream);
     if (g_dsv41_shared.ready) (void)cudaEventDestroy(g_dsv41_shared.ready);
     if (g_dsv41_shared.done) (void)cudaEventDestroy(g_dsv41_shared.done);
     if (g_dsv41_shared.scratch) (void)cudaFree(g_dsv41_shared.scratch);
+    if (g_dsv41_shared.stream) (void)cudaStreamDestroy(g_dsv41_shared.stream);
     g_dsv41_shared = {};
 }
 
@@ -1180,6 +1190,38 @@ extern "C" void ds4_gpu_decode_graphs_invalidate(void) {
             }
         }
     }
+}
+
+/* Invalidation retains the stream for ordinary graph-cache churn. Full CUDA
+ * teardown must not: cudaDeviceReset invalidates its handle, and a later
+ * capture must create a stream in the new context. */
+static void cuda_decode_graphs_release(void) {
+    /* Decode-graph objects belong to tier 0. Cleanup may arrive with another
+     * tier current after a cross-device handoff, so select their owner before
+     * destroying its stream, graph executables, or cuBLAS association. */
+    int previous_device = -1;
+    bool restore_device = false;
+    if (g_n_gpus > 0) {
+        (void)cudaGetDevice(&previous_device);
+        if (cudaSetDevice(g_gpu[0].device_id) == cudaSuccess)
+            restore_device = previous_device >= 0 && previous_device != g_gpu[0].device_id;
+    }
+    if (g_decode_graph_capturing && g_decode_graph_stream) {
+        g_decode_graph_capturing = 0;
+        cudaGraph_t graph = NULL;
+        (void)cudaStreamEndCapture(g_decode_graph_stream, &graph);
+        if (graph) (void)cudaGraphDestroy(graph);
+    }
+    if (g_n_gpus > 0 && g_gpu[0].cublas)
+        (void)cublasSetStream((cublasHandle_t)g_gpu[0].cublas, NULL);
+    ds4_gpu_decode_graphs_invalidate();
+    if (g_decode_graph_stream) {
+        (void)cudaStreamDestroy(g_decode_graph_stream);
+        g_decode_graph_stream = NULL;
+    }
+    if (restore_device) (void)cudaSetDevice(previous_device);
+    g_decode_graph_captures = 0;
+    g_decode_graph_replays = 0;
 }
 
 static cuda_decode_graph_entry *cuda_decode_graph_find(
@@ -3086,14 +3128,41 @@ extern "C" int ds4_gpu_init(void) {
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
+    /* cudaDeviceReset applies only to the currently selected device. Preserve
+     * the configured physical ids while teardown clears g_n_gpus so every
+     * initialized context is reset before model mappings can disappear. */
+    int reset_devices[DS4_MAX_GPUS];
+    int reset_count = 0;
+    for (int i = 0; i < g_n_gpus; i++) {
+        const int device = g_gpu[i].device_id;
+        bool duplicate = false;
+        for (int j = 0; j < reset_count; j++) {
+            if (reset_devices[j] == device) { duplicate = true; break; }
+        }
+        if (device >= 0 && !duplicate) reset_devices[reset_count++] = device;
+    }
+
     ds4_gpu_stream_expert_cache_prefetch_finish(true);
     ds4_gpu_tp_shutdown();
     (void)cudaDeviceSynchronize();
-    ds4_gpu_decode_graphs_invalidate();
+    cuda_decode_graphs_release();
     /* MMQ pools outlive individual calls, but not cudaDeviceReset(). Dispose
      * of their host owners after graph executables and before streams and the
      * CUDA context disappear. */
     ds4_mmq_cleanup();
+    (void)cudaDeviceSynchronize();
+    /* These Qwen scratch slabs and timing-event caches are file-static rather
+     * than session-owned. Clear their host handles before resetting the CUDA
+     * context, or a later engine can reuse pointers/events from the old one. */
+    if (g_qwen38_gdn_scalars) (void)cudaFree(g_qwen38_gdn_scalars);
+    g_qwen38_gdn_scalars = NULL;
+    g_qwen38_gdn_scalars_bytes = 0;
+    if (g_qwen38_kv_widen) (void)cudaFree(g_qwen38_kv_widen);
+    g_qwen38_kv_widen = NULL;
+    g_qwen38_kv_widen_bytes = 0;
+    qwen38_split_scratch_release();
+    cuda_profile_events_release();
+    cuda_phase_events_release();
     g_current_logical_tier = -1;
 
     /* Multi-GPU teardown: events, streams, cublas handles, scratch
@@ -3108,14 +3177,19 @@ extern "C" void ds4_gpu_cleanup(void) {
             (void)cudaEventDestroy((cudaEvent_t)c->boundary_event);
             c->boundary_event = NULL;
         }
-        if (c->stream) {
-            (void)cudaStreamDestroy((cudaStream_t)c->stream);
-            c->stream = NULL;
+        if (g_cuda_fence_events[i]) {
+            (void)cudaEventDestroy(g_cuda_fence_events[i]);
+            g_cuda_fence_events[i] = NULL;
         }
         if (c->cublas) {
+            (void)cublasSetStream((cublasHandle_t)c->cublas, NULL);
             (void)cublasDestroy((cublasHandle_t)c->cublas);
             c->cublas = NULL;
             c->cublas_ready = 0;
+        }
+        if (c->stream) {
+            (void)cudaStreamDestroy((cudaStream_t)c->stream);
+            c->stream = NULL;
         }
         if (c->scratch) {
             (void)cudaFree(c->scratch);
@@ -3155,6 +3229,14 @@ extern "C" void ds4_gpu_cleanup(void) {
            sizeof(g_cuda_score_tile_shmem_ready));
     memset(g_cuda_score_tile_rows_shmem_ready, 0,
            sizeof(g_cuda_score_tile_rows_shmem_ready));
+    memset(g_cuda_q8_mma_attr_ready, 0, sizeof(g_cuda_q8_mma_attr_ready));
+    memset(g_cuda_q4_mma_tile16_attr_ready, 0,
+           sizeof(g_cuda_q4_mma_tile16_attr_ready));
+    g_cuda_q4_mma_tile16_attr_failed = 0;
+    memset(g_cuda_tokentile_union_smem_ready, 0,
+           sizeof(g_cuda_tokentile_union_smem_ready));
+    memset(g_qwen38_gdn_state_shared_ready, 0,
+           sizeof(g_qwen38_gdn_state_shared_ready));
     g_cublas_ready = 0;
 
     /* Per-device selective cache teardown (selective model cache). */
@@ -3230,10 +3312,14 @@ extern "C" void ds4_gpu_cleanup(void) {
         (void)cudaStreamDestroy(g_model_prefetch_stream);
         g_model_prefetch_stream = NULL;
     }
-    /* Release the CUDA context before the caller unmaps the model: driver
-     * threads and UVA references must be gone, or unmapping faults teardown
-     * (teardown SIGSEGV). Re-init recreates it if the process continues. */
-    (void)cudaDeviceReset();
+    /* Release every configured CUDA context before the caller unmaps the
+     * model: driver threads and UVA references must be gone, or unmapping
+     * faults teardown. Re-init recreates each context if the process
+     * continues. */
+    for (int i = 0; i < reset_count; i++) {
+        if (cudaSetDevice(reset_devices[i]) == cudaSuccess)
+            (void)cudaDeviceReset();
+    }
 }
 
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
@@ -4070,6 +4156,19 @@ static double g_prof_sum[DS4_GPU_PROF_STAGES];
 static uint64_t g_prof_cnt[DS4_GPU_PROF_STAGES];
 static uint64_t g_prof_tokens;
 
+static void cuda_profile_events_release(void) {
+    for (uint32_t i = 0; i < g_prof_n; i++) {
+        if (g_prof_ev[i]) (void)cudaEventDestroy(g_prof_ev[i]);
+        g_prof_ev[i] = NULL;
+    }
+    g_prof_n = 0;
+    g_prof_on = -1;
+    g_prof_tokens = 0;
+    memset(g_prof_stage, 0, sizeof(g_prof_stage));
+    memset(g_prof_sum, 0, sizeof(g_prof_sum));
+    memset(g_prof_cnt, 0, sizeof(g_prof_cnt));
+}
+
 extern "C" int ds4_gpu_prof_mark(int stage) {
     if (g_prof_on < 0) {
         const char *tv = getenv("DS4_QWEN4_TIMING");
@@ -4394,7 +4493,6 @@ extern "C" int ds4_gpu_set_current_device(int logical_tier) {
  * device does not change. */
 extern "C" int ds4_gpu_set_current_device_fenced(int logical_tier) {
     if (logical_tier < 0 || logical_tier >= g_n_gpus) return -1;
-    static cudaEvent_t fence_ev[DS4_MAX_GPUS];
     /* Resolve the ACTUAL current device: WITH_DEVICE blocks and direct
      * cudaSetDevice calls can leave g_current_logical_tier stale, and a
      * false "already there" here strands work on the wrong device. */
@@ -4413,21 +4511,21 @@ extern "C" int ds4_gpu_set_current_device_fenced(int logical_tier) {
     }
     if (prev >= 0 && prev < g_n_gpus && prev != logical_tier) {
         if (cudaSetDevice(g_gpu[prev].device_id) != cudaSuccess) return -1;
-        if (!fence_ev[prev] &&
-            cudaEventCreateWithFlags(&fence_ev[prev],
+        if (!g_cuda_fence_events[prev] &&
+            cudaEventCreateWithFlags(&g_cuda_fence_events[prev],
                                      cudaEventDisableTiming) != cudaSuccess) {
-            fence_ev[prev] = NULL;
+            g_cuda_fence_events[prev] = NULL;
         }
-        if (fence_ev[prev]) {
-            (void)cudaEventRecord(fence_ev[prev], 0);
+        if (g_cuda_fence_events[prev]) {
+            (void)cudaEventRecord(g_cuda_fence_events[prev], 0);
         }
         if (cudaSetDevice(g_gpu[logical_tier].device_id) != cudaSuccess) {
             g_current_logical_tier = -1;
             return -1;
         }
         g_current_logical_tier = logical_tier;
-        if (fence_ev[prev]) {
-            (void)cudaStreamWaitEvent(0, fence_ev[prev], 0);
+        if (g_cuda_fence_events[prev]) {
+            (void)cudaStreamWaitEvent(0, g_cuda_fence_events[prev], 0);
         }
         return 0;
     }
@@ -6694,7 +6792,6 @@ static int cuda_q4_mma_ok(void) {
     }
     return cached;
 }
-static int cuda_q8_mma_attr_ready[DS4_MAX_GPUS][4];
 static int cuda_q8_mma_try_launch(
         float *out,
         const unsigned char *w,
@@ -6725,7 +6822,7 @@ static int cuda_q8_mma_try_launch(
                     (((unsigned)out_dim + 63u) / 64u + 7u) / 8u, 1);
 #define DS4_Q8_MMA_LAUNCH(TT) \
     do { \
-        if (!cuda_q8_mma_attr_ready[dev][ti]) { \
+        if (!g_cuda_q8_mma_attr_ready[dev][ti]) { \
             cudaFuncAttributes fn_attr; \
             if (cudaFuncGetAttributes(&fn_attr, matmul_q8_0_mma_exact_kernel<TT>) != cudaSuccess || \
                 fn_attr.binaryVersion < 80 || fn_attr.ptxVersion < 80) { \
@@ -6738,7 +6835,7 @@ static int cuda_q8_mma_try_launch(
                 disabled = 1; \
                 return 0; \
             } \
-            cuda_q8_mma_attr_ready[dev][ti] = 1; \
+            g_cuda_q8_mma_attr_ready[dev][ti] = 1; \
         } \
         matmul_q8_0_mma_exact_kernel<TT><<<grid, 256, shmem>>>( \
                 out, w, xq, xscale, in_dim, out_dim, n_tok, blocks, \
@@ -18675,8 +18772,13 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                 /* The launch limit includes the kernel's static scan array,
                  * so opt in to the largest bitmap admitted by this path even
                  * when the dynamic bitmap alone is just under 48 KiB. */
-                static int union_smem_attr_set = 0;
-                if (!union_smem_attr_set) {
+                int union_dev = -1;
+                if (cudaGetDevice(&union_dev) != cudaSuccess ||
+                    union_dev < 0 || union_dev >= DS4_MAX_GPUS) {
+                    (void)cudaGetLastError();
+                    return 0;
+                }
+                if (!g_cuda_tokentile_union_smem_ready[union_dev]) {
                     const int max_bitmap_smem =
                         (int)(((32768u + 1u) >> 1u) * sizeof(uint32_t));
                     if (!cuda_ok(cudaFuncSetAttribute(
@@ -18686,7 +18788,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                         "set token-tile union shared-memory limit")) {
                         return 0;
                     }
-                    union_smem_attr_set = 1;
+                    g_cuda_tokentile_union_smem_ready[union_dev] = 1;
                 }
                 if (!cuda_ok(cudaFuncSetAttribute(
                     attention_tokentile_hmma_kernel,
@@ -24064,20 +24166,18 @@ __global__ static void moe_down_q4K_tile16_mma_kernel(
 
 static int cuda_q4_mma_tile16_shmem_ok(int which_down) {
     /* Opt the tile16 kernels into >48KB dynamic shared memory, per device. */
-    static int ready[DS4_MAX_GPUS][2];
-    static int failed = 0;
-    if (failed) return 0;
+    if (g_cuda_q4_mma_tile16_attr_failed) return 0;
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev < 0 || dev >= DS4_MAX_GPUS) return 0;
-    if (ready[dev][which_down]) return 1;
+    if (g_cuda_q4_mma_tile16_attr_ready[dev][which_down]) return 1;
     cudaFuncAttributes fn_attr;
     cudaError_t err = which_down
         ? cudaFuncGetAttributes(&fn_attr, moe_down_q4K_tile16_mma_kernel<512>)
         : cudaFuncGetAttributes(&fn_attr, moe_gate_up_mid_q4K_tile16_mma_kernel<512>);
     if (err != cudaSuccess || fn_attr.binaryVersion < 80 ||
         fn_attr.ptxVersion < 80) {
-        failed = 1;
+        g_cuda_q4_mma_tile16_attr_failed = 1;
         return 0;
     }
     const int bytes = (int)(16u * 16u * sizeof(cuda_block_q8_K));
@@ -24101,10 +24201,10 @@ static int cuda_q4_mma_tile16_shmem_ok(int which_down) {
                                        cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
     }
     if (err != cudaSuccess) {
-        failed = 1;
+        g_cuda_q4_mma_tile16_attr_failed = 1;
         return 0;
     }
-    ready[dev][which_down] = 1;
+    g_cuda_q4_mma_tile16_attr_ready[dev][which_down] = 1;
     return 1;
 }
 
@@ -29158,17 +29258,22 @@ static const float *qwen38_cuda_f32_weight(
     (QWEN38_CUDA_HEAD_DIM * QWEN38_CUDA_HEAD_DIM * sizeof(float))
 
 /* Static shared memory is capped at 48 KiB, so the 64 KiB state tile has to be
- * dynamic and the kernel needs the opt-in attribute.  Set it once. */
+ * dynamic and the kernel needs the opt-in attribute once per CUDA context. */
 static void qwen38_gdn_ensure_state_shared(void) {
-    static int done = 0;
-    if (done) return;
-    done = 1;
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= DS4_MAX_GPUS) {
+        (void)cudaGetLastError();
+        return;
+    }
+    if (g_qwen38_gdn_state_shared_ready[dev]) return;
     if (cudaFuncSetAttribute(qwen38_gdn_decode_kernel,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                              (int)QWEN38_GDN_STATE_SHARED_BYTES) != cudaSuccess) {
         fprintf(stderr, "ds4: Qwen GDN shared-state attribute failed: %s\n",
                 cudaGetErrorString(cudaGetLastError()));
+        return;
     }
+    g_qwen38_gdn_state_shared_ready[dev] = 1;
 }
 
 extern "C" int ds4_gpu_qwen38_gdn_chunk(
@@ -29526,6 +29631,12 @@ static uint32_t qwen38_split_parts(void) {
 
 static float *g_qwen38_split_scratch;
 static uint32_t g_qwen38_split_scratch_parts;
+
+static void qwen38_split_scratch_release(void) {
+    if (g_qwen38_split_scratch) (void)cudaFree(g_qwen38_split_scratch);
+    g_qwen38_split_scratch = NULL;
+    g_qwen38_split_scratch_parts = 0;
+}
 
 static float *qwen38_split_scratch(uint32_t parts, cudaStream_t stream) {
     const uint64_t want = (uint64_t)parts * QWEN38_CUDA_GA_HEADS *
@@ -35082,6 +35193,16 @@ static cudaEvent_t g_phase_events[DS4_PHASE_MARK_MAX];
 static int         g_phase_groups[DS4_PHASE_MARK_MAX];
 static int         g_phase_count;
 static int         g_phase_created;
+
+static void cuda_phase_events_release(void) {
+    for (int i = 0; i < g_phase_created; i++) {
+        if (g_phase_events[i]) (void)cudaEventDestroy(g_phase_events[i]);
+        g_phase_events[i] = NULL;
+    }
+    g_phase_count = 0;
+    g_phase_created = 0;
+    memset(g_phase_groups, 0, sizeof(g_phase_groups));
+}
 
 extern "C" void ds4_gpu_phase_reset(void) {
     g_phase_count = 0;

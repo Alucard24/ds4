@@ -358,6 +358,7 @@ static uint64_t row_bytes(uint32_t type, uint64_t n) {
     case 0: return n * 4;
     case 1: case 30: return n * 2;
     case 2: return n % 32 ? 0 : n / 32 * 18;
+    case 6: return n % 32 ? 0 : n / 32 * 22;
     case 8: return n % 32 ? 0 : n / 32 * 34;
     case 39: return n % 32 ? 0 : n / 32 * 17;
     case 10: return n % 256 ? 0 : n / 256 * 84;
@@ -424,6 +425,20 @@ __device__ __forceinline__ float value(const char *row, unsigned i,
         const uint8_t *b = (const uint8_t *)row + (i / 32) * 18;
         return __half2float(*(const __half *)b) *
             (float)((int)((b[2 + i % 16] >> (4 * (i % 32 / 16))) & 15) - 8);
+    }
+    /* Q5_0 (the Q4 MTP sidecar's HC up projections): f16 delta,
+     * 32 high bits, then 16 packed low-nibble pairs. */
+    if (TYPE == 6) {
+        const uint8_t *b = (const uint8_t *)row + (i / 32) * 22;
+        const unsigned j = i % 32, p = j % 16;
+        uint16_t dh;
+        uint32_t qh;
+        memcpy(&dh, b, sizeof(dh));
+        memcpy(&qh, b + 2, sizeof(qh));
+        const unsigned q = j < 16 ?
+            ((b[6 + p] & 15u) | (((qh >> p) & 1u) << 4)) :
+            ((b[6 + p] >> 4) | (((qh >> (p + 16)) & 1u) << 4));
+        return dev_f16_to_f32(dh) * (float)((int)q - 16);
     }
     if (TYPE == 39) {
         const uint8_t *b = (const uint8_t *)row + (i / 32) * 17;
@@ -600,6 +615,7 @@ __device__ __forceinline__ float scalar(const char *row, unsigned i, unsigned ty
     case 0: return value<0>(row, i);
     case 1: return value<1>(row, i);
     case 2: return value<2>(row, i);
+    case 6: return value<6>(row, i);
     case 8: return value<8>(row, i);
     case 12: return value<12>(row, i);
     case 13: return value<13>(row, i);
@@ -1299,7 +1315,7 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
         else if (down) matrix_reg<TYPE,true,2><<<tcgrid,128,0,cuda_decode_stream()>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); \
         else matrix_reg<TYPE,false,2><<<tcgrid,128,0,cuda_decode_stream()>>>(out,x,w0,w1,lists,counts,tiles,NE,NS,NO,K,M,cap,rb); break
         switch (type) {
-        QWEN_TC(0); QWEN_TC(1); QWEN_TC(2); QWEN_TC(8); QWEN_TC(10);
+        QWEN_TC(0); QWEN_TC(1); QWEN_TC(2); QWEN_TC(6); QWEN_TC(8); QWEN_TC(10);
         QWEN_TC(12); QWEN_TC(13); QWEN_TC(14); QWEN_TC(16); QWEN_TC(17); QWEN_TC(18);
         QWEN_TC(20); QWEN_TC(21); QWEN_TC(22); QWEN_TC(23); QWEN_TC(30); QWEN_TC(39); QWEN_TC(42);
         default: return 0;
@@ -1312,7 +1328,7 @@ static int matrix_dispatch(float *out, const float *x, const char *w0, const cha
     else if (down) matrix<TYPE,true,true><<<grid,256,0,cuda_decode_stream()>>>(out,x,w0,w1,lists,counts,T,NS,NO,K,M,cap,rb); \
     else matrix<TYPE,false,true><<<grid,256,0,cuda_decode_stream()>>>(out,x,w0,w1,lists,counts,T,NS,NO,K,M,cap,rb); break
     switch (type) {
-    QWEN_MM(0); QWEN_MM(1); QWEN_MM(2); QWEN_MM(8); QWEN_MM(10);
+    QWEN_MM(0); QWEN_MM(1); QWEN_MM(2); QWEN_MM(6); QWEN_MM(8); QWEN_MM(10);
     QWEN_MM(12); QWEN_MM(16); QWEN_MM(30); QWEN_MM(39);
     default: return 0;
     }
@@ -1435,7 +1451,7 @@ static int matvec_dispatch(float *out, const char *w, const float *x,
     else if (T > 4 && T <= 8) matvec_rows<TYPE,8><<<(M+3)/4,128,0,cuda_decode_stream()>>>(out,w,x,T,K,M,stride); \
     else matvec<TYPE><<<grid,128,0,cuda_decode_stream()>>>(out,w,x,K,M,stride); break
     switch (type) {
-    QWEN_MV(0); QWEN_MV(1); QWEN_MV(2); QWEN_MV(8); QWEN_MV(10);
+    QWEN_MV(0); QWEN_MV(1); QWEN_MV(2); QWEN_MV(6); QWEN_MV(8); QWEN_MV(10);
     QWEN_MV(12); QWEN_MV(13); QWEN_MV(14); QWEN_MV(16); QWEN_MV(20); QWEN_MV(21); QWEN_MV(23); QWEN_MV(30); QWEN_MV(39); QWEN_MV(42);
     default: return 0;
     }
@@ -1614,7 +1630,7 @@ static int dense_blas(float *out, const float *x, const char *w,
         if (type) {
 #define QWEN_UNPACK(TYPE) case TYPE: unpack<TYPE><<<((uint64_t)n*K+255)/256,256,0,cuda_decode_stream()>>>(scratch,w+(uint64_t)r*rb,K,n,rb); break
             switch (type) {
-            QWEN_UNPACK(1); QWEN_UNPACK(2); QWEN_UNPACK(8); QWEN_UNPACK(10);
+            QWEN_UNPACK(1); QWEN_UNPACK(2); QWEN_UNPACK(6); QWEN_UNPACK(8); QWEN_UNPACK(10);
             QWEN_UNPACK(12); QWEN_UNPACK(13); QWEN_UNPACK(14); QWEN_UNPACK(16); QWEN_UNPACK(20); QWEN_UNPACK(21);
             QWEN_UNPACK(23); QWEN_UNPACK(30); QWEN_UNPACK(39); QWEN_UNPACK(42);
             default: return 0;
@@ -2117,12 +2133,13 @@ extern "C" int ds4_gpu_qwen4_hc_norm_tensor(ds4_gpu_tensor *xn, ds4_gpu_tensor *
         (ni && !tensor(inj, (uint64_t)T * hc * 8 * ni * 4))) return 0;
     const char *gamma = weight(map, size, go, (uint64_t)E * hc * 4);
     const char *wi = ni ? weight(map, size, io, row_bytes(type, (uint64_t)E * hc) * ni) : gamma;
-    if (!gamma || !wi || (type != 0 && type != 1 && type != 8 && type != 30)) return 0;
+    if (!gamma || !wi || (type != 0 && type != 1 && type != 8 && type != 12 && type != 30)) return 0;
     if (T > 8) {
 #define QWEN_HC_NORM(TYPE) hc_norm_prefill<TYPE><<<dim3(hc,T),256,0,cuda_decode_stream()>>>((float *)xn->ptr, \
         ni ? (float *)inj->ptr : NULL,(const float *)R->ptr,(const float *)gamma,wi,E,hc,ni,eps)
         if (type == 0) { QWEN_HC_NORM(0); }
         else if (type == 1) { QWEN_HC_NORM(1); }
+        else if (type == 12) { QWEN_HC_NORM(12); }
         else if (type == 30) { QWEN_HC_NORM(30); }
         else { QWEN_HC_NORM(8); }
 #undef QWEN_HC_NORM
@@ -2140,11 +2157,12 @@ extern "C" int ds4_gpu_qwen4_hc_gate_mix_tensor(ds4_gpu_tensor *out,
     if (!T || !E || !hc || hc > 4 || !rank || !tensor(out, (uint64_t)T * E * 4) ||
         !tensor(xn, (uint64_t)T * E * hc * 4) || !tensor(lo, (uint64_t)T * rank * 4)) return 0;
     const char *w = weight(map, size, offset, row_bytes(type, rank) * E * hc);
-    if (!w || (type != 0 && type != 1 && type != 8 && type != 30)) return 0;
+    if (!w || (type != 0 && type != 1 && type != 6 && type != 8 && type != 30)) return 0;
 #define QWEN_HC(TYPE) hc_mix<TYPE><<<dim3((E + 3) / 4, T),128,0,cuda_decode_stream()>>>((float *)out->ptr, \
         (const float *)xn->ptr,(const float *)lo->ptr,w,E,hc,rank,row_bytes(TYPE,rank))
     if (type == 0) { QWEN_HC(0); }
     else if (type == 1) { QWEN_HC(1); }
+    else if (type == 6) { QWEN_HC(6); }
     else if (type == 30) { QWEN_HC(30); }
     else { QWEN_HC(8); }
 #undef QWEN_HC
@@ -2494,22 +2512,6 @@ extern "C" int ds4_gpu_qwen4_mtp_stage_tensor(ds4_gpu_tensor *cat, const ds4_gpu
         !tensor(e,(uint64_t)E*4) || !tensor(R,(uint64_t)hc*E*4)) return 0;
     const char *ge = weight(map,size,eo,(uint64_t)E*4), *gh = weight(map,size,ho,(uint64_t)hc*E*4);
     if (!ge || !gh) return 0;
-#if 1 /* TEMP-DEBUG MTP fault: classify every pointer. Remove after fix. */
-    {
-        const void *ptrs[5] = {cat->ptr, e->ptr, R->ptr, ge, gh};
-        const char *names[5] = {"cat", "e", "R", "ge", "gh"};
-        for (int pi = 0; pi < 5; pi++) {
-            struct cudaPointerAttributes attr;
-            memset(&attr, 0, sizeof(attr));
-            cudaError_t pe = cudaPointerGetAttributes(&attr, ptrs[pi]);
-            fprintf(stderr, "ds4: [tmp-mtp] %s=%p attr=%d dev=%d err=%d\n",
-                    names[pi], ptrs[pi],
-                    pe == cudaSuccess ? attr.type : -1,
-                    pe == cudaSuccess ? attr.device : -1, (int)pe);
-            (void)cudaGetLastError();
-        }
-    }
-#endif
     mtp_stage<<<hc+1,256,0,cuda_decode_stream()>>>((float *)cat->ptr,(const float *)e->ptr,
         (const float *)R->ptr,(const float *)ge,(const float *)gh,E,hc,eps);
     return launched();

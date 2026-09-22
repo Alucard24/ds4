@@ -156,6 +156,36 @@ static uint64_t arena_bf16(arena_t *a, uint64_t n, double **shadow, float scale)
 }
 
 /* q4_0 rows: 18-byte blocks of 32 (f16 scale, 16 nibble bytes; low nibbles first) */
+/* q5_0 rows: f16 delta, 32 high bits and 16 packed low-nibble pairs. */
+static uint64_t arena_q5_0(arena_t *a, uint64_t rows, uint64_t cols, double **shadow, float scale) {
+    const uint64_t blocks = cols / 32;
+    const uint64_t off = arena_alloc(a, rows * blocks * 22u);
+    uint8_t *w = a->base + off;
+    *shadow = malloc(rows * cols * sizeof(double));
+    for (uint64_t r = 0; r < rows; r++) {
+        for (uint64_t b = 0; b < blocks; b++) {
+            uint8_t *blk = w + (r * blocks + b) * 22u;
+            const uint16_t dh = f32_to_f16(scale / 16.0f);
+            const float d = f16_to_f32(dh);
+            uint32_t qh = 0;
+            memset(blk, 0, 22u);
+            memcpy(blk, &dh, sizeof(dh));
+            for (unsigned j = 0; j < 16; j++) {
+                const unsigned q0 = g_rng & 31u;
+                const unsigned q1 = (g_rng >> 5) & 31u;
+                g_rng = g_rng * 1664525u + 1013904223u;
+                blk[6 + j] = (uint8_t)((q0 & 15u) | ((q1 & 15u) << 4));
+                qh |= (q0 >> 4) << j;
+                qh |= (q1 >> 4) << (j + 16);
+                (*shadow)[r * cols + b * 32 + j] = d * ((int)q0 - 16);
+                (*shadow)[r * cols + b * 32 + 16 + j] = d * ((int)q1 - 16);
+            }
+            memcpy(blk + 2, &qh, sizeof(qh));
+        }
+    }
+    return off;
+}
+
 static uint64_t arena_q4_0(arena_t *a, uint64_t rows, uint64_t cols, double **shadow, float scale) {
     const uint64_t blocks = cols / 32;
     const uint64_t off = arena_alloc(a, rows * blocks * 18u);
@@ -507,20 +537,26 @@ static float *rand_vec(uint64_t n, float scale) {
 /* ---- hyper-connections ---- */
 
 static void test_hc(arena_t *a, uint32_t E, uint32_t rank, uint32_t T, uint32_t wtype) {
-    const bool f16 = wtype == 1u, q8 = wtype == 8u;
+    const bool f16 = wtype == 1u, q8 = wtype == 8u, q5_sidecar = wtype == 6u;
     const uint32_t hc = 4, dim = E * hc, CH = DS4_QWEN4_HC_CHUNKS;
+    const uint32_t down_type = q5_sidecar ? 12u : wtype;
+    const uint32_t inj_type = q5_sidecar ? 12u : wtype;
     const float eps = 1e-6f;
     double *g_gamma, *g_down, *g_up, *g_inj;
     const uint64_t gamma_off = arena_f32(a, dim, &g_gamma, 0.5f, 1.5f);
-    const uint64_t down_off = q8 ? arena_q8_0(a, rank, dim, &g_down, 0.05f)
+    /* Q4_K down/inject plus Q5_0 up matches the Q4_K_M MTP sidecar. */
+    const uint64_t down_off = down_type == 12u ? arena_q4_K(a, rank, dim, &g_down, 0.05f)
+                            : q8 ? arena_q8_0(a, rank, dim, &g_down, 0.05f)
                             : f16 ? arena_f16(a, (uint64_t)rank * dim, &g_down, 0.05f)
                                   : arena_f32(a, (uint64_t)rank * dim, &g_down, -0.05f, 0.05f);
-    /* q8 up rows need rank % 32; smaller ranks keep f16 like the converter does */
-    const uint32_t up_type = q8 && (rank % 32) == 0 ? 8u : q8 ? 1u : wtype;
+    /* q8 up rows need rank % 32; smaller ranks keep f16 like the converter does. */
+    const uint32_t up_type = q5_sidecar ? 6u : q8 && (rank % 32) == 0 ? 8u : q8 ? 1u : wtype;
     const uint64_t up_off = up_type == 8u ? arena_q8_0(a, dim, rank, &g_up, 0.2f)
+                          : up_type == 6u ? arena_q5_0(a, dim, rank, &g_up, 0.2f)
                           : up_type == 1u ? arena_f16(a, (uint64_t)dim * rank, &g_up, 0.2f)
                                           : arena_f32(a, (uint64_t)dim * rank, &g_up, -0.2f, 0.2f);
-    const uint64_t inj_off = q8 ? arena_q8_0(a, hc, dim, &g_inj, 0.05f)
+    const uint64_t inj_off = inj_type == 12u ? arena_q4_K(a, hc, dim, &g_inj, 0.05f)
+                           : q8 ? arena_q8_0(a, hc, dim, &g_inj, 0.05f)
                            : f16 ? arena_f16(a, (uint64_t)hc * dim, &g_inj, 0.05f)
                                  : arena_f32(a, (uint64_t)hc * dim, &g_inj, -0.05f, 0.05f);
     float *R = rand_vec((uint64_t)T * dim, 1.0f);
@@ -578,7 +614,7 @@ static void test_hc(arena_t *a, uint32_t E, uint32_t rank, uint32_t T, uint32_t 
     ds4_gpu_tensor *ginj = upload(NULL, (uint64_t)T * hc * CH * hc);
     ds4_gpu_tensor *gmixed = upload(NULL, (uint64_t)T * E);
     ds4_gpu_tensor *gblk = upload(blk, (uint64_t)T * E);
-    require_ok(ds4_gpu_qwen4_hc_norm_tensor(gxn, ginj, gR, a->base, a->size, gamma_off, inj_off, wtype, T, E, hc, hc, eps),
+    require_ok(ds4_gpu_qwen4_hc_norm_tensor(gxn, ginj, gR, a->base, a->size, gamma_off, inj_off, inj_type, T, E, hc, hc, eps),
                "hc norm");
 #ifdef __APPLE__
     require_ok(q8 ? ds4_gpu_matmul_q8_0_tensor(glo, a->base, a->size, down_off, dim, rank, gxn, T)
@@ -586,13 +622,13 @@ static void test_hc(arena_t *a, uint32_t E, uint32_t rank, uint32_t T, uint32_t 
                    : ds4_gpu_matmul_f32_tensor(glo, a->base, a->size, down_off, dim, rank, gxn, T), "hc down gemv");
 #else
     require_ok(ds4_gpu_qwen4_dense_mm_tensor(glo, gxn, a->base, a->size,
-                    down_off, wtype, T, dim, rank), "hc down projection");
+                    down_off, down_type, T, dim, rank), "hc down projection");
 #endif
     require_ok(ds4_gpu_qwen4_hc_gate_mix_tensor(gmixed, gxn, glo, a->base, a->size, up_off, up_type, T, E, hc, rank),
                "hc gate mix");
     require_ok(ds4_gpu_qwen4_hc_combine_tensor(gR, gblk, ginj, T, E, hc), "hc combine");
     char name[96];
-    const char *tname = q8 ? "q8_0" : f16 ? "f16" : "f32";
+    const char *tname = q5_sidecar ? "q4_K/q5_0" : q8 ? "q8_0" : f16 ? "f16" : "f32";
     snprintf(name, sizeof(name), "hc E=%u rank=%u T=%u %s: xn", E, rank, T, tname);
     check_tensor(name, gxn, xn, (uint64_t)T * dim, 1e-5);
     snprintf(name, sizeof(name), "hc E=%u rank=%u T=%u %s: lowrank", E, rank, T, tname);
@@ -1352,6 +1388,9 @@ static void test_attention(arena_t *a, uint32_t H, uint32_t Hkv, uint32_t D, uin
     free(gq_w); free(gk_w); free(giq_w); free(gik_w);
 }
 
+/* These decode-batch launchers are Metal-specific. CUDA runs its ordered
+ * per-session path instead, which the common attention/MoE tests below cover. */
+#ifdef __APPLE__
 static void same_bytes(const char *what, uint32_t row, const ds4_gpu_tensor *ta, uint64_t offa,
                        const ds4_gpu_tensor *tb, uint64_t offb, uint64_t bytes) {
     uint8_t *a = malloc(bytes), *b = malloc(bytes);
@@ -1525,6 +1564,7 @@ static void test_attention_rows(arena_t *a) {
     free(ik); free(iq); free(vp); free(kp); free(qg);
     free(gq_w); free(gk_w); free(giq_w); free(gik_w);
 }
+#endif
 
 /* ---- routed experts ---- */
 
@@ -2043,6 +2083,7 @@ static void test_mv_ext_groups(arena_t *a) {
 
 /* The grouped decode-batch kernels must reproduce the per-token kernels bit
  * for bit under heavy expert reuse (sixteen rows over eight experts). */
+#ifdef __APPLE__
 static void test_moe_grouped(arena_t *a) {
     const uint32_t NE = 8, slots = 6, E = 2560, F = 640, T = 16, cap = 64;
     double *gate_w, *up_w, *down_w;
@@ -2081,6 +2122,7 @@ static void test_moe_grouped(arena_t *a) {
     ds4_gpu_tensor_free(gcounts); ds4_gpu_tensor_free(glists); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gx);
     free(sel); free(x);
 }
+#endif
 
 static void test_hc_pair_groups(arena_t *a) {
     const uint32_t types[] = {1u, 0u, 8u}, widths[] = {9u, 64u, 2560u};
@@ -3424,6 +3466,7 @@ static void test_half_expert_tiles(arena_t *a, uint32_t T, uint32_t type, uint32
 /* dense tiled GEMM against a double reference for f32, f16 and q8_0 rows */
 /* The decode-batch Q8 GEMM: reference in double, and the same sums the
  * per-token matvec finds, to rounding. */
+#ifdef __APPLE__
 static void test_batch_mm_q8(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T) {
     double *sh;
     const uint64_t off = arena_q8_0(a, rows, in_dim, &sh, 0.05f);
@@ -3453,10 +3496,12 @@ static void test_batch_mm_q8(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_
     free(bm); free(am); free(ref); free(x); free(sh);
     ds4_gpu_tensor_free(gmv); ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gx);
 }
+#endif
 
 static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T, uint32_t wtype) {
     double *sh;
     uint64_t off = wtype == 8u ? arena_q8_0(a, rows, in_dim, &sh, 0.05f)
+                 : wtype == 6u ? arena_q5_0(a, rows, in_dim, &sh, 0.05f)
                  : wtype == 1u ? arena_f16(a, (uint64_t)rows * in_dim, &sh, 0.05f)
                                : arena_f32(a, (uint64_t)rows * in_dim, &sh, -0.05f, 0.05f);
     float *x = rand_vec((uint64_t)T * in_dim, 1.0f);
@@ -3534,6 +3579,8 @@ int main(void) {
         test_dense_mm_large(&arena, 1u);
         test_dense_mm_large(&arena, 8u);
         test_dense_mm(&arena, 10240, 1700, 32, 8u);
+        test_dense_mm(&arena, 320, 10240, 1, 6u);
+        test_dense_mm(&arena, 320, 10240, 33, 6u);
         test_dense_mm(&arena, 320, 10240, 40, 1u);
         test_dense_mm(&arena, 67, 97, 35, 1u);
         test_dense_mm(&arena, 96, 129, 35, 8u);
@@ -3590,7 +3637,9 @@ int main(void) {
     test_qwen4_argmax();
     test_hc_pair_groups(&arena);
     test_mv_ext_groups(&arena);
+#ifdef __APPLE__
     test_moe_grouped(&arena);
+#endif
     test_hc_mix_prefetch(&arena);
     test_hc(&arena, 2560, 320, 3, 1u);
     test_hc(&arena, 2560, 320, 2, 1u);
@@ -3598,6 +3647,10 @@ int main(void) {
     test_hc(&arena, 2560, 320, 1, 0u);
     test_hc(&arena, 2560, 320, 2, 8u);
     test_hc(&arena, 2560, 320, 1, 8u);
+#ifndef __APPLE__
+    test_hc(&arena, 2560, 320, 1, 6u);
+    test_hc(&arena, 2560, 320, 2, 6u);
+#endif
     test_hc(&arena, 64, 8, 5, 1u);
     test_hc(&arena, 64, 8, 2, 0u);
     test_hc(&arena, 64, 8, 1, 8u);
@@ -3632,7 +3685,9 @@ int main(void) {
     printf("attention\n");
     test_attention(&arena, 24, 2, 256, 64, 4, 128, 2, 21);
     test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
+#ifdef __APPLE__
     test_attention_rows(&arena);
+#endif
     printf("routed experts\n");
     test_moe(&arena, 16, 10, 2560, 640, 2, 8u);
     test_moe(&arena, 16, 10, 2560, 640, 1, 12u);
@@ -3657,9 +3712,11 @@ int main(void) {
     test_moe_mm_tiles_iq2(&arena);
     printf("dense mm\n");
     test_dense_mm(&arena, 2560, 512, 37, 0u);
+#ifdef __APPLE__
     test_batch_mm_q8(&arena, 2560, 640, 16);
     test_batch_mm_q8(&arena, 6144, 2560, 16);
     test_batch_mm_q8(&arena, 2560, 128, 8);
+#endif
     test_dense_mm(&arena, 10240, 320, 33, 1u);
     test_dense_mm(&arena, 320, 10240, 40, 1u);
     test_dense_mm(&arena, 2560, 100, 9, 8u);
@@ -3674,6 +3731,8 @@ int main(void) {
     test_half_expert_tiles(&arena,2049,12,39,192);
     test_dense_mm(&arena, 2560, 100, 37, 8u);
     test_dense_mm(&arena, 10240, 1700, 32, 8u);
+    test_dense_mm(&arena, 320, 10240, 1, 6u);
+    test_dense_mm(&arena, 320, 10240, 33, 6u);
     test_dense_mm_large(&arena, 1u);
     test_dense_mm_large(&arena, 8u);
     test_dense_mm(&arena, 67, 97, 35, 1u);
