@@ -1314,8 +1314,9 @@ static char *agent_build_dsml_tools_prompt(bool edit_upto, bool vision) {
     size_t b = strlen(edit);
     size_t c = strlen(agent_tools_prompt_after_edit);
     const char *vision_start = "\n{\"type\":\"function\",\"function\":";
-    size_t v = vision ? strlen(vision_start) + strlen(agent_vision_tool_schema) +
-                             strlen(agent_video_tool_schema) + 6 : 0;
+    /* "%s%s}%s%s}\n" emits two wrappers, two closing braces, and a newline. */
+    size_t v = vision ? 2 * strlen(vision_start) + strlen(agent_vision_tool_schema) +
+                             strlen(agent_video_tool_schema) + 3 : 0;
     char *out = xmalloc(a + b + c + v + 1);
     memcpy(out, agent_tools_prompt_intro, a);
     memcpy(out + a, edit, b);
@@ -1387,7 +1388,11 @@ static const char agent_qwen_tools_prompt_intro[] =
     "You may call one or more functions to assist with the user query.\n\n"
     "You are provided with function signatures within <tools></tools> XML tags:\n"
     "<tools>";
-/parameter>. "
+
+static const char agent_qwen_tools_prompt_after_schemas[] =
+    "\n</tools>\n\n"
+    AGENT_TOOL_CONTRACTS
+    "Inside argument values only, escape a literal </parameter> as &lt;/parameter>. "
     "To write that escaped spelling literally, use &amp;lt;/parameter>. Other HTML entities are unchanged.\n\n"
     "If you choose to call a function, reply with the function call and nothing after it, in exactly this format:\n"
     "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
@@ -1455,59 +1460,6 @@ static char *agent_build_glm_tools_prompt(bool edit_upto, bool vision) {
     memcpy(out + a + b, agent_glm_tools_prompt_after_schemas, c);
     memcpy(out + a + b + c, edit, d);
     memcpy(out + a + b + c + d, agent_glm_tools_prompt_rules_tail, e + 1);
-    return out;
-}
- create or edit files with tools, "
-    "then summarize results briefly.\n\n"
-    "# Tools\n\n"
-    "You have access to the following functions:\n\n"
-    "<tools>";
-
-static const char agent_qwen_tools_prompt_after_schemas[] =
-    "\n</tools>\n\n"
-    AGENT_TOOL_CONTRACTS
-    "Inside string values only, escape a literal </parameter> as &lt;/parameter>. "
-    "To write that escaped spelling literally, use &amp;lt;/parameter>. Other HTML entities are unchanged.\n\n"
-    "If you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
-    "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
-    "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n"
-    "</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n"
-    "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested "
-    "within <tool_call></tool_call> XML tags\n"
-    "- Required parameters MUST be specified\n"
-    "- You may provide optional reasoning for your function call in natural language BEFORE the function call, "
-    "but NOT after\n"
-    "- If there is no function call available, answer the question like normal with your current knowledge and "
-    "do not tell the user about function calls\n</IMPORTANT>\n\n"
-    "Tool calls are not allowed inside <think></think>; finish thinking before emitting <tool_call>.\n\n"
-    "# Rules\n\n"
-    "- read path alone returns a context-sized bounded chunk, not the whole file; for first looks at large files, prefer max_lines around 80-160.\n"
-    "- If read says more lines are available, call more with count=<lines> to read the next chunk.\n"
-    "- Use whole=true only when the user explicitly asks for the complete file contents or when bounded chunks are insufficient for the task; add raw=true only when line numbers would corrupt the payload.\n"
-    "- " AGENT_EDIT_TARGET_RULE "\n";
-
-/* the GLM schema list, each line wrapped as {"type": "function", "function": ...} */
-    const char *edit = edit_upto ? agent_glm_tools_prompt_edit_upto
-                                 : agent_glm_tools_prompt_edit_exact;
-    size_t lines = 1;
-    for (const char *q = agent_glm_tool_schemas; *q; q++) lines += *q == '\n';
-    size_t cap = strlen(agent_qwen_tools_prompt_intro) +
-                 strlen(agent_glm_tool_schemas) + lines * sizeof(wrap) +
-                 strlen(agent_qwen_tools_prompt_after_schemas) + strlen(edit) +
-                 strlen(agent_glm_tools_prompt_rules_tail) + 1;
-    if (vision) cap += strlen(wrap) + strlen(agent_vision_tool_schema) + 1;
-    char *out = xmalloc(cap);
-    size_t n = (size_t)snprintf(out, cap, "%s", agent_qwen_tools_prompt_intro);
-    const char *p = agent_glm_tool_schemas;
-    while (*p) {
-        const char *nl = strchr(p, '\n');
-        size_t len = nl ? (size_t)(nl - p) : strlen(p);
-        if (len) n += (size_t)snprintf(out + n, cap - n, "%s%.*s}", wrap, (int)len, p);
-        p += len + (nl ? 1 : 0);
-    }
-    if (vision) n += (size_t)snprintf(out + n, cap - n, "%s%s}", wrap, agent_vision_tool_schema);
-    snprintf(out + n, cap - n, "%s%s%s", agent_qwen_tools_prompt_after_schemas, edit,
-             agent_glm_tools_prompt_rules_tail);
     return out;
 }
 
@@ -7937,7 +7889,7 @@ static void test_agent_tool_argument_literal_markup(void) {
         AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
         AGENT_TEST_ASSERT(p.calls.len == 1);
         if (p.calls.len)
-            AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "content"), expected[kind]));
+            AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&p.calls.v[0], "content"), expected[is_glm]));
         free(out);
         agent_dsml_parser_free(&p);
     }

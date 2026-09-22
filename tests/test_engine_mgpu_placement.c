@@ -326,6 +326,9 @@ static void test_zero_budget_guard(void) {
     CHECK(rc != 0, "classify rejects all-zero vram_bytes");
 }
 
+static char *save_env_value(const char *name);
+static void restore_env_value(const char *name, char *saved);
+
 /* Exercise the placement_ctx_hint path in engine_compute_entry_bytes:
  * the same layout at a larger ctx must produce more spill or refusal,
  * proving the hint actually flows into per-layer KV pricing. */
@@ -339,6 +342,13 @@ static void test_placement_ctx_hint_scales(void) {
      * the layers; without this, min_ratio==est_ctx in test mode and the
      * per-layer KV / per-tier overhead don't scale meaningfully with
      * ctx. */
+    /* Hold independent tuning knobs at their defaults: this regression
+     * varies the placement hint, not an inherited test-runner prefill/raw
+     * cap.  In particular, the 16 GiB streaming profile uses chunk=512. */
+    char *old_chunk = save_env_value("DS4_METAL_PREFILL_CHUNK");
+    char *old_raw = save_env_value("DS4_METAL_GRAPH_RAW_CAP");
+    unsetenv("DS4_METAL_PREFILL_CHUNK");
+    unsetenv("DS4_METAL_GRAPH_RAW_CAP");
     ds4_test_seed_compress_ratios();
 
     /* Two-GPU budgets sized so that ctx=4096 fits cleanly but ctx=131072
@@ -378,6 +388,8 @@ static void test_placement_ctx_hint_scales(void) {
           "overhead — larger ctx forces more spill (or refusal).");
 
     ds4_test_clear_compress_ratios();
+    restore_env_value("DS4_METAL_PREFILL_CHUNK", old_chunk);
+    restore_env_value("DS4_METAL_GRAPH_RAW_CAP", old_raw);
 }
 
 /* Verifies the per-tier overhead pre-subtract actually changes a

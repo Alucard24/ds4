@@ -7219,7 +7219,8 @@ static float qwen4_cpu_row_dot_q8k(uint32_t type, const void *row, const block_q
  * 2 rows x up to 8 tokens: the 2x8 shape does 2 grid assemblies per 8 tokens
  * (4 tokens made it 2 per 4, which ate part of the traffic win).  16
  * accumulators + 8 q8 zmm may spill; the bench decides. */ 
-static void qwen4_cpu_dot_iq2_s_q8k_vnni_batch2(const void *row0, const void *row1,
+#if defined(DS4_CPU_IQ2S_Q8K_VNNI)
+static DS4_MAYBE_UNUSED void qwen4_cpu_dot_iq2_s_q8k_vnni_batch2(const void *row0, const void *row1,
                                                const block_q8_K *const *ys, float *out0,
                                                float *out1, uint32_t n, uint32_t k) {
     const block_iq2_s *xa = (const block_iq2_s *)row0, *xb = (const block_iq2_s *)row1;
@@ -7274,6 +7275,8 @@ static void qwen4_cpu_dot_iq2_s_q8k_vnni_batch2(const void *row0, const void *ro
     }
     for (uint32_t b = 0; b < n; b++) { out0[b] = 0.125f * sumf[0][b]; out1[b] = 0.125f * sumf[1][b]; }
 }
+
+#endif
 
 /* One weight row against a chunk of activations: batched where a batched
  * kernel exists (IQ2_S VNNI shares the row assembly across tokens),
@@ -7418,8 +7421,15 @@ void ds4_test_qwen4_dequant_row_q8k(const void *yq, float *out, uint32_t k) {
  * activations, used to measure the kernel without the model around it. */
 void ds4_test_qwen4_cpu_dot_q8k_batch2(const void *row0, const void *row1, const void *const *xq,
                                        float *out0, float *out1, uint32_t n, uint32_t k) {
+#if defined(DS4_CPU_IQ2S_Q8K_VNNI)
     qwen4_cpu_dot_iq2_s_q8k_vnni_batch2(row0, row1, (const block_q8_K *const *)xq,
                                         out0, out1, n, k);
+#else
+    qwen4_cpu_row_dot_q8k_batch(DS4_TENSOR_IQ2_S, row0,
+                                 (const block_q8_K *const *)xq, out0, n, k);
+    qwen4_cpu_row_dot_q8k_batch(DS4_TENSOR_IQ2_S, row1,
+                                 (const block_q8_K *const *)xq, out1, n, k);
+#endif
 }
 
 /* Explicit IQ4_NL m=8 twin for same-process A/B. */
@@ -48806,7 +48816,7 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, t
  *   | ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
  *
  * Rules are tried in order with the leftmost match winning. */
-static bool qwen35_is_letter(uint32_t cp) {
+static DS4_MAYBE_UNUSED bool qwen35_is_letter(uint32_t cp) {
     if (cp < 128) return ascii_alpha((uint8_t)cp);
     return (cp >= 0x00c0 && cp <= 0x017f) ||   /* Latin-1 supplement, ext A */
            (cp >= 0x0180 && cp <= 0x024f) ||   /* Latin ext B, IPA */
@@ -48823,7 +48833,7 @@ static bool qwen35_is_letter(uint32_t cp) {
            (cp >= 0xff41 && cp <= 0xff5a);     /* fullwidth a-z */
 }
 
-static bool qwen35_is_mark(uint32_t cp) {
+static DS4_MAYBE_UNUSED bool qwen35_is_mark(uint32_t cp) {
     return (cp >= 0x0300 && cp <= 0x036f) ||   /* combining diacritics */
            (cp >= 0x1ab0 && cp <= 0x1aff) ||
            (cp >= 0x1dc0 && cp <= 0x1dff) ||
@@ -49289,10 +49299,10 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
         {"</tool_call>",           vocab->tool_call_end_id},
         {"<tool_response>",        vocab->tool_response_start_id},
         {"</tool_response>",       vocab->tool_response_end_id},
-        {"<|vision_start|>",       vocab_lookup(vocab, "<|vision_start|>")},
-        {"<|vision_end|>",         vocab_lookup(vocab, "<|vision_end|>")},
-        {"<|image_pad|>",          vocab_lookup(vocab, "<|image_pad|>")},
-        {"<|video_pad|>",          vocab_lookup(vocab, "<|video_pad|>")},
+        {"<|vision_start|>",       vocab_lookup_optional(vocab, "<|vision_start|>")},
+        {"<|vision_end|>",         vocab_lookup_optional(vocab, "<|vision_end|>")},
+        {"<|image_pad|>",          vocab_lookup_optional(vocab, "<|image_pad|>")},
+        {"<|video_pad|>",          vocab_lookup_optional(vocab, "<|video_pad|>")},
         {"<arg_key>",              vocab->arg_key_start_id},
         {"</arg_key>",             vocab->arg_key_end_id},
         {"<arg_value>",            vocab->arg_value_start_id},
@@ -78342,7 +78352,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_QWEN38 &&
             DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41) {
             fprintf(stderr,
-                    "ds4: --vision requires GLM-5.3, Qwen3.8-Flash-Next, Qwen3.8, or the pinned ",
+                    "ds4: --vision requires GLM-5.3, Qwen3.8-Flash-Next, Qwen3.8, or the pinned "
                     "DeepSeek V4 Flash Vision-Exp or V4.1 Flash model\n");
             ds4_engine_close(e);
             *out = NULL;

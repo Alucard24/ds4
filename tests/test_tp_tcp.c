@@ -75,7 +75,11 @@ static void pair(int fd[2], bool tcp) {
         assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
     }
     for (unsigned i = 0; i < 2; i++) {
-        int small = 1024;
+        /* Linux can pace a 20 KiB TCP decode gate through a 1 KiB window at
+         * delayed-ACK intervals. Keep the original 1 KiB Unix stress case;
+         * TCP's 32 KiB request remains below an 8-row gate and all bulk
+         * payloads, so those paths still require partial I/O. */
+        int small = tcp ? 32768 : 1024;
         assert(setsockopt(fd[i], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)) == 0);
         assert(setsockopt(fd[i], SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)) == 0);
 #ifdef SO_NOSIGPIPE

@@ -144,7 +144,7 @@ round-trips a multimodal disk payload and verifies exact continuation plus
 restoration of the compressed MRoPE frontier and image fingerprint identity.
 
 `ds4-server` selects Qwen's `<|im_start|>` chat rendering and native
-`<tool_call><function=...>` syntax for model id 4. Its system tool instructions,
+`<tool_call><function=...>` syntax for model id 7. Its system tool instructions,
 normalized OpenAI function-schema objects, whitespace trimming, historical
 thinking wrappers, grouped `<tool_response>` turns, and assistant generation
 prefix match the GGUF `tokenizer.chat_template`. OpenAI and Anthropic SSE project Qwen
@@ -824,7 +824,7 @@ GA cache directly; the CPU oracle writes F32. The element-size field allows the
 loader to convert either representation when changing backend. Payload size is
 roughly 149 MiB of fixed recurrent/logit state plus 64 KiB per token on CUDA
 (128 KiB per token for CPU checkpoints), so normal KV-store limits still apply.
-The outer KVC header accepts quant tag zero only for dense Qwen model id 4;
+The outer KVC header accepts quant tag zero only for dense Qwen model id 7;
 DeepSeek/GLM entries still require their routed-expert 2/4-bit tag. A checked
 server restart stored a 75-token Qwen checkpoint as a 155.26 MiB file, restored
 it in 35.8 ms, and reported all 75 prompt tokens from `disk-text`.

@@ -681,6 +681,11 @@ static void test_tool_contracts(void) {
                            glm ? agent_build_glm_tools_prompt(false, vision) :
                                  agent_build_dsml_tools_prompt(false, vision);
             AGENT_TEST_ASSERT((strstr(prompt, "view_image") != NULL) == vision);
+            AGENT_TEST_ASSERT((strstr(prompt, "view_video") != NULL) == vision);
+            if (vision) {
+                AGENT_TEST_ASSERT(strstr(prompt, "\"max_frames\":{\"type\":\"integer\"}"));
+                AGENT_TEST_ASSERT(strstr(prompt, "# Rules"));
+            }
             AGENT_TEST_ASSERT(strstr(prompt, "POSIX extended") && strstr(prompt, "128 KiB"));
             AGENT_TEST_ASSERT(strstr(prompt, "&amp;lt;/"));
             char name[64];

@@ -308,7 +308,7 @@ Qwen3.8 MTP draft head: 32768-token context needs ~13.93 GiB resident (trunk 11.
 `orca` is opt-in and is not a replacement for the IQ3_S default: it measured a
 16-token NLL of 1.89104305 against IQ3_XXS's 1.87606303 and IQ3_S's 1.80954673.
 It writes its cache under `<KV_DIR>/orca`, not the directory the other profiles
-share: the payload records the model id (4 for every Qwen3.8 trunk) and the routed
+share: the payload records the model id (7 for every Qwen3.8 trunk) and the routed
 quant bits (0, this model has no routed experts), so nothing but a directory of its
 own separates two different trunks under the same rendered text.  The same text
 produces the same file name in either directory, which is what makes the

@@ -201,6 +201,10 @@ static int g_cuda_exact_score_split_vec4;
 static int g_cuda_exact_score_split_vec4_plain;
 static int g_cuda_exact_score_split_dim2;
 static int g_cuda_exact_score_split_fuse_inv_rope;
+/* cudaFuncSetAttribute state belongs to a CUDA context. These caches are
+ * cleared by ds4_gpu_cleanup(), which cudaDeviceReset()s that context. */
+static int g_cuda_score_tile_shmem_ready[DS4_MAX_GPUS];
+static int g_cuda_score_tile_rows_shmem_ready[DS4_MAX_GPUS];
 static int g_cuda_moe_decode_graph;
 static int g_current_logical_tier = -1;
 static int g_ssd_streaming_mode;
@@ -1323,27 +1327,40 @@ extern "C" int ds4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim,
 static int cuda_use_mmq(void) {
     static int init = 0;
     static int use = 0;
+    static int disabled_notice = 0;
+    const char *s = getenv("DS4_CUDA_MMQ");
+
+    /* Quality execution must keep the reference prefill path. Do this check
+     * before the lazy initializer: a preceding fast engine must not latch MMQ
+     * on for a later quality engine in the same process. */
+    if (g_quality_mode || g_n_gpus > 1) return 0;
+    if (s && s[0] == '0') {
+        if (!disabled_notice) {
+            fprintf(stderr, "ds4: DS4_CUDA_MMQ=0 - mmq prefill tier disabled\n");
+            disabled_notice = 1;
+        }
+        return 0;
+    }
     if (!init) {
         init = 1;
-        const char *s = getenv("DS4_CUDA_MMQ");
-        const int off = (s && s[0] == '0') || g_quality_mode || g_n_gpus > 1;
-        if (off) {
-            if (s && s[0] == '0') {
-                fprintf(stderr, "ds4: DS4_CUDA_MMQ=0 - mmq prefill tier disabled\n");
-            }
-        } else if (ds4_mmq_init(0) == 0) {
+        if (ds4_mmq_init(0) == 0) {
             use = 1;
         } else {
             fprintf(stderr, "ds4: ds4_mmq_init failed - mmq prefill tier disabled\n");
         }
+    } else if (use && ds4_mmq_init(0) != 0) {
+        /* ds4_mmq_cleanup() clears its session marker before CUDA teardown.
+         * Do not retain an MMQ dispatch after a failed session re-init. */
+        fprintf(stderr, "ds4: ds4_mmq re-init failed - mmq prefill tier disabled\n");
+        use = 0;
     }
     return use;
 }
 
 /* MXFP4 has no dequant+cublas fallback, so it must retain MMQ on multi-GPU
  * placements where the optional Q8/IQ2 prefill tier stays disabled. MMQ
- * resolves the active CUDA device on every call; initialization only warms
- * its device-info singleton. The experimental global persistent scratch is
+ * resolves the active CUDA device on every call and re-warms after a context
+ * reset. The experimental global persistent scratch is
  * intentionally rejected because one pointer cannot span CUDA devices. */
 static int cuda_use_mxfp4_mmq(void) {
     static int init = 0;
@@ -1367,6 +1384,13 @@ static int cuda_use_mxfp4_mmq(void) {
                 fprintf(stderr,
                         "ds4: ds4_mmq_init failed - MXFP4 unavailable\n");
             }
+        }
+    } else if (use) {
+        int device = 0;
+        if (cudaGetDevice(&device) != cudaSuccess ||
+            ds4_mmq_init(device) != 0) {
+            fprintf(stderr, "ds4: ds4_mmq re-init failed - MXFP4 unavailable\n");
+            use = 0;
         }
     }
     return use;
@@ -3066,6 +3090,10 @@ extern "C" void ds4_gpu_cleanup(void) {
     ds4_gpu_tp_shutdown();
     (void)cudaDeviceSynchronize();
     ds4_gpu_decode_graphs_invalidate();
+    /* MMQ pools outlive individual calls, but not cudaDeviceReset(). Dispose
+     * of their host owners after graph executables and before streams and the
+     * CUDA context disappear. */
+    ds4_mmq_cleanup();
     g_current_logical_tier = -1;
 
     /* Multi-GPU teardown: events, streams, cublas handles, scratch
@@ -3123,6 +3151,10 @@ extern "C" void ds4_gpu_cleanup(void) {
     cuda_stream_selected_stage_release();
     g_n_gpus = 0;
     g_device_is_spark = false;
+    memset(g_cuda_score_tile_shmem_ready, 0,
+           sizeof(g_cuda_score_tile_shmem_ready));
+    memset(g_cuda_score_tile_rows_shmem_ready, 0,
+           sizeof(g_cuda_score_tile_rows_shmem_ready));
     g_cublas_ready = 0;
 
     /* Per-device selective cache teardown (selective model cache). */
@@ -3340,6 +3372,26 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_on(int tier, uint64_t by
 
 extern "C" int ds4_gpu_tensor_device(const ds4_gpu_tensor *t) {
     return t ? t->device_id : -1;
+}
+
+/* The selected-expert cache is allocated after the graph, so a fixed
+ * device-wide reserve need not duplicate the graph's already-resident
+ * workspace on discrete GPUs. Unified-memory devices retain a larger reserve
+ * to avoid turning cache growth into host-memory pressure. */
+static uint64_t cuda_stream_expert_cache_reserve_bytes(
+        uint64_t total_bytes,
+        int      integrated) {
+    int present = 0;
+    const uint64_t override = cuda_parse_mib_env(
+            "DS4_CUDA_STREAM_EXPERT_CACHE_RESERVE_MB", &present);
+    if (present) return override;
+    if (integrated) return 8ull * 1073741824ull;
+
+    const uint64_t floor = 1ull * 1073741824ull;
+    uint64_t reserve = total_bytes / 8u;
+    if (reserve < floor) reserve = floor;
+    if (reserve > 4ull * 1073741824ull) reserve = 4ull * 1073741824ull;
+    return reserve;
 }
 
 static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
@@ -9686,14 +9738,13 @@ static int attention_decode_score_split_launch(
         !use_vec4_scores) {
         /* cudaFuncSetAttribute() applies to the current device only, so opt in
          * to >48KB dynamic shared memory once per device. */
-        static int tile_shmem_ready[DS4_MAX_GPUS] = {0};
         const size_t tile_shmem =
             (size_t)(DS4_SCORE_TILE_HEADS + DS4_SCORE_TILE_ROWS) *
             DS4_SCORE_TILE_STRIDE * sizeof(float);
         int tile_dev = 0;
         cudaGetDevice(&tile_dev);
         if (tile_dev >= 0 && tile_dev < DS4_MAX_GPUS &&
-            !tile_shmem_ready[tile_dev]) {
+            !g_cuda_score_tile_shmem_ready[tile_dev]) {
             if (!cuda_ok(cudaFuncSetAttribute(
                              attention_decode_score_split_scores_tile512_kernel,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -9701,7 +9752,7 @@ static int attention_decode_score_split_launch(
                          "attention score tile shared-memory opt-in")) {
                 score_tile_disabled = 1;
             }
-            tile_shmem_ready[tile_dev] = 1;
+            g_cuda_score_tile_shmem_ready[tile_dev] = 1;
         }
         if (score_tile_disabled) {
             return 0; /* retry via the generic path on the next call */
@@ -18082,13 +18133,12 @@ extern "C" int ds4_gpu_attention_decode_rows_rope_tensor(
         const size_t tile_shmem =
             (size_t)(DS4_SCORE_TILE_HEADS + DS4_SCORE_TILE_ROWS) *
             DS4_SCORE_TILE_STRIDE * sizeof(float);
-        static int tile_shmem_ready[DS4_MAX_GPUS] = {0};
         int physical_device = 0;
         if (cudaGetDevice(&physical_device) != cudaSuccess ||
             physical_device < 0 || physical_device >= DS4_MAX_GPUS) {
             return 0;
         }
-        if (!tile_shmem_ready[physical_device]) {
+        if (!g_cuda_score_tile_rows_shmem_ready[physical_device]) {
             if (!cuda_ok(cudaFuncSetAttribute(
                     attention_decode_score_split_scores_tile512_rows_kernel,
                     cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -18096,7 +18146,7 @@ extern "C" int ds4_gpu_attention_decode_rows_rope_tensor(
                     "attention score rows shared-memory opt-in")) {
                 return 0;
             }
-            tile_shmem_ready[physical_device] = 1;
+            g_cuda_score_tile_rows_shmem_ready[physical_device] = 1;
         }
         dim3 score_grid(
             (max_dense_score + DS4_SCORE_TILE_ROWS - 1u) /
@@ -27484,7 +27534,9 @@ static int cuda_stream_selected_cache_begin_load(
             if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, g_gpu[0].device_id) == cudaSuccess &&
                 integrated && ds4_linux_nonmovable_memory(&host_available))
                 free_bytes = (size_t)std::min(host_available, (uint64_t)total_bytes);
-            const uint64_t reserve = UINT64_C(8) << 30;
+            const uint64_t reserve =
+                cuda_stream_expert_cache_reserve_bytes((uint64_t)total_bytes,
+                                                       integrated);
             const uint64_t available = free_bytes > reserve ? free_bytes - reserve : 0;
             capacity = std::min(capacity, available / expert_bytes);
             if (capacity < unique.size()) {
@@ -29202,7 +29254,7 @@ extern "C" int ds4_gpu_qwen38_gdn_decode(
  * instead of once per (value, row).  The expression is the same one the byte
  * readers used - scale times code - so the values are the values they always
  * produced. */
-__device__ static __forceinline__ float qwen38_ga_score_part_f32(
+__device__ static __forceinline__ __attribute__((unused)) float qwen38_ga_score_part_f32(
         const float *k, uint64_t base, uint32_t lane,
         float q0, float q32, float q64, float q96,
         float q128, float q160, float q192, float q224) {
@@ -29220,7 +29272,7 @@ __device__ static __forceinline__ float qwen38_ga_score_part_f32(
     return p0;
 }
 
-__device__ static __forceinline__ void qwen38_ga_accumulate_f32(
+__device__ static __forceinline__ __attribute__((unused)) void qwen38_ga_accumulate_f32(
         const float *v, uint64_t base, uint32_t lane,
         float old_scale, float probability, float *accum) {
 #pragma unroll

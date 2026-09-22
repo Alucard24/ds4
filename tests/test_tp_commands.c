@@ -24,11 +24,16 @@ static void check_bulk_exchange(void) {
         int fd[2];
         assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
         bulk_peer peer[2] = {0};
+        const uint64_t gate_timeout_ms = n == 0 ? 50u : 3000u;
+        struct timeval expected_timeout[2] = {{0}};
         for (unsigned rank = 0; rank < 2; rank++) {
             tp_socket_tune(fd[rank]);
-            assert(tp_socket_set_gate_timeout(fd[rank], 3000));
+            assert(tp_socket_set_gate_timeout(fd[rank], gate_timeout_ms));
+            socklen_t timeout_len = sizeof(expected_timeout[rank]);
+            assert(getsockopt(fd[rank], SOL_SOCKET, SO_RCVTIMEO,
+                              &expected_timeout[rank], &timeout_len) == 0);
             peer[rank].tp.data_fd = fd[rank];
-            peer[rank].tp.gate_timeout_ms = 3000;
+            peer[rank].tp.gate_timeout_ms = gate_timeout_ms;
             peer[rank].bytes = sizes[n];
             peer[rank].out = malloc(sizes[n]);
             peer[rank].in = malloc(sizes[n]);
@@ -36,10 +41,7 @@ static void check_bulk_exchange(void) {
             for (uint64_t i = 0; i < sizes[n]; i++)
                 peer[rank].out[i] = (uint8_t)(i * 31u + rank * 17u);
         }
-        if (n == 0) {
-            peer[0].tp.gate_timeout_ms = peer[1].tp.gate_timeout_ms = 50;
-            peer[1].delay = 150000;
-        }
+        if (n == 0) peer[1].delay = 150000;
         pthread_t thread;
         assert(pthread_create(&thread, NULL, exchange_bulk, &peer[1]) == 0);
         exchange_bulk(&peer[0]);
@@ -51,8 +53,8 @@ static void check_bulk_exchange(void) {
             struct timeval timeout;
             socklen_t len = sizeof(timeout);
             assert(getsockopt(fd[rank], SOL_SOCKET, SO_RCVTIMEO, &timeout, &len) == 0);
-            assert((uint64_t)timeout.tv_sec * 1000u + timeout.tv_usec / 1000u ==
-                   peer[rank].tp.gate_timeout_ms);
+            assert(timeout.tv_sec == expected_timeout[rank].tv_sec &&
+                   timeout.tv_usec == expected_timeout[rank].tv_usec);
             free(peer[rank].in); free(peer[rank].out); close(fd[rank]);
         }
     }

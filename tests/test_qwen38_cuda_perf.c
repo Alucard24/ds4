@@ -47,7 +47,8 @@ int main(int argc, char **argv) {
     double t0 = now_seconds();
     if (ds4_engine_open(&engine, &opt) != 0) fail("engine open");
     double t1 = now_seconds();
-    if (ds4_engine_model_id(engine) != 4) fail("requires Qwen3.8 model");
+    if (ds4_engine_model_id(engine) != DS4_MODEL_ID_QWEN38)
+        fail("requires Qwen3.8 model");
     ds4_tokens prompt = {0};
     ds4_tokenize_text(engine, text, &prompt);
     free(text);

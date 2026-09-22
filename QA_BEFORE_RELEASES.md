@@ -68,6 +68,13 @@ in this system.
 
 - Run the default suite:
   `make test`.
+- On the local 16 GiB RTX 5070 Ti with the default approximately 81 GiB Flash
+  GGUF, run the equivalent full CUDA SSD-streaming profile:
+  `make test-cuda-streaming-16gb`. It uses a 4 GiB test cache, disables the
+  optional Q8-to-F16 weight cache, and sets a 512 MiB selected-expert admission
+  reserve so the long vector and replay cases fit. These are test-runner
+  settings only; do not copy them into a production serving command. Record
+  any overridden `CUDA_STREAMING_TEST_*` value in the QA report.
 - Run `tests/test_gpu_args_cli.sh` explicitly after changing executable option
   parsing or multi-GPU placement. Invalid values and device/budget count
   mismatches must reach the shared GPU parser in all four binaries; an

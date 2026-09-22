@@ -71,7 +71,7 @@ case "$PROFILE" in
     orca)
         # A different trunk with the same mix, and its embedded draft head binds the
         # same way, so the memory budget is `xxs`'s. The separate cache directory is
-        # deliberate: the payload carries only the model id (4 for every Qwen3.8)
+        # deliberate: the payload carries only the model id (7 for every Qwen3.8)
         # and the routed quant bits (0, this model has no routed experts), so a
         # text-keyed entry written by one trunk would otherwise be resumed by the
         # other and the restored cache would not be the one that prompt was built

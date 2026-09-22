@@ -119,6 +119,7 @@ private:
 static void *g_q81_scratch_ptr   = nullptr;
 static size_t g_q81_scratch_bytes = 0;
 static bool   g_q81_scratch_enabled = false;
+static int    g_q81_scratch_device = -1;
 static void  *g_aligned_q81_scratch_ptr = nullptr;
 static size_t g_aligned_q81_scratch_bytes = 0;
 static int    g_aligned_q81_scratch_device = -1;
@@ -139,6 +140,15 @@ struct mmq_pair_map_scratch {
 };
 
 static mmq_pair_map_scratch g_mmq_pair_maps[GGML_CUDA_MAX_DEVICES] = {};
+/* cudaDeviceReset invalidates every allocation held by these host objects.
+ * Keep ownership explicit so ds4_gpu_cleanup() can destroy them first. */
+static ggml_backend_cuda_context *g_mmq_contexts[GGML_CUDA_MAX_DEVICES] = {};
+static bool g_mmq_initialized[GGML_CUDA_MAX_DEVICES] = {};
+static uint64_t g_mmq_cuda_context_epoch = 1;
+
+extern "C" uint64_t ds4_mmq_cuda_context_epoch(void) {
+    return g_mmq_cuda_context_epoch;
+}
 
 extern "C" void ds4_mmq_set_aligned_q81_scratch(void *ptr, size_t bytes) {
     g_aligned_q81_scratch_ptr = ptr;
@@ -313,10 +323,13 @@ extern "C" size_t ds4_mmq_q81_scratch_bytes(void) {
 }
 
 extern "C" int ds4_mmq_init(int device) {
-    if (device < 0) {
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
         fprintf(stderr, "ds4_mmq_init: invalid device %d\n", device);
         return -1;
     }
+    /* Teardown clears this marker before cudaDeviceReset(). Calls on an
+     * already-live context stay a cheap no-op. */
+    if (g_mmq_initialized[device]) return 0;
     ggml_cuda_set_device(device);
     // Trigger lazy population of the device-info singleton.
     const auto & info = ggml_cuda_info();
@@ -365,10 +378,12 @@ extern "C" int ds4_mmq_init(int device) {
         } else {
             g_q81_scratch_bytes = bytes;
             g_q81_scratch_enabled = true;
+            g_q81_scratch_device = device;
             fprintf(stderr, "ds4_mmq_init: persistent Q8_1 scratch enabled (%zu B at %p)\n",
                     bytes, g_q81_scratch_ptr);
         }
     }
+    g_mmq_initialized[device] = true;
     return 0;
 }
 
@@ -492,12 +507,49 @@ static void ds4_mmq_sanitize_f32(float *p, uint64_t n, cudaStream_t stream) {
 }
 
 ggml_backend_cuda_context * get_ctx_for_device(int device) {
-    static ggml_backend_cuda_context * cached[GGML_CUDA_MAX_DEVICES] = {};
     if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) return nullptr;
-    if (!cached[device]) {
-        cached[device] = new ggml_backend_cuda_context(device);
+    if (!g_mmq_contexts[device]) {
+        g_mmq_contexts[device] = new ggml_backend_cuda_context(device);
     }
-    return cached[device];
+    return g_mmq_contexts[device];
+}
+
+extern "C" void ds4_mmq_cleanup(void) {
+    /* Every CUDA context-local function attribute cached by the vendored
+     * kernels must be applied again after the caller's cudaDeviceReset(). */
+    if (++g_mmq_cuda_context_epoch == 0) ++g_mmq_cuda_context_epoch;
+
+    /* Pools free asynchronously on their remembered stream. GPU teardown has
+     * synchronized all work, and using the default stream here avoids a
+     * reference to a backend stream that is about to be destroyed. */
+    ds4_pool_set_stream((cudaStream_t)0);
+    int previous_device = -1;
+    (void)cudaGetDevice(&previous_device);
+
+    for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
+        if (!g_mmq_contexts[device] && !g_mmq_pair_maps[device].base) {
+            g_mmq_initialized[device] = false;
+            continue;
+        }
+        if (cudaSetDevice(device) != cudaSuccess) continue;
+        delete g_mmq_contexts[device];
+        g_mmq_contexts[device] = nullptr;
+        if (g_mmq_pair_maps[device].base) {
+            (void)cudaFree(g_mmq_pair_maps[device].base);
+            g_mmq_pair_maps[device] = {};
+        }
+        g_mmq_initialized[device] = false;
+    }
+    if (g_q81_scratch_ptr && g_q81_scratch_device >= 0 &&
+        g_q81_scratch_device < GGML_CUDA_MAX_DEVICES &&
+        cudaSetDevice(g_q81_scratch_device) == cudaSuccess) {
+        (void)cudaFree(g_q81_scratch_ptr);
+    }
+    g_q81_scratch_ptr = nullptr;
+    g_q81_scratch_bytes = 0;
+    g_q81_scratch_enabled = false;
+    g_q81_scratch_device = -1;
+    if (previous_device >= 0) (void)cudaSetDevice(previous_device);
 }
 
 template <ggml_type type>

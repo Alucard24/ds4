@@ -202,13 +202,18 @@ static const char * cu_get_error_str(CUresult err) {
 #endif
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+/* cudaFuncSetAttribute state is tied to the CUDA context. ds4 increments
+ * this epoch before resetting that context so each kernel re-applies its
+ * dynamic-shared-memory limit after an engine teardown. */
+extern "C" uint64_t ds4_mmq_cuda_context_epoch(void);
 #    define CUDA_SET_SHARED_MEMORY_LIMIT(kernel, nbytes)                                                       \
         do {                                                                                                   \
-            static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = { false };                         \
-            const int   id                                                = ggml_cuda_get_device();            \
-            if (!shared_memory_limit_raised[id]) {                                                             \
+            static uint64_t shared_memory_limit_epoch[GGML_CUDA_MAX_DEVICES] = { 0 };                          \
+            const int id = ggml_cuda_get_device();                                                             \
+            const uint64_t epoch = ds4_mmq_cuda_context_epoch();                                               \
+            if (shared_memory_limit_epoch[id] != epoch) {                                                      \
                 CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes)); \
-                shared_memory_limit_raised[id] = true;                                                         \
+                shared_memory_limit_epoch[id] = epoch;                                                         \
             }                                                                                                  \
         } while (0)
 #else

@@ -32,6 +32,9 @@ extern "C" {
 //   device: CUDA device ordinal (0 for the primary GPU).
 // Returns 0 on success.
 int ds4_mmq_init(int device);
+// Release MMQ-owned pools and persistent device allocations before the host
+// backend resets its CUDA context. Safe to call when MMQ was never used.
+void ds4_mmq_cleanup(void);
 void ds4_mmq_set_aligned_q81_scratch(void *ptr, size_t bytes);
 
 // Query whether ds4_mmq is willing to handle a given matmul. Returns

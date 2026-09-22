@@ -5127,6 +5127,16 @@ static void test_metal_router_weights_batch_exact(void) {
 #endif
 
 static void test_metal_kernel_group(void) {
+    /* These isolated kernels replace the global model map with synthetic
+     * buffers. Close any cached model engine first so later model tests reopen
+     * a valid map instead of inheriting a freed synthetic one. */
+    test_close_engines();
+    if (!ds4_gpu_init()) {
+        TEST_ASSERT(false);
+        ds4_gpu_cleanup();
+        return;
+    }
+
     test_metal_f16_matvec_fast_nr0_4();
     test_metal_f16_prefill_matmul();
     test_metal_q8_0_prefill_matmul();
@@ -5152,6 +5162,7 @@ static void test_metal_kernel_group(void) {
     test_metal_router_simd_finalize_exact();
     test_metal_router_weights_batch_exact();
 #endif
+    ds4_gpu_cleanup();
 }
 
 static void test_metal_short_prefill_ratio4(void) {

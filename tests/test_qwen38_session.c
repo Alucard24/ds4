@@ -102,7 +102,8 @@ int main(int argc, char **argv) {
         .context_size=128, .power_percent=100};
     ds4_engine *e = NULL;
     require(ds4_engine_open(&e, &opt) == 0, "engine open");
-    require(ds4_engine_model_id(e) == 4, "requires Qwen3.8 model");
+    require(ds4_engine_model_id(e) == DS4_MODEL_ID_QWEN38,
+            "requires Qwen3.8 model");
     check_qwen_tokenizer(e);
     ds4_tokens tokens = {0};
     ds4_tokenize_text(e, argv[2], &tokens);
